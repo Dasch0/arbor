@@ -10,4 +10,5 @@ edition = "2018"
 failure = "0.1.8"
 ropey = "1.2.0"
 petgraph = { version = "0.5.1", features = ["serde-1"] }
+serde_json = "1.0.59"
 shellwords = "1.1.0"
