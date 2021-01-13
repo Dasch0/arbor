@@ -55,12 +55,12 @@ mod cmd {
     /// Unified result type for propogating errors in cmd methods
     type Result = std::result::Result<&'static str, Box<dyn std::error::Error + Send + Sync>>;
 
-    pub fn help(_cmd_iter: &mut std::str::Split<&str>, _state: &mut State) -> cmd::Result {
+    pub fn help(_cmd_iter: &mut std::slice::Iter<String>, _state: &mut State) -> cmd::Result {
         Ok(HELP)
     }
 
-    pub fn new(cmd_iter: &mut std::str::Split<&str>, state: &mut State) -> cmd::Result {
-        match cmd_iter.next().ok_or(cmd::Error::default())? {
+    pub fn new(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+        match cmd_iter.next().ok_or(cmd::Error::default())?.as_str() {
             "project" => new::project(cmd_iter, state),
             "node" => new::node(cmd_iter, state),
             "edge" => new::edge(cmd_iter, state),
@@ -72,7 +72,7 @@ mod cmd {
         use super::*;
 
         // TODO: Serializable tree struct
-        pub fn project(cmd_iter: &mut std::str::Split<&str>, state: &mut State) -> cmd::Result {
+        pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
             // Create new project file on disk with user supplied name
             let project_name = cmd_iter
                 .next()
@@ -108,7 +108,7 @@ mod cmd {
         /// The node is also represented in the tree by an array of two values, the start and end
         /// line of the node's text block in the text rope.  
         /// 
-        pub fn node(cmd_iter: &mut std::str::Split<&str>, state: &mut State) -> cmd::Result {
+        pub fn node(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
             // Next and final argument passed with the new node command should be the full text
             // string.
             let text = cmd_iter
@@ -129,7 +129,7 @@ mod cmd {
             Ok(SUCCESS)
         }
 
-        pub fn edge(cmd_iter: &mut std::str::Split<&str>, state: &mut State) -> cmd::Result {
+        pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
             // Next and final argument passed with the new node command should be the full text
             // string.
             let text = cmd_iter
@@ -148,7 +148,7 @@ mod cmd {
     /// Print all nodes, edges, and associated text
     /// 
     // TODO: Determine how to represent edges
-    pub fn list(cmd_iter: &mut std::str::Split<&str>, state: &mut State) -> cmd::Result {
+    pub fn list(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
         check_end(cmd_iter)?;
         let node_iter = state.tree.node_references(); 
         node_iter.for_each(|n| {
@@ -186,11 +186,10 @@ mod cmd {
 
     /// Helper method for checking that a command iterator is ended
     /// Returns Ok if iterator is empty, or a cmd::Error if any more elements remain in the iterator  
-    fn check_end(cmd_iter: &mut std::str::Split<&str>) -> cmd::Result {
-        let test = cmd_iter
-            .next();
-        test
-            .xor(Some(""))
+    fn check_end(cmd_iter: &mut std::slice::Iter<String>) -> cmd::Result {
+        cmd_iter
+            .next()
+            .xor(Some(&String::new()))
             .ok_or(cmd::Error::default())?;
         // TODO: different Ok message for check_end
         Ok(SUCCESS)
@@ -212,10 +211,10 @@ fn main() {
         io::stdin()
             .read_line(&mut buf)
             .expect("Failed to read line");
-
-        let mut cmd_iter = buf.trim_end_matches("\n").split(" ");
-
-        let res = match cmd_iter.next().unwrap() {
+        
+        let cmds = shellwords::split(&buf).unwrap();
+        let mut cmd_iter = cmds.iter();
+        let res = match cmd_iter.next().unwrap().as_str() {
             "help" => cmd::help(&mut cmd_iter, &mut state),
             "new" => cmd::new(&mut cmd_iter, &mut state),
             "list" => cmd::list(&mut cmd_iter, &mut state),
