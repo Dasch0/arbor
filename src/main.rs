@@ -1,10 +1,11 @@
 use petgraph::prelude::*;
-use petgraph::visit::{IntoNodeReferences, IntoEdgeReferences};
+use petgraph::visit::{IntoEdgeReferences, IntoNodeReferences};
 use petgraph::*;
 use std::io;
 use std::io::Write;
 
-static PROJECT_EXTENSION: &str = ".tree";
+static ROPE_EXT: &str = ".rope";
+static TREE_EXT: &str = ".tree";
 static UNKNOWN: &str = "unknown command, type help for more info";
 static NONAME: &str = "no name provided";
 static HELP: &str = "Arbor
@@ -25,27 +26,18 @@ static SUCCESS: &str = "success\r\n";
 
 type Section = [usize; 2];
 
-#[derive(Debug)]
-pub enum Mode {
-    Project,
-    Node,
-    Edge,
-}
-
 pub struct State {
     tree: petgraph::graph::DiGraph<Section, Section>,
     text: ropey::Rope,
     name: String,
-    mode: Mode,
 }
 impl State {
     fn new() -> Self {
         State {
             //TODO: parameter for initial capacity
-            tree: graph::DiGraph::<Section, Section>::with_capacity(1000,1000),
+            tree: graph::DiGraph::<Section, Section>::with_capacity(1000, 1000),
             text: ropey::Rope::new(),
             name: String::new(),
-            mode: Mode::Project,
         }
     }
 }
@@ -75,22 +67,12 @@ mod cmd {
         // TODO: Serializable tree struct
         pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
             // Create new project file on disk with user supplied name
-            let project_name =
-                cmd_iter.next().ok_or(cmd::Error::default())?.to_owned() + PROJECT_EXTENSION;
-            // TODO: use openoptions to not overwrite
-            let project_file = std::fs::File::create(&project_name)?;
-            // drop project to save new file to disk
-            drop(project_file);
+            let project_name = cmd_iter.next().ok_or(cmd::Error::default())?.to_owned();
 
-            // re-open project file as a rope
-            let project = ropey::Rope::from_reader(std::io::BufReader::new(std::fs::File::open(
-                &project_name,
-            )?))
-            .unwrap();
-
+            let text = ropey::Rope::new();
             // save info to state
             state.name = project_name.to_string();
-            state.text = project;
+            state.text = text;
             Ok("New project created")
         }
 
@@ -125,6 +107,23 @@ mod cmd {
             Ok(SUCCESS)
         }
 
+        /// Create a new edge between nodes
+        /// The edge represents a dialogue choice by the player. The edge should connect two nodes
+        /// of dialogue with an action. The user will select from a list of outgoing edges on a
+        /// given node in order to choose the path through the dialogue tree. Edges can loop back
+        /// to the same node (eg: to retry a different option), and any number of edges may connect
+        /// the same or different nodes.
+        ///
+        /// Note that edges are directional, so to create a loop between two dialogue options, two
+        /// edges need to be defined.
+        ///
+        /// The format for defining a new edge is:
+        ///     new edge <start_node_idx> <target_node_idx> "<user choice or action>"
+        /// example:
+        ///     new edge 0 1 "Yes, I am"
+        ///
+        // TODO: Define case for empty edge, where no action is taken and dialogue should move
+        // automatically to the next node.
         pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
             let start_node_idx = cmd_iter
                 .next()
@@ -157,6 +156,16 @@ mod cmd {
     }
 
     /// Print all nodes, edges, and associated text
+    /// This prints all nodes in index order (not necessarily the order they would appear when
+    /// traversing the dialogue tree). Under each node definiton, a list of the outgoing edges from
+    /// that node will be listed. This will show the path to the next dialogue option from any
+    /// node, and the choice/action text associated with that edge.
+    ///
+    /// ex:
+    /// NodeIndex(0) Algernon::You're a law Student?
+    /// --> NodeIndex(1) Yes
+    /// --> NodeIndex(1) No
+    /// NodeIndex(1) Algernon::Well...gotta run
     ///
     pub fn list(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
         check_end(cmd_iter)?;
@@ -167,21 +176,77 @@ mod cmd {
             state
                 .tree
                 .edges_directed(n.0, petgraph::Direction::Outgoing)
-                .for_each(|e| println!("--> {:#?} : {} ", e.1, state.text.slice(e.2[0]..e.2[1])));
+                .for_each(|e| {
+                    println!(
+                        "--> {:#?} : {} ",
+                        e.target(),
+                        state.text.slice(e.weight()[0]..e.weight()[1])
+                    )
+                });
         });
 
         Ok(SUCCESS)
     }
 
-    pub fn save(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
-        // save text
-        state.text.write_to(std::io::BufWriter::new(std::fs::File::open(state.name.clone())?))?;
+    /// Save the text rope and tree to the file system
+    ///
+    /// At the moment, the tree and text rope are saved to different files, with .rope and .tree
+    /// file extensions respectively. These files are saved to the local directory
 
+    // TODO:
+    //  1. Handle overwriting, backups, etc
+    //  2. Handle custom pathing to save file
+    //  3. Have definable default save path (maybe save last path in state)
+    pub fn save(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+        check_end(cmd_iter)?;
         // save tree
         let tree_json = serde_json::to_string(&state.tree).unwrap();
+        std::fs::write(state.name.clone() + TREE_EXT, tree_json)?;
+
+        // save text
+        state
+            .text
+            .write_to(std::io::BufWriter::new(std::fs::File::create(
+                state.name.clone() + ROPE_EXT,
+            )?))?;
         Ok(SUCCESS)
     }
-    
+
+    /// Load a text rope and tree from the file system
+    ///
+    /// Will open a .rope and .tree file with the provided name. Currently only looks in the
+    /// current working directory. Once loaded, the program state will be updated to edit the new
+    /// text rope and tree, using the loaded project name
+    ///
+    /// Format for load command is:
+    ///     load <project_name>
+    /// example (with files algernon.tree and algernon.rope in ./):
+    ///     load algernon
+    // TODO:
+    //  1. Handle custom pathing
+    //  2. Consider recursive searching for files
+    //  3. Have definable default path to search for file (maybe save last path in state)
+    //  4. Validate files, report error after loading
+    pub fn load(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+        let name = cmd_iter.next().ok_or(cmd::Error::default())?.to_owned();
+        check_end(cmd_iter)?;
+
+        // Attempt to load files
+        let tree: petgraph::graph::DiGraph<Section, Section> = serde_json::from_reader(
+            std::io::BufReader::new(std::fs::File::open(name.clone() + TREE_EXT)?),
+        )?;
+        let rope = ropey::Rope::from_reader(std::io::BufReader::new(std::fs::File::open(
+            name.clone() + ROPE_EXT,
+        )?))?;
+
+        // If successful, update state
+        state.tree = tree;
+        state.text = rope;
+        state.name = name;
+
+        Ok(SUCCESS)
+    }
+
     /// Error types for different commands
     // TODO: remove if not needed
     #[derive(Debug, Default)]
@@ -227,7 +292,7 @@ fn main() {
     let mut state = State::new();
     loop {
         // print default information
-        print!("project: {}\nmode: {:?}\n>> ", state.name, state.mode);
+        print!("project: {}\n>> ", state.name);
 
         // get next command from the user
         io::stdout().flush().unwrap();
@@ -241,6 +306,10 @@ fn main() {
             "help" => cmd::help(&mut cmd_iter, &mut state),
             "new" => cmd::new(&mut cmd_iter, &mut state),
             "list" => cmd::list(&mut cmd_iter, &mut state),
+            "ls" => cmd::list(&mut cmd_iter, &mut state),
+            "save" => cmd::save(&mut cmd_iter, &mut state),
+            "s" => cmd::save(&mut cmd_iter, &mut state),
+            "load" => cmd::load(&mut cmd_iter, &mut state),
             "q" => break,
             "exit" => break,
             "quit" => break,
