@@ -1,13 +1,22 @@
 use petgraph::prelude::*;
-use petgraph::visit::{IntoEdgeReferences, IntoNodeReferences};
+use petgraph::visit::IntoNodeReferences;
 use petgraph::*;
 use std::io;
 use std::io::Write;
 
+// TODO: Major Features
+// 1. enums for edge function calls
+// 2. Name list & name validation
+// 3. Node and edge validation
+// 4. Tests
+// 5. Redundancy when editing/pruning/saving
+// 6. Help text based on /// comments
+// 7. Proper error/Ok propogation
+
 static ROPE_EXT: &str = ".rope";
 static TREE_EXT: &str = ".tree";
 static UNKNOWN: &str = "unknown command, type help for more info";
-static NONAME: &str = "no name provided";
+static _NONAME: &str = "no name provided";
 static HELP: &str = "Arbor
     A tree based dialogue editor
 
@@ -21,7 +30,7 @@ static HELP: &str = "Arbor
     q 
     quit 
     exit";
-static UNIMPLEMENTED: &str = "unimplemented command";
+static _UNIMPLEMENTED: &str = "unimplemented command";
 static SUCCESS: &str = "success\r\n";
 
 type Section = [usize; 2];
@@ -30,6 +39,7 @@ pub struct State {
     tree: petgraph::graph::DiGraph<Section, Section>,
     text: ropey::Rope,
     name: String,
+    to_be_deleted: Vec<Section>,
 }
 impl State {
     fn new() -> Self {
@@ -38,6 +48,7 @@ impl State {
             tree: graph::DiGraph::<Section, Section>::with_capacity(1000, 1000),
             text: ropey::Rope::new(),
             name: String::new(),
+            to_be_deleted: Vec::<Section>::with_capacity(10),
         }
     }
 }
@@ -46,14 +57,19 @@ mod cmd {
     use super::*;
 
     /// Unified result type for propogating errors in cmd methods
-    type Result = std::result::Result<&'static str, Box<dyn std::error::Error + Send + Sync>>;
+
+    type Result = std::result::Result<&'static str, cmd::Error>;
 
     pub fn help(_cmd_iter: &mut std::slice::Iter<String>, _state: &mut State) -> cmd::Result {
         Ok(HELP)
     }
 
     pub fn new(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
-        match cmd_iter.next().ok_or(cmd::Error::default())?.as_str() {
+        match cmd_iter
+            .next()
+            .ok_or_else(|| cmd::Error::default())?
+            .as_str()
+        {
             "project" => new::project(cmd_iter, state),
             "node" => new::node(cmd_iter, state),
             "edge" => new::edge(cmd_iter, state),
@@ -67,11 +83,14 @@ mod cmd {
         // TODO: Serializable tree struct
         pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
             // Create new project file on disk with user supplied name
-            let project_name = cmd_iter.next().ok_or(cmd::Error::default())?.to_owned();
+            let project_name = cmd_iter
+                .next()
+                .ok_or_else(|| cmd::Error::default())?
+                .to_owned();
 
             let text = ropey::Rope::new();
             // save info to state
-            state.name = project_name.to_string();
+            state.name = project_name;
             state.text = text;
             Ok("New project created")
         }
@@ -92,11 +111,14 @@ mod cmd {
         pub fn node(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
             // Next and final argument passed with the new node command should be the full text
             // string.
-            let text = cmd_iter.next().ok_or(cmd::Error::default())?.to_owned();
+            let text = cmd_iter
+                .next()
+                .ok_or_else(|| cmd::Error::default())?
+                .to_owned();
 
             // The iterator shouldn't have any command line parameters after the text, if extra
             // parameters are passed it probably is a mistake from the user
-            check_end(cmd_iter)?;
+            util::check_end(cmd_iter)?;
 
             // add the text to the rope, get the start and end line, and add to tree
             // TODO: Text sanitization needed?
@@ -127,19 +149,22 @@ mod cmd {
         pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
             let start_node_idx = cmd_iter
                 .next()
-                .ok_or(cmd::Error::default())?
+                .ok_or_else(|| cmd::Error::default())?
                 .parse::<i32>()? as u32;
 
             let end_node_idx = cmd_iter
                 .next()
-                .ok_or(cmd::Error::default())?
+                .ok_or_else(|| cmd::Error::default())?
                 .parse::<i32>()? as u32;
 
-            let text = cmd_iter.next().ok_or(cmd::Error::default())?.to_owned();
+            let text = cmd_iter
+                .next()
+                .ok_or_else(|| cmd::Error::default())?
+                .to_owned();
 
             // The iterator shouldn't have any command line parameters after the text, if extra
             // parameters are passed it probably is a mistake from the user
-            check_end(cmd_iter)?;
+            util::check_end(cmd_iter)?;
 
             //Add edge text to rope and edge to tree
             let start = state.text.len_chars();
@@ -168,7 +193,7 @@ mod cmd {
     /// NodeIndex(1) Algernon::Well...gotta run
     ///
     pub fn list(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
-        check_end(cmd_iter)?;
+        util::check_end(cmd_iter)?;
         let node_iter = state.tree.node_references();
         node_iter.for_each(|n| {
             // Print node identifier, node text, and then all edges
@@ -198,7 +223,7 @@ mod cmd {
     //  2. Handle custom pathing to save file
     //  3. Have definable default save path (maybe save last path in state)
     pub fn save(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
-        check_end(cmd_iter)?;
+        util::check_end(cmd_iter)?;
         // save tree
         let tree_json = serde_json::to_string(&state.tree).unwrap();
         std::fs::write(state.name.clone() + TREE_EXT, tree_json)?;
@@ -228,8 +253,11 @@ mod cmd {
     //  3. Have definable default path to search for file (maybe save last path in state)
     //  4. Validate files, report error after loading
     pub fn load(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
-        let name = cmd_iter.next().ok_or(cmd::Error::default())?.to_owned();
-        check_end(cmd_iter)?;
+        let name = cmd_iter
+            .next()
+            .ok_or_else(|| cmd::Error::default())?
+            .to_owned();
+        util::check_end(cmd_iter)?;
 
         // Attempt to load files
         let tree: petgraph::graph::DiGraph<Section, Section> = serde_json::from_reader(
@@ -247,10 +275,161 @@ mod cmd {
         Ok(SUCCESS)
     }
 
+    pub fn edit(
+        cmd_iter: &mut std::slice::Iter<String>,
+        buf: &mut String,
+        state: &mut State,
+    ) -> cmd::Result {
+        match cmd_iter
+            .next()
+            .ok_or_else(|| cmd::Error::default())?
+            .as_str()
+        {
+            "project" => edit::project(cmd_iter, state),
+            "node" => edit::node(cmd_iter, buf, state),
+            "edge" => edit::edge(cmd_iter, buf, state),
+            _ => Ok(UNKNOWN),
+        }
+    }
+
+    mod edit {
+        use super::*;
+
+        /// Edit the project info
+        ///
+        /// Currently only edit the project name, requires entering the current project name to
+        /// confirm
+        ///
+        /// example:
+        ///     edit project current_project_name new_project_name
+        pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+            // extract project names from command iter & verify matching project names and number
+            // of args
+            let old_name = cmd_iter.next().ok_or_else(|| cmd::Error::default())?;
+            let new_name = cmd_iter.next().ok_or_else(|| cmd::Error::default())?;
+            util::check_end(cmd_iter)?;
+            util::check_str(&old_name, &new_name)?;
+
+            state.name = new_name.to_string();
+            Ok(SUCCESS)
+        }
+
+        /// Edit the contents of a node
+        ///
+        /// The function first provides the contents of the selected node to the command line.
+        /// The user is then prompted to provide the new contents for the node. The new contents
+        /// need to be inserted in the text rope. Currently this is done with safety in mind, and
+        /// the contents are added to the end of the rope. Once added to the rope, the start and
+        /// end indices stored in the node are updated to point to the new text.
+        ///
+        /// example:
+        ///     edit node 0
+        ///     NodeIndex(0): Algernon::You're a law student?
+        ///     >> new_speaker::new_text
+        // TODO: mark unused section of the rope for deletion, implement scheme for safely
+        // removing unused text and shifting node indices
+        pub fn node(
+            cmd_iter: &mut std::slice::Iter<String>,
+            buf: &mut String,
+            state: &mut State,
+        ) -> cmd::Result {
+            // Get node index and convert into integer, check there are no hanging args
+            let node_idx = NodeIndex::new(
+                cmd_iter
+                    .next()
+                    .ok_or_else(|| cmd::Error::default())?
+                    .parse::<i32>()? as usize,
+            );
+            util::check_end(cmd_iter)?;
+
+            let node_weight = state
+                .tree
+                .node_weight_mut(node_idx)
+                .ok_or_else(|| cmd::Error::default())?;
+
+            println!(
+                "{:#?}: {}",
+                node_idx,
+                state.text.slice(node_weight[0]..node_weight[1])
+            );
+
+            util::prompt_input(buf);
+            // Remove the trailing newline
+            buf.truncate(buf.len() - 1);
+
+            let start = state.text.len_chars();
+            state.text.append(ropey::Rope::from(buf.as_str()));
+            let end = state.text.len_chars();
+
+            state.to_be_deleted.push(*node_weight);
+            *node_weight = [start, end];
+
+            // TODO: Finalize pruning sequence, this may need to move 
+            // Remove unused text section from the graph
+            util::prune(
+                state.to_be_deleted.pop().unwrap(),
+                &mut state.text,
+                &mut state.tree,
+            );
+            Ok(SUCCESS)
+        }
+
+        /// Edit the contents of an edge
+        ///
+        /// The function first provides the contents of the selected edge to the command line.
+        /// The user is then prompted to provide the new contents for the edge. The new contents
+        /// need to be inserted in the text rope. Currently this is done with safety in mind, and
+        /// the contents are added to the end of the rope. Once added to the rope, the start and
+        /// end indices stored in the tree are updated to point to the new text.
+        ///
+        /// example:
+        ///     edit edge 0
+        ///     NodeIndex(0) -> NodeIndex(1) : Gotta run!
+        ///     >> new_text
+        pub fn edge(
+            cmd_iter: &mut std::slice::Iter<String>,
+            buf: &mut String,
+            state: &mut State,
+        ) -> cmd::Result {
+            // Get node index and convert into integer, check there are no hanging args
+            let edge_idx = EdgeIndex::new(
+                cmd_iter
+                    .next()
+                    .ok_or_else(|| cmd::Error::default())?
+                    .parse::<i32>()? as usize,
+            );
+            util::check_end(cmd_iter)?;
+
+            let edge_weight = state
+                .tree
+                .edge_weight_mut(edge_idx)
+                .ok_or_else(|| cmd::Error::default())?;
+
+            println!(
+                "{:#?} : {}",
+                edge_idx,
+                state.text.slice(edge_weight[0]..edge_weight[1])
+            );
+
+            util::prompt_input(buf);
+            // Remove the trailing newline
+            buf.truncate(buf.len() - 1);
+
+            let start = state.text.len_chars();
+            state.text.append(ropey::Rope::from(buf.as_str()));
+            let end = state.text.len_chars();
+
+            state.to_be_deleted.push(*edge_weight);
+            *edge_weight = [start, end];
+
+            Ok(SUCCESS)
+        }
+    }
+
     /// Error types for different commands
     // TODO: remove if not needed
     #[derive(Debug, Default)]
-    struct Error {
+    pub struct Error {
         details: String,
     }
 
@@ -266,41 +445,118 @@ mod cmd {
         }
     }
 
+    /// Placeholder from implementation for io Errors
+    // TODO: use non-default error type for io errors
     impl From<std::io::Error> for Error {
-        fn from(err: std::io::Error) -> Self {
+        fn from(_err: std::io::Error) -> Self {
             Error::default()
         }
     }
 
-    /// Helper method for checking that a command iterator is ended
-    /// Returns Ok if iterator is empty, or a cmd::Error if any more elements remain in the iterator  
-    fn check_end(cmd_iter: &mut std::slice::Iter<String>) -> cmd::Result {
-        cmd_iter
-            .next()
-            .xor(Some(&String::new()))
-            .ok_or(cmd::Error::default())?;
-        // TODO: different Ok message for check_end
-        Ok(SUCCESS)
+    /// Placeholder from implementation for str->int conversion errors
+    // TODO: use non-default error type for str->int conversion errors
+    impl From<std::num::ParseIntError> for Error {
+        fn from(_err: std::num::ParseIntError) -> Self {
+            Error::default()
+        }
+    }
+
+    /// Placeholder from implementation for serde serialization errors
+    // TODO: use non-default error type for serde serialization errors
+    impl From<serde_json::Error> for Error {
+        fn from(_err: serde_json::Error) -> Self {
+            Error::default()
+        }
+    }
+
+    pub mod util {
+        use super::*;
+
+        /// Helper method for checking that a command iterator is ended
+        /// Returns Ok if iterator is empty, or a cmd::Error if any more elements remain in the
+        /// iterator   
+        pub fn check_end(cmd_iter: &mut std::slice::Iter<String>) -> cmd::Result {
+            cmd_iter
+                .next()
+                .xor(Some(&String::new()))
+                .ok_or_else(|| cmd::Error::default())?;
+            // TODO: different Ok message for check_end
+            Ok(SUCCESS)
+        }
+
+        /// Helper method to check if two string slices match, and return a cmd::Result based on
+        /// the results.
+        // TODO: Create non-default error type for compare mismatch
+        pub fn check_str(a: &str, b: &str) -> cmd::Result {
+            match a == b {
+                true => Ok(""),
+                false => Err(cmd::Error::default()),
+            }
+        }
+
+        /// Helper method to prompt the user for input
+        ///
+        /// User input is stored into the provided buffer
+        pub fn prompt_input(buf: &mut String) {
+            // Print input prompt
+            print!(">> ");
+
+            // get next command from the user
+            io::stdout().flush().unwrap();
+            io::stdin().read_line(buf).expect("Failed to read line");
+        }
+
+        /// Helper method to remove text from the middle of the text rope, and adjust the node
+        /// and edge weights accordingly
+        ///
+        /// Note that for prune to work properly, the section of text MUST not be referenced by
+        /// any of the nodes or edges in the tree.
+        pub fn prune(
+            range: Section,
+            rope: &mut ropey::Rope,
+            tree: &mut graph::DiGraph<Section, Section>,
+        ) {
+            // Implementation notes:
+            //  1. Code is written to be branchless in case of a very large tree
+            //  2. Range is non-inclusive, which means that num_removed has to be 1 larger than the
+            //     difference between the ranges
+            //  3. Currently it is just blindly assumed that range[1] > range[0]
+            let num_removed = range[1] - range[0] + 1;
+            assert!(num_removed > 0);
+
+            rope.remove(range[0]..range[1]);
+
+            // Iterate through each node & edge, and shift the range left by the number of removed
+            // characters
+            tree.node_weights_mut().for_each(|w| {
+                let shift = num_removed - (w[0] >= range[1]) as usize;
+                *w = [w[0] - shift, w[1] - shift]
+            });
+
+            tree.edge_weights_mut().for_each(|w| {
+                let shift = num_removed - (w[0] >= range[1]) as usize;
+                *w = [w[0] - shift, w[1] - shift]
+            });
+        }
     }
 }
 
 fn main() {
-    let mut buf = String::with_capacity(100);
+    let mut cmd_buf = String::with_capacity(1000);
+    let mut edit_buf = String::with_capacity(1000);
     println!("welcome to arbor!");
 
     // TODO: clean up state init
     let mut state = State::new();
     loop {
-        // print default information
-        print!("project: {}\n>> ", state.name);
+        // print default header
+        println!("------------");
+        println!("project: {}", state.name);
+        println!("------------");
 
-        // get next command from the user
-        io::stdout().flush().unwrap();
-        io::stdin()
-            .read_line(&mut buf)
-            .expect("Failed to read line");
+        cmd::util::prompt_input(&mut cmd_buf);
 
-        let cmds = shellwords::split(&buf).unwrap();
+        let cmds = shellwords::split(&cmd_buf).unwrap();
         let mut cmd_iter = cmds.iter();
         let res = match cmd_iter.next().unwrap().as_str() {
             "help" => cmd::help(&mut cmd_iter, &mut state),
@@ -310,6 +566,7 @@ fn main() {
             "save" => cmd::save(&mut cmd_iter, &mut state),
             "s" => cmd::save(&mut cmd_iter, &mut state),
             "load" => cmd::load(&mut cmd_iter, &mut state),
+            "edit" => cmd::edit(&mut cmd_iter, &mut edit_buf, &mut state),
             "q" => break,
             "exit" => break,
             "quit" => break,
@@ -322,7 +579,8 @@ fn main() {
             Err(e) => println!("error: {}", e),
         }
 
-        // clear input buffer before starting next input loop
-        buf.clear();
+        // clear input buffers before starting next input loop
+        cmd_buf.clear();
+        edit_buf.clear();
     }
 }
