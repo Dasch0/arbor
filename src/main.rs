@@ -11,7 +11,9 @@ use std::io::Write;
 // 4. Tests
 // 5. Redundancy when editing/pruning/saving
 // 6. Help text based on /// comments
+//      a. standardize /// comment style
 // 7. Proper error/Ok propogation
+// 8. Decouple command parsing from command execution
 
 static ROPE_EXT: &str = ".rope";
 static TREE_EXT: &str = ".tree";
@@ -67,7 +69,7 @@ mod cmd {
     pub fn new(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
         match cmd_iter
             .next()
-            .ok_or_else(|| cmd::Error::default())?
+            .ok_or_else(cmd::Error::default)?
             .as_str()
         {
             "project" => new::project(cmd_iter, state),
@@ -85,7 +87,7 @@ mod cmd {
             // Create new project file on disk with user supplied name
             let project_name = cmd_iter
                 .next()
-                .ok_or_else(|| cmd::Error::default())?
+                .ok_or_else(cmd::Error::default)?
                 .to_owned();
 
             let text = ropey::Rope::new();
@@ -113,7 +115,7 @@ mod cmd {
             // string.
             let text = cmd_iter
                 .next()
-                .ok_or_else(|| cmd::Error::default())?
+                .ok_or_else(cmd::Error::default)?
                 .to_owned();
 
             // The iterator shouldn't have any command line parameters after the text, if extra
@@ -149,17 +151,17 @@ mod cmd {
         pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
             let start_node_idx = cmd_iter
                 .next()
-                .ok_or_else(|| cmd::Error::default())?
+                .ok_or_else(cmd::Error::default)?
                 .parse::<i32>()? as u32;
 
             let end_node_idx = cmd_iter
                 .next()
-                .ok_or_else(|| cmd::Error::default())?
+                .ok_or_else(cmd::Error::default)?
                 .parse::<i32>()? as u32;
 
             let text = cmd_iter
                 .next()
-                .ok_or_else(|| cmd::Error::default())?
+                .ok_or_else(cmd::Error::default)?
                 .to_owned();
 
             // The iterator shouldn't have any command line parameters after the text, if extra
@@ -203,8 +205,10 @@ mod cmd {
                 .edges_directed(n.0, petgraph::Direction::Outgoing)
                 .for_each(|e| {
                     println!(
-                        "--> {:#?} : {} ",
+                        "--> {:#?} : {} : {} ",
                         e.target(),
+                        // TODO: Pull Request index() method to petgraph::EdgeReference
+                        "EdgeIndex(#)",
                         state.text.slice(e.weight()[0]..e.weight()[1])
                     )
                 });
@@ -255,7 +259,7 @@ mod cmd {
     pub fn load(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
         let name = cmd_iter
             .next()
-            .ok_or_else(|| cmd::Error::default())?
+            .ok_or_else(cmd::Error::default)?
             .to_owned();
         util::check_end(cmd_iter)?;
 
@@ -275,19 +279,15 @@ mod cmd {
         Ok(SUCCESS)
     }
 
-    pub fn edit(
-        cmd_iter: &mut std::slice::Iter<String>,
-        buf: &mut String,
-        state: &mut State,
-    ) -> cmd::Result {
+    pub fn edit(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
         match cmd_iter
             .next()
-            .ok_or_else(|| cmd::Error::default())?
+            .ok_or_else(cmd::Error::default)?
             .as_str()
         {
             "project" => edit::project(cmd_iter, state),
-            "node" => edit::node(cmd_iter, buf, state),
-            "edge" => edit::edge(cmd_iter, buf, state),
+            "node" => edit::node(cmd_iter, state),
+            "edge" => edit::edge(cmd_iter, state),
             _ => Ok(UNKNOWN),
         }
     }
@@ -298,15 +298,18 @@ mod cmd {
         /// Edit the project info
         ///
         /// Currently only edit the project name, requires entering the current project name to
-        /// confirm
+        /// confirm change
+        ///
+        /// format: 
+        ///     edit project "<old_title>" "<new_title>"
         ///
         /// example:
-        ///     edit project current_project_name new_project_name
+        ///     edit project "My Old and Bad Title" "My New and Amazing Title" 
         pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
             // extract project names from command iter & verify matching project names and number
             // of args
-            let old_name = cmd_iter.next().ok_or_else(|| cmd::Error::default())?;
-            let new_name = cmd_iter.next().ok_or_else(|| cmd::Error::default())?;
+            let old_name = cmd_iter.next().ok_or_else(cmd::Error::default)?;
+            let new_name = cmd_iter.next().ok_or_else(cmd::Error::default)?;
             util::check_end(cmd_iter)?;
             util::check_str(&old_name, &new_name)?;
 
@@ -316,49 +319,36 @@ mod cmd {
 
         /// Edit the contents of a node
         ///
-        /// The function first provides the contents of the selected node to the command line.
-        /// The user is then prompted to provide the new contents for the node. The new contents
-        /// need to be inserted in the text rope. Currently this is done with safety in mind, and
-        /// the contents are added to the end of the rope. Once added to the rope, the start and
-        /// end indices stored in the node are updated to point to the new text.
+        /// First, the new text section is appended to the end of the text rope. Next, the node
+        /// weights are modified to point to the new text section. Finally, the old text section is
+        /// removed from the rope, and all tree weights are shifted in turn.
+        ///
+        /// format:
+        ///     edit node <NodeIndex> "<edited_node_name::edited_node_text>
         ///
         /// example:
-        ///     edit node 0
-        ///     NodeIndex(0): Algernon::You're a law student?
-        ///     >> new_speaker::new_text
+        ///     edit node 0 "Algernon::You, of all people, are a law student!?"
         // TODO: mark unused section of the rope for deletion, implement scheme for safely
         // removing unused text and shifting node indices
-        pub fn node(
-            cmd_iter: &mut std::slice::Iter<String>,
-            buf: &mut String,
-            state: &mut State,
-        ) -> cmd::Result {
-            // Get node index and convert into integer, check there are no hanging args
+        pub fn node(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+            // Get node index and convert into integer
             let node_idx = NodeIndex::new(
                 cmd_iter
                     .next()
-                    .ok_or_else(|| cmd::Error::default())?
+                    .ok_or_else(cmd::Error::default)?
                     .parse::<i32>()? as usize,
             );
+
+            let new_node_text = cmd_iter.next().ok_or_else(cmd::Error::default)?;
             util::check_end(cmd_iter)?;
 
             let node_weight = state
                 .tree
                 .node_weight_mut(node_idx)
-                .ok_or_else(|| cmd::Error::default())?;
-
-            println!(
-                "{:#?}: {}",
-                node_idx,
-                state.text.slice(node_weight[0]..node_weight[1])
-            );
-
-            util::prompt_input(buf);
-            // Remove the trailing newline
-            buf.truncate(buf.len() - 1);
+                .ok_or_else(cmd::Error::default)?;
 
             let start = state.text.len_chars();
-            state.text.append(ropey::Rope::from(buf.as_str()));
+            state.text.append(ropey::Rope::from(new_node_text.as_str()));
             let end = state.text.len_chars();
 
             state.to_be_deleted.push(*node_weight);
@@ -376,52 +366,46 @@ mod cmd {
 
         /// Edit the contents of an edge
         ///
-        /// The function first provides the contents of the selected edge to the command line.
-        /// The user is then prompted to provide the new contents for the edge. The new contents
-        /// need to be inserted in the text rope. Currently this is done with safety in mind, and
-        /// the contents are added to the end of the rope. Once added to the rope, the start and
-        /// end indices stored in the tree are updated to point to the new text.
+        /// First, the new text section is appended to the end of the text rope. Next, the edge 
+        /// weights are modified to point to the new text section. Finally, the old text section is
+        /// removed from the rope, and all tree weights are shifted in turn.
+        ///
+        /// format:
+        ///     edit edge <EdgeIndex> "<edited_edge_text>"
         ///
         /// example:
-        ///     edit edge 0
-        ///     NodeIndex(0) -> NodeIndex(1) : Gotta run!
-        ///     >> new_text
-        pub fn edge(
-            cmd_iter: &mut std::slice::Iter<String>,
-            buf: &mut String,
-            state: &mut State,
-        ) -> cmd::Result {
-            // Get node index and convert into integer, check there are no hanging args
-            let edge_idx = EdgeIndex::new(
+        ///     edit edge 0 "No, I'm not" 
+        pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+            // Get node index and convert into integer
+            let node_idx = NodeIndex::new(
                 cmd_iter
                     .next()
-                    .ok_or_else(|| cmd::Error::default())?
+                    .ok_or_else(cmd::Error::default)?
                     .parse::<i32>()? as usize,
             );
+
+            let new_node_text = cmd_iter.next().ok_or_else(cmd::Error::default)?;
             util::check_end(cmd_iter)?;
 
-            let edge_weight = state
+            let node_weight = state
                 .tree
-                .edge_weight_mut(edge_idx)
-                .ok_or_else(|| cmd::Error::default())?;
-
-            println!(
-                "{:#?} : {}",
-                edge_idx,
-                state.text.slice(edge_weight[0]..edge_weight[1])
-            );
-
-            util::prompt_input(buf);
-            // Remove the trailing newline
-            buf.truncate(buf.len() - 1);
+                .node_weight_mut(node_idx)
+                .ok_or_else(cmd::Error::default)?;
 
             let start = state.text.len_chars();
-            state.text.append(ropey::Rope::from(buf.as_str()));
+            state.text.append(ropey::Rope::from(new_node_text.as_str()));
             let end = state.text.len_chars();
 
-            state.to_be_deleted.push(*edge_weight);
-            *edge_weight = [start, end];
+            state.to_be_deleted.push(*node_weight);
+            *node_weight = [start, end];
 
+            // TODO: Finalize pruning sequence, this may need to move 
+            // Remove unused text section from the graph
+            util::prune(
+                state.to_be_deleted.pop().unwrap(),
+                &mut state.text,
+                &mut state.tree,
+            );
             Ok(SUCCESS)
         }
     }
@@ -479,7 +463,7 @@ mod cmd {
             cmd_iter
                 .next()
                 .xor(Some(&String::new()))
-                .ok_or_else(|| cmd::Error::default())?;
+                .ok_or_else(cmd::Error::default)?;
             // TODO: different Ok message for check_end
             Ok(SUCCESS)
         }
@@ -543,8 +527,6 @@ mod cmd {
 
 fn main() {
     let mut cmd_buf = String::with_capacity(1000);
-    let mut edit_buf = String::with_capacity(1000);
-    println!("welcome to arbor!");
 
     // TODO: clean up state init
     let mut state = State::new();
@@ -566,7 +548,7 @@ fn main() {
             "save" => cmd::save(&mut cmd_iter, &mut state),
             "s" => cmd::save(&mut cmd_iter, &mut state),
             "load" => cmd::load(&mut cmd_iter, &mut state),
-            "edit" => cmd::edit(&mut cmd_iter, &mut edit_buf, &mut state),
+            "edit" => cmd::edit(&mut cmd_iter, &mut state),
             "q" => break,
             "exit" => break,
             "quit" => break,
@@ -581,6 +563,5 @@ fn main() {
 
         // clear input buffers before starting next input loop
         cmd_buf.clear();
-        edit_buf.clear();
     }
 }
