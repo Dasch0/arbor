@@ -35,20 +35,37 @@ static HELP: &str = "Arbor
 static _UNIMPLEMENTED: &str = "unimplemented command";
 static SUCCESS: &str = "success\r\n";
 
-type Section = [usize; 2];
+/// typedef representing a section of text in a rope. This section contains a start and end index,
+/// stored in an array. The first element should always be smaller than the second
+pub type Section = [usize; 2];
 
-pub struct State {
+/// Struct storing the information for a player choice. Stored in the edges of a dialogue tree
+pub struct Choice {
+   text: Section,
+   action: action::Kind
+}
+
+impl Choice {
+    fn new(text: Section, action: action::Kind) -> Self {
+        Choice{
+            text,
+            action,
+        }
+    }
+}
+
+pub struct EditorState {
     tree: petgraph::graph::DiGraph<Section, Section>,
-    text: ropey::Rope,
+    rope: ropey::Rope,
     name: String,
     to_be_deleted: Vec<Section>,
 }
-impl State {
+impl EditorState {
     fn new() -> Self {
-        State {
+        EditorState {
             //TODO: parameter for initial capacity
             tree: graph::DiGraph::<Section, Section>::with_capacity(1000, 1000),
-            text: ropey::Rope::new(),
+            rope: ropey::Rope::new(),
             name: String::new(),
             to_be_deleted: Vec::<Section>::with_capacity(10),
         }
@@ -62,11 +79,11 @@ mod cmd {
 
     type Result = std::result::Result<&'static str, cmd::Error>;
 
-    pub fn help(_cmd_iter: &mut std::slice::Iter<String>, _state: &mut State) -> cmd::Result {
+    pub fn help(_cmd_iter: &mut std::slice::Iter<String>, _state: &mut EditorState) -> cmd::Result {
         Ok(HELP)
     }
 
-    pub fn new(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+    pub fn new(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
         match cmd_iter
             .next()
             .ok_or_else(cmd::Error::default)?
@@ -83,7 +100,7 @@ mod cmd {
         use super::*;
 
         // TODO: Serializable tree struct
-        pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+        pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
             // Create new project file on disk with user supplied name
             let project_name = cmd_iter
                 .next()
@@ -93,7 +110,7 @@ mod cmd {
             let text = ropey::Rope::new();
             // save info to state
             state.name = project_name;
-            state.text = text;
+            state.rope = text;
             Ok("New project created")
         }
 
@@ -110,7 +127,7 @@ mod cmd {
         /// The node is also represented in the tree by an array of two values, the start and end
         /// line of the node's text block in the text rope.  
         ///
-        pub fn node(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+        pub fn node(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
             // Next and final argument passed with the new node command should be the full text
             // string.
             let text = cmd_iter
@@ -124,9 +141,9 @@ mod cmd {
 
             // add the text to the rope, get the start and end line, and add to tree
             // TODO: Text sanitization needed?
-            let start = state.text.len_chars();
-            state.text.append(ropey::Rope::from(text));
-            let end = state.text.len_chars();
+            let start = state.rope.len_chars();
+            state.rope.append(ropey::Rope::from(text));
+            let end = state.rope.len_chars();
             state.tree.add_node([start, end]);
             Ok(SUCCESS)
         }
@@ -148,7 +165,7 @@ mod cmd {
         ///
         // TODO: Define case for empty edge, where no action is taken and dialogue should move
         // automatically to the next node.
-        pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+        pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
             let start_node_idx = cmd_iter
                 .next()
                 .ok_or_else(cmd::Error::default)?
@@ -169,9 +186,9 @@ mod cmd {
             util::check_end(cmd_iter)?;
 
             //Add edge text to rope and edge to tree
-            let start = state.text.len_chars();
-            state.text.append(ropey::Rope::from(text));
-            let end = state.text.len_chars();
+            let start = state.rope.len_chars();
+            state.rope.append(ropey::Rope::from(text));
+            let end = state.rope.len_chars();
             state.tree.add_edge(
                 NodeIndex::from(start_node_idx),
                 NodeIndex::from(end_node_idx),
@@ -194,12 +211,12 @@ mod cmd {
     /// --> NodeIndex(1) No
     /// NodeIndex(1) Algernon::Well...gotta run
     ///
-    pub fn list(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+    pub fn list(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
         util::check_end(cmd_iter)?;
         let node_iter = state.tree.node_references();
         node_iter.for_each(|n| {
             // Print node identifier, node text, and then all edges
-            println!("{:#?} : {}", n.0, state.text.slice(n.1[0]..n.1[1]));
+            println!("{:#?} : {}", n.0, state.rope.slice(n.1[0]..n.1[1]));
             state
                 .tree
                 .edges_directed(n.0, petgraph::Direction::Outgoing)
@@ -207,9 +224,8 @@ mod cmd {
                     println!(
                         "--> {:#?} : {} : {} ",
                         e.target(),
-                        // TODO: Pull Request index() method to petgraph::EdgeReference
-                        "EdgeIndex(#)",
-                        state.text.slice(e.weight()[0]..e.weight()[1])
+                        e.id().index(),
+                        state.rope.slice(e.weight()[0]..e.weight()[1])
                     )
                 });
         });
@@ -226,7 +242,7 @@ mod cmd {
     //  1. Handle overwriting, backups, etc
     //  2. Handle custom pathing to save file
     //  3. Have definable default save path (maybe save last path in state)
-    pub fn save(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+    pub fn save(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
         util::check_end(cmd_iter)?;
         // save tree
         let tree_json = serde_json::to_string(&state.tree).unwrap();
@@ -234,7 +250,7 @@ mod cmd {
 
         // save text
         state
-            .text
+            .rope
             .write_to(std::io::BufWriter::new(std::fs::File::create(
                 state.name.clone() + ROPE_EXT,
             )?))?;
@@ -256,7 +272,7 @@ mod cmd {
     //  2. Consider recursive searching for files
     //  3. Have definable default path to search for file (maybe save last path in state)
     //  4. Validate files, report error after loading
-    pub fn load(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+    pub fn load(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
         let name = cmd_iter
             .next()
             .ok_or_else(cmd::Error::default)?
@@ -273,13 +289,13 @@ mod cmd {
 
         // If successful, update state
         state.tree = tree;
-        state.text = rope;
+        state.rope = rope;
         state.name = name;
 
         Ok(SUCCESS)
     }
 
-    pub fn edit(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+    pub fn edit(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
         match cmd_iter
             .next()
             .ok_or_else(cmd::Error::default)?
@@ -305,7 +321,7 @@ mod cmd {
         ///
         /// example:
         ///     edit project "My Old and Bad Title" "My New and Amazing Title" 
-        pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+        pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
             // extract project names from command iter & verify matching project names and number
             // of args
             let old_name = cmd_iter.next().ok_or_else(cmd::Error::default)?;
@@ -330,7 +346,7 @@ mod cmd {
         ///     edit node 0 "Algernon::You, of all people, are a law student!?"
         // TODO: mark unused section of the rope for deletion, implement scheme for safely
         // removing unused text and shifting node indices
-        pub fn node(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+        pub fn node(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
             // Get node index and convert into integer
             let node_idx = NodeIndex::new(
                 cmd_iter
@@ -347,9 +363,9 @@ mod cmd {
                 .node_weight_mut(node_idx)
                 .ok_or_else(cmd::Error::default)?;
 
-            let start = state.text.len_chars();
-            state.text.append(ropey::Rope::from(new_node_text.as_str()));
-            let end = state.text.len_chars();
+            let start = state.rope.len_chars();
+            state.rope.append(ropey::Rope::from(new_node_text.as_str()));
+            let end = state.rope.len_chars();
 
             state.to_be_deleted.push(*node_weight);
             *node_weight = [start, end];
@@ -358,7 +374,7 @@ mod cmd {
             // Remove unused text section from the graph
             util::prune(
                 state.to_be_deleted.pop().unwrap(),
-                &mut state.text,
+                &mut state.rope,
                 &mut state.tree,
             );
             Ok(SUCCESS)
@@ -375,7 +391,7 @@ mod cmd {
         ///
         /// example:
         ///     edit edge 0 "No, I'm not" 
-        pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut State) -> cmd::Result {
+        pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
             // Get node index and convert into integer
             let node_idx = NodeIndex::new(
                 cmd_iter
@@ -392,9 +408,9 @@ mod cmd {
                 .node_weight_mut(node_idx)
                 .ok_or_else(cmd::Error::default)?;
 
-            let start = state.text.len_chars();
-            state.text.append(ropey::Rope::from(new_node_text.as_str()));
-            let end = state.text.len_chars();
+            let start = state.rope.len_chars();
+            state.rope.append(ropey::Rope::from(new_node_text.as_str()));
+            let end = state.rope.len_chars();
 
             state.to_be_deleted.push(*node_weight);
             *node_weight = [start, end];
@@ -403,7 +419,7 @@ mod cmd {
             // Remove unused text section from the graph
             util::prune(
                 state.to_be_deleted.pop().unwrap(),
-                &mut state.text,
+                &mut state.rope,
                 &mut state.tree,
             );
             Ok(SUCCESS)
@@ -525,11 +541,25 @@ mod cmd {
     }
 }
 
+mod action {
+    /// Kind defines the types of actions available for dialogue tree choices
+    pub enum Kind {
+        /// No action
+        Inactive,
+        /// Stores a specific word or phrase to the Hashtable with a provided key, if the key is
+        /// already used, the value is updated. If the key is new, a new entry in the table is
+        /// created
+        Store,
+        /// Similar function to store, except the word or phrase is provided by the user
+        StorePrompt,
+    }
+}
+
 fn main() {
     let mut cmd_buf = String::with_capacity(1000);
 
     // TODO: clean up state init
-    let mut state = State::new();
+    let mut state = EditorState::new();
     loop {
         // print default header
         println!("------------");
