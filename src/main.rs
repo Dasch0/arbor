@@ -3,6 +3,8 @@ use petgraph::visit::IntoNodeReferences;
 use petgraph::*;
 use std::io;
 use std::io::Write;
+use displaydoc::Display;
+use serde::{Serialize, Deserialize};
 
 // TODO: Major Features
 // 1. enums for edge function calls
@@ -40,6 +42,7 @@ static SUCCESS: &str = "success\r\n";
 pub type Section = [usize; 2];
 
 /// Struct storing the information for a player choice. Stored in the edges of a dialogue tree
+#[derive(Serialize, Deserialize)] 
 pub struct Choice {
    text: Section,
    action: action::Kind
@@ -55,7 +58,7 @@ impl Choice {
 }
 
 pub struct EditorState {
-    tree: petgraph::graph::DiGraph<Section, Section>,
+    tree: petgraph::graph::DiGraph<Section, Choice>,
     rope: ropey::Rope,
     name: String,
     to_be_deleted: Vec<Section>,
@@ -64,7 +67,7 @@ impl EditorState {
     fn new() -> Self {
         EditorState {
             //TODO: parameter for initial capacity
-            tree: graph::DiGraph::<Section, Section>::with_capacity(1000, 1000),
+            tree: graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
             rope: ropey::Rope::new(),
             name: String::new(),
             to_be_deleted: Vec::<Section>::with_capacity(10),
@@ -192,7 +195,7 @@ mod cmd {
             state.tree.add_edge(
                 NodeIndex::from(start_node_idx),
                 NodeIndex::from(end_node_idx),
-                [start, end],
+                Choice::new([start, end], action::Kind::Inactive),
             );
 
             Ok(SUCCESS)
@@ -225,7 +228,7 @@ mod cmd {
                         "--> {:#?} : {} : {} ",
                         e.target(),
                         e.id().index(),
-                        state.rope.slice(e.weight()[0]..e.weight()[1])
+                        state.rope.slice(e.weight().text[0]..e.weight().text[1])
                     )
                 });
         });
@@ -280,7 +283,7 @@ mod cmd {
         util::check_end(cmd_iter)?;
 
         // Attempt to load files
-        let tree: petgraph::graph::DiGraph<Section, Section> = serde_json::from_reader(
+        let tree: petgraph::graph::DiGraph<Section, Choice> = serde_json::from_reader(
             std::io::BufReader::new(std::fs::File::open(name.clone() + TREE_EXT)?),
         )?;
         let rope = ropey::Rope::from_reader(std::io::BufReader::new(std::fs::File::open(
@@ -426,6 +429,31 @@ mod cmd {
         }
     }
 
+    /// Start reading the currently loaded project from the start node
+    /// 
+    /// format:
+    ///     read 
+    /// example:
+    ///     read 
+    // TODO: This is a prototype for read functionality, likely needs to be moved in the future
+    pub fn read(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
+        println!("reader mode:");
+        util::check_end(cmd_iter)?;
+        let node_idx = graph::node_index(0);
+        let iter = state.tree.edges_directed(node_idx, petgraph::Direction::Outgoing);
+        let _target_list = iter
+            .enumerate()
+            .map(|(i, e)| {
+                println!(
+                    "{}. {}",
+                    i,
+                    state.rope.slice(e.weight().text[0]..e.weight().text[1])
+                );
+                e.target()
+        });
+        Ok(SUCCESS)
+    }
+
     /// Error types for different commands
     // TODO: remove if not needed
     #[derive(Debug, Default)]
@@ -514,7 +542,7 @@ mod cmd {
         pub fn prune(
             range: Section,
             rope: &mut ropey::Rope,
-            tree: &mut graph::DiGraph<Section, Section>,
+            tree: &mut graph::DiGraph<Section, Choice>,
         ) {
             // Implementation notes:
             //  1. Code is written to be branchless in case of a very large tree
@@ -534,15 +562,17 @@ mod cmd {
             });
 
             tree.edge_weights_mut().for_each(|w| {
-                let shift = num_removed - (w[0] >= range[1]) as usize;
-                *w = [w[0] - shift, w[1] - shift]
+                let shift = num_removed - (w.text[0] >= range[1]) as usize;
+                w.text = [w.text[0] - shift, w.text[1] - shift]
             });
         }
     }
 }
 
 mod action {
+    use super::*; 
     /// Kind defines the types of actions available for dialogue tree choices
+    #[derive(Serialize, Deserialize)]
     pub enum Kind {
         /// No action
         Inactive,
@@ -579,6 +609,7 @@ fn main() {
             "s" => cmd::save(&mut cmd_iter, &mut state),
             "load" => cmd::load(&mut cmd_iter, &mut state),
             "edit" => cmd::edit(&mut cmd_iter, &mut state),
+            "read" => cmd::read(&mut cmd_iter, &mut state),
             "q" => break,
             "exit" => break,
             "quit" => break,
