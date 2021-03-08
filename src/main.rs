@@ -3,8 +3,19 @@ use petgraph::visit::IntoNodeReferences;
 use petgraph::*;
 use std::io;
 use std::io::Write;
-use displaydoc::Display;
-use serde::{Serialize, Deserialize};
+use structopt::*;
+use derive_new::*;
+use clap::AppSettings;
+use enum_dispatch::*;
+use enum_from_str::ParseEnumVariantError;
+use enum_from_str_derive::FromStr;
+use serde::{Serialize,
+            Deserialize,
+            Serializer,
+            Deserializer,
+            de::Visitor};
+
+use crate::cmd::Executable;
 
 // TODO: Major Features
 // 1. enums for edge function calls
@@ -12,16 +23,15 @@ use serde::{Serialize, Deserialize};
 // 3. Node and edge validation
 // 4. Tests
 // 5. Redundancy when editing/pruning/saving
-// 6. Help text based on /// comments
-//      a. standardize /// comment style
-// 7. Proper error/Ok propogation
-// 8. Decouple command parsing from command execution
+// 6. Proper error/Ok propogation
+// 7. Fork ropey::Rope and implement serialize/deserialize
+// 8. Switch to bincode serialization format, json should only be for debugging
 
 static ROPE_EXT: &str = ".rope";
 static TREE_EXT: &str = ".tree";
 static UNKNOWN: &str = "unknown command, type help for more info";
 static _NONAME: &str = "no name provided";
-static HELP: &str = "Arbor
+static HELP: &str = "
     A tree based dialogue editor
 
     commands:
@@ -42,35 +52,71 @@ static SUCCESS: &str = "success\r\n";
 pub type Section = [usize; 2];
 
 /// Struct storing the information for a player choice. Stored in the edges of a dialogue tree
-#[derive(Serialize, Deserialize)] 
+#[derive(new, Serialize, Deserialize)] 
 pub struct Choice {
    text: Section,
    action: action::Kind
 }
 
-impl Choice {
-    fn new(text: Section, action: action::Kind) -> Self {
-        Choice{
-            text,
-            action,
-        }
+/// Wrapper for ropey::Rope struct to implement the serializable trait via the Rope::write_to
+/// method
+#[derive(new)]
+pub struct SerialRope{
+    rope: ropey::Rope,
+}
+
+impl Serialize for SerialRope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> 
+    where
+        S: Serializer
+    {
+        let rope_string = self.rope.to_string();
+        serializer.serialize_str(rope_string.as_str())
     }
 }
 
+impl std::str::FromStr for SerialRope {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(SerialRope::new(ropey::Rope::from_str(s)))    
+    }
+}
+
+impl<'de> Deserialize<'de> for SerialRope {
+    fn deserialize<D>(deserializer: D) -> Result<SerialRope, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RopeVisitor;
+
+        impl<'de> Visitor<'de> for RopeVisitor {
+            type Value = SerialRope;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("text rope as string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) 
+            -> std::result::Result<Self::Value, E> {
+                value.parse().map_err(|_| serde::de::Error::custom(""))
+            }
+        }
+        deserializer.deserialize_str(RopeVisitor)
+    }
+}
+
+#[derive(new, Serialize, Deserialize)]
 pub struct EditorState {
     tree: petgraph::graph::DiGraph<Section, Choice>,
-    rope: ropey::Rope,
+    rope: SerialRope,
     name: String,
-    to_be_deleted: Vec<Section>,
 }
 impl EditorState {
-    fn new() -> Self {
+    fn default() -> Self {
         EditorState {
-            //TODO: parameter for initial capacity
             tree: graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
-            rope: ropey::Rope::new(),
+            rope: SerialRope::new(ropey::Rope::new()),
             name: String::new(),
-            to_be_deleted: Vec::<Section>::with_capacity(10),
         }
     }
 }
@@ -79,384 +125,227 @@ mod cmd {
     use super::*;
 
     /// Unified result type for propogating errors in cmd methods
-
     type Result = std::result::Result<&'static str, cmd::Error>;
 
-    pub fn help(_cmd_iter: &mut std::slice::Iter<String>, _state: &mut EditorState) -> cmd::Result {
-        Ok(HELP)
+    /// Trait to allow structopt generated 
+    #[enum_dispatch]
+    pub trait Executable {
+        fn execute(&self, state: &mut EditorState) -> cmd::Result;
     }
 
-    pub fn new(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-        match cmd_iter
-            .next()
-            .ok_or_else(cmd::Error::default)?
-            .as_str()
-        {
-            "project" => new::project(cmd_iter, state),
-            "node" => new::node(cmd_iter, state),
-            "edge" => new::edge(cmd_iter, state),
-            _ => Ok(UNKNOWN),
-        }
+    /// A tree based dialogue editor
+    // NoBinaryName is set so that the first arg is not parsed as binary name when using
+    // StructOpt::from_iter_safe
+    // name is set as "" to prevent usage help from recommending to start commands with "dialogue_tree"
+    #[enum_dispatch(Executable)]
+    #[derive(StructOpt)]
+    #[structopt(name="", setting = AppSettings::NoBinaryName)]
+    pub enum Parse {
+        New(new::Parse),
+        Save(Save),
+        Load(Load),
+        List(List),
     }
 
     mod new {
         use super::*;
 
-        // TODO: Serializable tree struct
-        pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-            // Create new project file on disk with user supplied name
-            let project_name = cmd_iter
-                .next()
-                .ok_or_else(cmd::Error::default)?
-                .to_owned();
+        /// Create new things 
+        #[enum_dispatch(Executable)]
+        #[derive(StructOpt)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub enum Parse{
+            Project(new::Project),
+            Node(new::Node),
+            Edge(new::Edge),
+        }
+        
+        /// Create a new project
+        ///
+        /// A project is made up of a text rope storing all dialogue text, a hashtable storing
+        /// variable or user defined values, and a graph representing the narrative. Nodes of the
+        /// graph represent dialogues from characters in the story, and nodes represent the 
+        /// actions of the player.
+        #[derive(new, StructOpt, Debug)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Project {
+            /// The name of the project
+            name: String,
 
-            let text = ropey::Rope::new();
-            // save info to state
-            state.name = project_name;
-            state.rope = text;
-            Ok("New project created")
+            /// Determine if the project should be loaded as the active project after creation. If
+            /// any unsaved changes in the current project will be discarded.
+            #[structopt(short, long)]
+            set_active: bool,
+        }
+        impl Executable for Project {
+            // Create a new file on disk for new project, optionally set it as active in the editor
+            // state
+            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+                let mut new_state = EditorState::new(
+                    graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
+                    SerialRope::new(ropey::Rope::new()),
+                    self.name.clone(),
+                    );
+
+                cmd::Save::new().execute(&mut new_state)?;
+                
+                if self.set_active {
+                    *state = new_state;
+                    Ok("New project created and set as active")
+                } else {
+                    Ok("New project created on disk")
+                }
+            }
         }
 
-        /// Create a new node
-        /// The node represents a continuous block of text in the text rope, and a segment of
-        /// dialogue from a character. Different sections of the node are delimited by '::' in the
-        /// text rope. A node has 2 sections:
-        /// 1. Speaker name
-        /// 2. Dialogue
+        /// Create a new node in the dialogue tree
         ///
-        /// example:
-        /// new node "Algernon::You're a law student?"
-        ///
-        /// The node is also represented in the tree by an array of two values, the start and end
-        /// line of the node's text block in the text rope.  
-        ///
-        pub fn node(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-            // Next and final argument passed with the new node command should be the full text
-            // string.
-            let text = cmd_iter
-                .next()
-                .ok_or_else(cmd::Error::default)?
-                .to_owned();
+        /// A node represents a text a segment of dialogue from a character.
+        #[derive(new, StructOpt, Debug)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Node {
+           /// The speaker for this node 
+           speaker: String,
+           /// The text or action for this node 
+           dialogue: String,
+        }
+        impl Executable for Node {
+            /// Create a new section of text on the text rope, and then make a new node on the
+            /// tree pointing to the section
+            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+                let start = state.rope.rope.len_chars();
+                state.rope.rope.append(ropey::Rope::from(format!("{}::{}", self.speaker, self.dialogue)));
+                let end = state.rope.rope.len_chars();
+                state.tree.add_node([start, end]);
+                Ok(SUCCESS)
+            }
+        }
 
-            // The iterator shouldn't have any command line parameters after the text, if extra
-            // parameters are passed it probably is a mistake from the user
-            util::check_end(cmd_iter)?;
+        /// Create a new edge in the dialogue tree
+        ///
+        /// An edge represents an action from the player that connects two nodes
+        #[derive(new, StructOpt)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Edge {
+            /// dialogue node that this action originates from
+            start_node_idx: u32,
+            /// dialogue node that this action will lead to 
+            end_node_idx: u32,
+            /// Action text or dialogue
+            text: String,
+            /// Special types for actions that may edit variables  
+            ///
+            /// An example action is if the user is prompted to input the name of their character,
+            /// or if the user picks up a variable item from a table and stores it in their
+            /// inventory
+            action: Option<action::Kind>,
+        }
 
-            // add the text to the rope, get the start and end line, and add to tree
-            // TODO: Text sanitization needed?
-            let start = state.rope.len_chars();
-            state.rope.append(ropey::Rope::from(text));
-            let end = state.rope.len_chars();
-            state.tree.add_node([start, end]);
+        impl Executable for Edge {
+            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+                let start = state.rope.rope.len_chars();
+                state.rope.rope.append(ropey::Rope::from(self.text.clone()));
+                let end = state.rope.rope.len_chars();
+                state.tree.add_edge(
+                    NodeIndex::from(self.start_node_idx),
+                    NodeIndex::from(self.end_node_idx),
+                    Choice::new([start, end], self.action.unwrap_or_default()),
+                );
+                Ok(SUCCESS)
+            }
+        }
+    }
+
+    /// Save the current project
+    #[derive(new, StructOpt, Debug)]
+    #[structopt(setting = AppSettings::NoBinaryName)]
+    pub struct Save {}
+
+    impl Executable for Save {
+        fn execute(&self, state: &mut EditorState) -> cmd::Result { 
+            let json = serde_json::to_string(&state).unwrap();
+            std::fs::write(state.name.clone() + TREE_EXT, json)?;
             Ok(SUCCESS)
         }
+    }
 
-        /// Create a new edge between nodes
-        /// The edge represents a dialogue choice by the player. The edge should connect two nodes
-        /// of dialogue with an action. The user will select from a list of outgoing edges on a
-        /// given node in order to choose the path through the dialogue tree. Edges can loop back
-        /// to the same node (eg: to retry a different option), and any number of edges may connect
-        /// the same or different nodes.
-        ///
-        /// Note that edges are directional, so to create a loop between two dialogue options, two
-        /// edges need to be defined.
-        ///
-        /// The format for defining a new edge is:
-        ///     new edge <start_node_idx> <target_node_idx> "<user choice or action>"
-        /// example:
-        ///     new edge 0 1 "Yes, I am"
-        ///
-        // TODO: Define case for empty edge, where no action is taken and dialogue should move
-        // automatically to the next node.
-        pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-            let start_node_idx = cmd_iter
-                .next()
-                .ok_or_else(cmd::Error::default)?
-                .parse::<i32>()? as u32;
+    /// Load a project from disk, will overwrite unsaved changes
+    #[derive(new, StructOpt, Debug)]
+    #[structopt(setting = AppSettings::NoBinaryName)]
+    pub struct Load {
+        name: String,
+    }
 
-            let end_node_idx = cmd_iter
-                .next()
-                .ok_or_else(cmd::Error::default)?
-                .parse::<i32>()? as u32;
-
-            let text = cmd_iter
-                .next()
-                .ok_or_else(cmd::Error::default)?
-                .to_owned();
-
-            // The iterator shouldn't have any command line parameters after the text, if extra
-            // parameters are passed it probably is a mistake from the user
-            util::check_end(cmd_iter)?;
-
-            //Add edge text to rope and edge to tree
-            let start = state.rope.len_chars();
-            state.rope.append(ropey::Rope::from(text));
-            let end = state.rope.len_chars();
-            state.tree.add_edge(
-                NodeIndex::from(start_node_idx),
-                NodeIndex::from(end_node_idx),
-                Choice::new([start, end], action::Kind::Inactive),
-            );
-
+    impl Executable for Load {
+        fn execute(&self, state: &mut EditorState) -> cmd::Result {
+            let new_state: EditorState = serde_json::from_reader(
+                std::io::BufReader::new(std::fs::File::open(self.name.clone() + TREE_EXT)?),
+            )?;
+            *state = new_state;
             Ok(SUCCESS)
         }
     }
 
     /// Print all nodes, edges, and associated text
-    /// This prints all nodes in index order (not necessarily the order they would appear when
+    ///
+    /// Prints all nodes in index order (not necessarily the order they would appear when
     /// traversing the dialogue tree). Under each node definiton, a list of the outgoing edges from
     /// that node will be listed. This will show the path to the next dialogue option from any
     /// node, and the choice/action text associated with that edge.
-    ///
-    /// ex:
-    /// NodeIndex(0) Algernon::You're a law Student?
-    /// --> NodeIndex(1) Yes
-    /// --> NodeIndex(1) No
-    /// NodeIndex(1) Algernon::Well...gotta run
-    ///
-    pub fn list(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-        util::check_end(cmd_iter)?;
-        let node_iter = state.tree.node_references();
-        node_iter.for_each(|n| {
-            // Print node identifier, node text, and then all edges
-            println!("{:#?} : {}", n.0, state.rope.slice(n.1[0]..n.1[1]));
-            state
-                .tree
-                .edges_directed(n.0, petgraph::Direction::Outgoing)
-                .for_each(|e| {
-                    println!(
-                        "--> {:#?} : {} : {} ",
-                        e.target(),
-                        e.id().index(),
-                        state.rope.slice(e.weight().text[0]..e.weight().text[1])
-                    )
-                });
-        });
+    #[derive(new, StructOpt, Debug)]
+    #[structopt(setting = AppSettings::NoBinaryName)]
+    pub struct List {}
 
-        Ok(SUCCESS)
-    }
-
-    /// Save the text rope and tree to the file system
-    ///
-    /// At the moment, the tree and text rope are saved to different files, with .rope and .tree
-    /// file extensions respectively. These files are saved to the local directory
-
-    // TODO:
-    //  1. Handle overwriting, backups, etc
-    //  2. Handle custom pathing to save file
-    //  3. Have definable default save path (maybe save last path in state)
-    pub fn save(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-        util::check_end(cmd_iter)?;
-        // save tree
-        let tree_json = serde_json::to_string(&state.tree).unwrap();
-        std::fs::write(state.name.clone() + TREE_EXT, tree_json)?;
-
-        // save text
-        state
-            .rope
-            .write_to(std::io::BufWriter::new(std::fs::File::create(
-                state.name.clone() + ROPE_EXT,
-            )?))?;
-        Ok(SUCCESS)
-    }
-
-    /// Load a text rope and tree from the file system
-    ///
-    /// Will open a .rope and .tree file with the provided name. Currently only looks in the
-    /// current working directory. Once loaded, the program state will be updated to edit the new
-    /// text rope and tree, using the loaded project name
-    ///
-    /// Format for load command is:
-    ///     load <project_name>
-    /// example (with files algernon.tree and algernon.rope in ./):
-    ///     load algernon
-    // TODO:
-    //  1. Handle custom pathing
-    //  2. Consider recursive searching for files
-    //  3. Have definable default path to search for file (maybe save last path in state)
-    //  4. Validate files, report error after loading
-    pub fn load(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-        let name = cmd_iter
-            .next()
-            .ok_or_else(cmd::Error::default)?
-            .to_owned();
-        util::check_end(cmd_iter)?;
-
-        // Attempt to load files
-        let tree: petgraph::graph::DiGraph<Section, Choice> = serde_json::from_reader(
-            std::io::BufReader::new(std::fs::File::open(name.clone() + TREE_EXT)?),
-        )?;
-        let rope = ropey::Rope::from_reader(std::io::BufReader::new(std::fs::File::open(
-            name.clone() + ROPE_EXT,
-        )?))?;
-
-        // If successful, update state
-        state.tree = tree;
-        state.rope = rope;
-        state.name = name;
-
-        Ok(SUCCESS)
-    }
-
-    pub fn edit(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-        match cmd_iter
-            .next()
-            .ok_or_else(cmd::Error::default)?
-            .as_str()
-        {
-            "project" => edit::project(cmd_iter, state),
-            "node" => edit::node(cmd_iter, state),
-            "edge" => edit::edge(cmd_iter, state),
-            _ => Ok(UNKNOWN),
-        }
-    }
-
-    mod edit {
-        use super::*;
-
-        /// Edit the project info
-        ///
-        /// Currently only edit the project name, requires entering the current project name to
-        /// confirm change
-        ///
-        /// format: 
-        ///     edit project "<old_title>" "<new_title>"
-        ///
-        /// example:
-        ///     edit project "My Old and Bad Title" "My New and Amazing Title" 
-        pub fn project(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-            // extract project names from command iter & verify matching project names and number
-            // of args
-            let old_name = cmd_iter.next().ok_or_else(cmd::Error::default)?;
-            let new_name = cmd_iter.next().ok_or_else(cmd::Error::default)?;
-            util::check_end(cmd_iter)?;
-            util::check_str(&old_name, &new_name)?;
-
-            state.name = new_name.to_string();
-            Ok(SUCCESS)
-        }
-
-        /// Edit the contents of a node
-        ///
-        /// First, the new text section is appended to the end of the text rope. Next, the node
-        /// weights are modified to point to the new text section. Finally, the old text section is
-        /// removed from the rope, and all tree weights are shifted in turn.
-        ///
-        /// format:
-        ///     edit node <NodeIndex> "<edited_node_name::edited_node_text>
-        ///
-        /// example:
-        ///     edit node 0 "Algernon::You, of all people, are a law student!?"
-        // TODO: mark unused section of the rope for deletion, implement scheme for safely
-        // removing unused text and shifting node indices
-        pub fn node(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-            // Get node index and convert into integer
-            let node_idx = NodeIndex::new(
-                cmd_iter
-                    .next()
-                    .ok_or_else(cmd::Error::default)?
-                    .parse::<i32>()? as usize,
-            );
-
-            let new_node_text = cmd_iter.next().ok_or_else(cmd::Error::default)?;
-            util::check_end(cmd_iter)?;
-
-            let node_weight = state
-                .tree
-                .node_weight_mut(node_idx)
-                .ok_or_else(cmd::Error::default)?;
-
-            let start = state.rope.len_chars();
-            state.rope.append(ropey::Rope::from(new_node_text.as_str()));
-            let end = state.rope.len_chars();
-
-            state.to_be_deleted.push(*node_weight);
-            *node_weight = [start, end];
-
-            // TODO: Finalize pruning sequence, this may need to move 
-            // Remove unused text section from the graph
-            util::prune(
-                state.to_be_deleted.pop().unwrap(),
-                &mut state.rope,
-                &mut state.tree,
-            );
-            Ok(SUCCESS)
-        }
-
-        /// Edit the contents of an edge
-        ///
-        /// First, the new text section is appended to the end of the text rope. Next, the edge 
-        /// weights are modified to point to the new text section. Finally, the old text section is
-        /// removed from the rope, and all tree weights are shifted in turn.
-        ///
-        /// format:
-        ///     edit edge <EdgeIndex> "<edited_edge_text>"
-        ///
-        /// example:
-        ///     edit edge 0 "No, I'm not" 
-        pub fn edge(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-            // Get node index and convert into integer
-            let node_idx = NodeIndex::new(
-                cmd_iter
-                    .next()
-                    .ok_or_else(cmd::Error::default)?
-                    .parse::<i32>()? as usize,
-            );
-
-            let new_node_text = cmd_iter.next().ok_or_else(cmd::Error::default)?;
-            util::check_end(cmd_iter)?;
-
-            let node_weight = state
-                .tree
-                .node_weight_mut(node_idx)
-                .ok_or_else(cmd::Error::default)?;
-
-            let start = state.rope.len_chars();
-            state.rope.append(ropey::Rope::from(new_node_text.as_str()));
-            let end = state.rope.len_chars();
-
-            state.to_be_deleted.push(*node_weight);
-            *node_weight = [start, end];
-
-            // TODO: Finalize pruning sequence, this may need to move 
-            // Remove unused text section from the graph
-            util::prune(
-                state.to_be_deleted.pop().unwrap(),
-                &mut state.rope,
-                &mut state.tree,
-            );
+    impl Executable for List {
+        fn execute(&self, state: &mut EditorState) -> cmd::Result {
+            let node_iter = state.tree.node_references();
+            node_iter.for_each(|n| {
+                // Print node identifier, node text, and then all edges
+                println!("{:#?} : {}", n.0, state.rope.rope.slice(n.1[0]..n.1[1]));
+                state
+                    .tree
+                    .edges_directed(n.0, petgraph::Direction::Outgoing)
+                    .for_each(|e| {
+                        println!(
+                            "--> {:#?} : {} : {} ",
+                            e.target(),
+                            e.id().index(),
+                            state.rope.rope.slice(e.weight().text[0]..e.weight().text[1])
+                        )
+                    });
+            });
             Ok(SUCCESS)
         }
     }
 
     /// Start reading the currently loaded project from the start node
-    /// 
-    /// format:
-    ///     read 
-    /// example:
-    ///     read 
     // TODO: This is a prototype for read functionality, likely needs to be moved in the future
-    pub fn read(cmd_iter: &mut std::slice::Iter<String>, state: &mut EditorState) -> cmd::Result {
-        println!("reader mode:");
-        util::check_end(cmd_iter)?;
-        let node_idx = graph::node_index(0);
-        let iter = state.tree.edges_directed(node_idx, petgraph::Direction::Outgoing);
-        let _target_list = iter
-            .enumerate()
-            .map(|(i, e)| {
-                println!(
-                    "{}. {}",
-                    i,
-                    state.rope.slice(e.weight().text[0]..e.weight().text[1])
-                );
-                e.target()
-        });
-        Ok(SUCCESS)
+    #[derive(new, StructOpt, Debug)]
+    #[structopt(setting = AppSettings::NoBinaryName)]
+    pub struct Read {}
+
+    impl Executable for Read {
+        fn execute(&self, state: &mut EditorState) -> cmd::Result {
+            println!("reader mode:");
+            let node_idx = graph::node_index(0);
+            let iter = state.tree.edges_directed(node_idx, petgraph::Direction::Outgoing);
+            let _target_list = iter
+                .enumerate()
+                .map(|(i, e)| {
+                    println!(
+                        "{}. {}",
+                        i,
+                        state.rope.rope.slice(e.weight().text[0]..e.weight().text[1])
+                    );
+                    e.target()
+            });
+            Ok(SUCCESS)
+        }
     }
 
     /// Error types for different commands
     // TODO: remove if not needed
-    #[derive(Debug, Default)]
+    #[derive(new, Debug, Default)]
     pub struct Error {
         details: String,
     }
@@ -493,34 +382,13 @@ mod cmd {
     // TODO: use non-default error type for serde serialization errors
     impl From<serde_json::Error> for Error {
         fn from(_err: serde_json::Error) -> Self {
+            println!("{}", _err);
             Error::default()
         }
     }
 
     pub mod util {
         use super::*;
-
-        /// Helper method for checking that a command iterator is ended
-        /// Returns Ok if iterator is empty, or a cmd::Error if any more elements remain in the
-        /// iterator   
-        pub fn check_end(cmd_iter: &mut std::slice::Iter<String>) -> cmd::Result {
-            cmd_iter
-                .next()
-                .xor(Some(&String::new()))
-                .ok_or_else(cmd::Error::default)?;
-            // TODO: different Ok message for check_end
-            Ok(SUCCESS)
-        }
-
-        /// Helper method to check if two string slices match, and return a cmd::Result based on
-        /// the results.
-        // TODO: Create non-default error type for compare mismatch
-        pub fn check_str(a: &str, b: &str) -> cmd::Result {
-            match a == b {
-                true => Ok(""),
-                false => Err(cmd::Error::default()),
-            }
-        }
 
         /// Helper method to prompt the user for input
         ///
@@ -572,7 +440,7 @@ mod cmd {
 mod action {
     use super::*; 
     /// Kind defines the types of actions available for dialogue tree choices
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, FromStr, Clone, Copy)]
     pub enum Kind {
         /// No action
         Inactive,
@@ -583,13 +451,19 @@ mod action {
         /// Similar function to store, except the word or phrase is provided by the user
         StorePrompt,
     }
+
+    impl Default for Kind {
+        fn default() -> Self {
+            Kind::Inactive
+        }
+    }
 }
 
 fn main() {
     let mut cmd_buf = String::with_capacity(1000);
 
     // TODO: clean up state init
-    let mut state = EditorState::new();
+    let mut state = EditorState::default();
     loop {
         // print default header
         println!("------------");
@@ -599,27 +473,17 @@ fn main() {
         cmd::util::prompt_input(&mut cmd_buf);
 
         let cmds = shellwords::split(&cmd_buf).unwrap();
-        let mut cmd_iter = cmds.iter();
-        let res = match cmd_iter.next().unwrap().as_str() {
-            "help" => cmd::help(&mut cmd_iter, &mut state),
-            "new" => cmd::new(&mut cmd_iter, &mut state),
-            "list" => cmd::list(&mut cmd_iter, &mut state),
-            "ls" => cmd::list(&mut cmd_iter, &mut state),
-            "save" => cmd::save(&mut cmd_iter, &mut state),
-            "s" => cmd::save(&mut cmd_iter, &mut state),
-            "load" => cmd::load(&mut cmd_iter, &mut state),
-            "edit" => cmd::edit(&mut cmd_iter, &mut state),
-            "read" => cmd::read(&mut cmd_iter, &mut state),
-            "q" => break,
-            "exit" => break,
-            "quit" => break,
-            _ => Ok(UNKNOWN),
-        };
+        let cmd_result = cmd::Parse::from_iter_safe(cmds);
 
         // Handle results/errors
-        match res {
-            Ok(v) => println!("{}", v),
-            Err(e) => println!("error: {}", e),
+        match cmd_result {
+            Ok(v) => {
+                match v.execute(&mut state) {
+                    Ok(r) => println!("{}", r),
+                    Err(f) => println!("{}", f), 
+                }
+            }
+            Err(e) => println!("{}", e),
         }
 
         // clear input buffers before starting next input loop
