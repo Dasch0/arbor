@@ -1,19 +1,15 @@
-use petgraph::prelude::*;
-use petgraph::visit::IntoNodeReferences;
-use petgraph::*;
-use std::io;
-use std::io::Write;
-use structopt::*;
-use derive_new::*;
 use clap::AppSettings;
+use derive_new::*;
 use enum_dispatch::*;
 use enum_from_str::ParseEnumVariantError;
 use enum_from_str_derive::FromStr;
-use serde::{Serialize,
-            Deserialize,
-            Serializer,
-            Deserializer,
-            de::Visitor};
+use petgraph::prelude::*;
+use petgraph::visit::IntoNodeReferences;
+use petgraph::*;
+use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
+use std::io;
+use std::io::Write;
+use structopt::*;
 
 use crate::cmd::Executable;
 
@@ -24,26 +20,11 @@ use crate::cmd::Executable;
 // 4. Tests
 // 5. Redundancy when editing/pruning/saving
 // 6. Proper error/Ok propogation
-// 7. Fork ropey::Rope and implement serialize/deserialize
+// 7. Fork ropey::Rope and implement serialize/deserialize, removing the need for SerialRope
 // 8. Switch to bincode serialization format, json should only be for debugging
 
-static ROPE_EXT: &str = ".rope";
 static TREE_EXT: &str = ".tree";
-static UNKNOWN: &str = "unknown command, type help for more info";
 static _NONAME: &str = "no name provided";
-static HELP: &str = "
-    A tree based dialogue editor
-
-    commands:
-    help - display this help menu
-    new - create a new project, node, or edge
-    project - get the current project info
-    node - get the current node info
-
-    exit application:
-    q 
-    quit 
-    exit";
 static _UNIMPLEMENTED: &str = "unimplemented command";
 static SUCCESS: &str = "success\r\n";
 
@@ -52,23 +33,23 @@ static SUCCESS: &str = "success\r\n";
 pub type Section = [usize; 2];
 
 /// Struct storing the information for a player choice. Stored in the edges of a dialogue tree
-#[derive(new, Serialize, Deserialize)] 
+#[derive(new, Serialize, Deserialize, Clone, Copy)]
 pub struct Choice {
-   text: Section,
-   action: action::Kind
+    text: Section,
+    action: action::Kind,
 }
 
 /// Wrapper for ropey::Rope struct to implement the serializable trait via the Rope::write_to
 /// method
 #[derive(new)]
-pub struct SerialRope{
+pub struct SerialRope {
     rope: ropey::Rope,
 }
 
 impl Serialize for SerialRope {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> 
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer
+        S: Serializer,
     {
         let rope_string = self.rope.to_string();
         serializer.serialize_str(rope_string.as_str())
@@ -78,7 +59,7 @@ impl Serialize for SerialRope {
 impl std::str::FromStr for SerialRope {
     type Err = ();
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Ok(SerialRope::new(ropey::Rope::from_str(s)))    
+        Ok(SerialRope::new(ropey::Rope::from_str(s)))
     }
 }
 
@@ -96,8 +77,10 @@ impl<'de> Deserialize<'de> for SerialRope {
                 formatter.write_str("text rope as string")
             }
 
-            fn visit_str<E: serde::de::Error>(self, value: &str) 
-            -> std::result::Result<Self::Value, E> {
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
                 value.parse().map_err(|_| serde::de::Error::custom(""))
             }
         }
@@ -127,7 +110,7 @@ mod cmd {
     /// Unified result type for propogating errors in cmd methods
     type Result = std::result::Result<&'static str, cmd::Error>;
 
-    /// Trait to allow structopt generated 
+    /// Trait to allow structopt generated
     #[enum_dispatch]
     pub trait Executable {
         fn execute(&self, state: &mut EditorState) -> cmd::Result;
@@ -142,6 +125,7 @@ mod cmd {
     #[structopt(name="", setting = AppSettings::NoBinaryName)]
     pub enum Parse {
         New(new::Parse),
+        Edit(edit::Parse),
         Save(Save),
         Load(Load),
         List(List),
@@ -150,21 +134,21 @@ mod cmd {
     mod new {
         use super::*;
 
-        /// Create new things 
+        /// Create new things
         #[enum_dispatch(Executable)]
         #[derive(StructOpt)]
         #[structopt(setting = AppSettings::NoBinaryName)]
-        pub enum Parse{
+        pub enum Parse {
             Project(new::Project),
             Node(new::Node),
             Edge(new::Edge),
         }
-        
+
         /// Create a new project
         ///
         /// A project is made up of a text rope storing all dialogue text, a hashtable storing
         /// variable or user defined values, and a graph representing the narrative. Nodes of the
-        /// graph represent dialogues from characters in the story, and nodes represent the 
+        /// graph represent dialogues from characters in the story, and nodes represent the
         /// actions of the player.
         #[derive(new, StructOpt, Debug)]
         #[structopt(setting = AppSettings::NoBinaryName)]
@@ -185,10 +169,10 @@ mod cmd {
                     graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
                     SerialRope::new(ropey::Rope::new()),
                     self.name.clone(),
-                    );
+                );
 
                 cmd::Save::new().execute(&mut new_state)?;
-                
+
                 if self.set_active {
                     *state = new_state;
                     Ok("New project created and set as active")
@@ -204,17 +188,20 @@ mod cmd {
         #[derive(new, StructOpt, Debug)]
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Node {
-           /// The speaker for this node 
-           speaker: String,
-           /// The text or action for this node 
-           dialogue: String,
+            /// The speaker for this node
+            speaker: String,
+            /// The text or action for this node
+            dialogue: String,
         }
         impl Executable for Node {
             /// Create a new section of text on the text rope, and then make a new node on the
             /// tree pointing to the section
             fn execute(&self, state: &mut EditorState) -> cmd::Result {
                 let start = state.rope.rope.len_chars();
-                state.rope.rope.append(ropey::Rope::from(format!("{}::{}", self.speaker, self.dialogue)));
+                state.rope.rope.append(ropey::Rope::from(format!(
+                    "{}::{}",
+                    self.speaker, self.dialogue
+                )));
                 let end = state.rope.rope.len_chars();
                 state.tree.add_node([start, end]);
                 Ok(SUCCESS)
@@ -228,9 +215,9 @@ mod cmd {
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Edge {
             /// dialogue node that this action originates from
-            start_node_idx: u32,
-            /// dialogue node that this action will lead to 
-            end_node_idx: u32,
+            start_index: u32,
+            /// dialogue node that this action will lead to
+            end_index: u32,
             /// Action text or dialogue
             text: String,
             /// Special types for actions that may edit variables  
@@ -247,10 +234,119 @@ mod cmd {
                 state.rope.rope.append(ropey::Rope::from(self.text.clone()));
                 let end = state.rope.rope.len_chars();
                 state.tree.add_edge(
-                    NodeIndex::from(self.start_node_idx),
-                    NodeIndex::from(self.end_node_idx),
+                    NodeIndex::from(self.start_index),
+                    NodeIndex::from(self.end_index),
                     Choice::new([start, end], self.action.unwrap_or_default()),
                 );
+                Ok(SUCCESS)
+            }
+        }
+    }
+
+    mod edit {
+        use super::*;
+
+        /// Edit existing things
+        #[enum_dispatch(Executable)]
+        #[derive(StructOpt)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub enum Parse {
+            Node(edit::Node),
+            Edge(edit::Edge),
+        }
+
+        /// Edit the contents of a node in the dialogue tree
+        ///
+        /// A node represents a text a segment of dialogue from a character.
+        #[derive(new, StructOpt, Debug)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Node {
+            /// Id of the node to edit
+            node_id: usize,
+            /// The speaker for this node
+            speaker: String,
+            /// The text or action for this node
+            dialogue: String,
+        }
+        impl Executable for Node {
+            /// Create a new section of text on the text rope, and then make a new node on the
+            /// tree pointing to the section
+            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+                let node_index = NodeIndex::new(self.node_id);
+                let node = state
+                    .tree
+                    .node_weight_mut(node_index)
+                    .ok_or_else(cmd::Error::default)?;
+                let old_weight = *node;
+
+                let start = state.rope.rope.len_chars();
+                state.rope.rope.append(ropey::Rope::from(format!(
+                    "{}::{}",
+                    self.speaker, self.dialogue
+                )));
+                let end = state.rope.rope.len_chars();
+
+                *node = [start, end];
+
+                util::prune(old_weight, &mut state.rope.rope, &mut state.tree);
+                state.tree.add_node([start, end]);
+                Ok(SUCCESS)
+            }
+        }
+
+        /// Edit the contents and connections of an edge in the dialogue tree
+        ///
+        /// Note: Editing the source or target node will change the edge index
+        #[derive(new, StructOpt)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Edge {
+            /// Id of the edge to edit
+            edge_id: usize,
+            /// Action text or dialogue
+            text: String,
+            /// Special types for actions that may edit variables  
+            ///
+            /// An example action is if the user is prompted to input the name of their character,
+            /// or if the user picks up a variable item from a table and stores it in their
+            /// inventory
+            action: Option<action::Kind>,
+            /// dialogue node that this action originates from
+            #[structopt(requires("target_node_id"))]
+            source_node_id: Option<usize>,
+            /// dialogue node that this action will lead to
+            #[structopt(requires("source_node_id"))]
+            target_node_id: Option<usize>,
+        }
+
+        impl Executable for Edge {
+            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+                let edge_index = EdgeIndex::<u32>::new(self.edge_id);
+                let edge = state
+                    .tree
+                    .edge_weight_mut(edge_index)
+                    .ok_or_else(cmd::Error::default)?;
+                let old_weight = *edge;
+
+                let start = state.rope.rope.len_chars();
+                state.rope.rope.append(ropey::Rope::from(self.text.clone()));
+                let end = state.rope.rope.len_chars();
+                let new_weight = Choice::new([start, end], self.action.unwrap_or_default());
+
+                // Handle deletion/recreation of edge if nodes need to change
+                if self.source_node_id.is_some() && self.target_node_id.is_some() {
+                    // None is unexpected at this point, but double check
+                    let source_node_index =
+                        NodeIndex::new(self.source_node_id.ok_or_else(cmd::Error::default)?);
+                    let target_node_index =
+                        NodeIndex::new(self.target_node_id.ok_or_else(cmd::Error::default)?);
+
+                    state.tree.remove_edge(edge_index);
+                    state
+                        .tree
+                        .add_edge(source_node_index, target_node_index, new_weight);
+                    util::prune(old_weight.text, &mut state.rope.rope, &mut state.tree);
+                }
+
                 Ok(SUCCESS)
             }
         }
@@ -262,7 +358,7 @@ mod cmd {
     pub struct Save {}
 
     impl Executable for Save {
-        fn execute(&self, state: &mut EditorState) -> cmd::Result { 
+        fn execute(&self, state: &mut EditorState) -> cmd::Result {
             let json = serde_json::to_string(&state).unwrap();
             std::fs::write(state.name.clone() + TREE_EXT, json)?;
             Ok(SUCCESS)
@@ -278,9 +374,9 @@ mod cmd {
 
     impl Executable for Load {
         fn execute(&self, state: &mut EditorState) -> cmd::Result {
-            let new_state: EditorState = serde_json::from_reader(
-                std::io::BufReader::new(std::fs::File::open(self.name.clone() + TREE_EXT)?),
-            )?;
+            let new_state: EditorState = serde_json::from_reader(std::io::BufReader::new(
+                std::fs::File::open(self.name.clone() + TREE_EXT)?,
+            ))?;
             *state = new_state;
             Ok(SUCCESS)
         }
@@ -310,7 +406,10 @@ mod cmd {
                             "--> {:#?} : {} : {} ",
                             e.target(),
                             e.id().index(),
-                            state.rope.rope.slice(e.weight().text[0]..e.weight().text[1])
+                            state
+                                .rope
+                                .rope
+                                .slice(e.weight().text[0]..e.weight().text[1])
                         )
                     });
             });
@@ -328,16 +427,19 @@ mod cmd {
         fn execute(&self, state: &mut EditorState) -> cmd::Result {
             println!("reader mode:");
             let node_idx = graph::node_index(0);
-            let iter = state.tree.edges_directed(node_idx, petgraph::Direction::Outgoing);
-            let _target_list = iter
-                .enumerate()
-                .map(|(i, e)| {
-                    println!(
-                        "{}. {}",
-                        i,
-                        state.rope.rope.slice(e.weight().text[0]..e.weight().text[1])
-                    );
-                    e.target()
+            let iter = state
+                .tree
+                .edges_directed(node_idx, petgraph::Direction::Outgoing);
+            let _target_list = iter.enumerate().map(|(i, e)| {
+                println!(
+                    "{}. {}",
+                    i,
+                    state
+                        .rope
+                        .rope
+                        .slice(e.weight().text[0]..e.weight().text[1])
+                );
+                e.target()
             });
             Ok(SUCCESS)
         }
@@ -438,7 +540,7 @@ mod cmd {
 }
 
 mod action {
-    use super::*; 
+    use super::*;
     /// Kind defines the types of actions available for dialogue tree choices
     #[derive(Serialize, Deserialize, FromStr, Clone, Copy)]
     pub enum Kind {
@@ -477,12 +579,10 @@ fn main() {
 
         // Handle results/errors
         match cmd_result {
-            Ok(v) => {
-                match v.execute(&mut state) {
-                    Ok(r) => println!("{}", r),
-                    Err(f) => println!("{}", f), 
-                }
-            }
+            Ok(v) => match v.execute(&mut state) {
+                Ok(r) => println!("{}", r),
+                Err(f) => println!("{}", f),
+            },
             Err(e) => println!("{}", e),
         }
 
