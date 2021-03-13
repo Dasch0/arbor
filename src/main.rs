@@ -16,13 +16,12 @@ use crate::cmd::Executable;
 
 // TODO: Major Features
 // 1. Actionable edge function calls, currently impossible to do anything with action::Kind enum
-// 2. Name list & name validation
-// 3. Node and edge validation
-// 4. Tests
-// 5. Redundancy when editing/pruning/saving
-// 6. Proper error/Ok propogation
-// 7. Fork ropey::Rope and implement serialize/deserialize, removing the need for SerialRope
-// 8. Switch to bincode serialization format, json should only be for debugging
+// 2. Node and edge validation
+// 3. Tests
+// 4. Redundancy when editing/pruning/saving
+// 5. Proper error/Ok propogation
+// 6. Fork ropey::Rope and implement serialize/deserialize, removing the need for SerialRope
+// 7. Switch to bincode serialization format, json should only be for debugging
 
 static TREE_EXT: &str = ".tree";
 static _NONAME: &str = "no name provided";
@@ -311,15 +310,13 @@ mod cmd {
             dialogue: String,
         }
         impl Executable for Node {
-            /// Create a new section of text on the text rope, and then make a new node on the
-            /// tree pointing to the section
+            /// Edit Node
             fn execute(&self, data: &mut DialogueTreeData) -> cmd::Result {
                 let node_index = NodeIndex::new(self.node_id);
-                let node = data
+                let old_weight = *data
                     .tree
                     .node_weight_mut(node_index)
                     .ok_or_else(cmd::Error::default)?;
-                let old_weight: Section = *node;
 
                 let start = data.rope.rope.len_chars();
                 data.rope.rope.append(ropey::Rope::from(format!(
@@ -328,10 +325,14 @@ mod cmd {
                 )));
                 let end = data.rope.rope.len_chars();
 
+                // tree must be pruned before the tree is modified to preserve a valid tree
+                // if prune fails
+                util::prune(old_weight, &mut data.rope.rope, &mut data.tree)?;
+                let node = data
+                    .tree
+                    .node_weight_mut(node_index)
+                    .ok_or_else(cmd::Error::default)?;
                 *node = [start, end];
-
-                util::prune(old_weight, &mut data.rope.rope, &mut data.tree);
-                data.tree.add_node([start, end]);
                 Ok(SUCCESS)
             }
         }
@@ -386,7 +387,7 @@ mod cmd {
                     data
                         .tree
                         .add_edge(source_node_index, target_node_index, new_weight);
-                    util::prune(old_weight.text, &mut data.rope.rope, &mut data.tree);
+                    util::prune(old_weight.text, &mut data.rope.rope, &mut data.tree)?;
                 }
 
                 Ok(SUCCESS)
@@ -463,10 +464,14 @@ mod cmd {
 
     impl Executable for List {
         fn execute(&self, data: &mut DialogueTreeData) -> cmd::Result {
-            let node_iter = data.tree.node_references();
-            node_iter.for_each(|n| {
-                // Print node identifier, node text, and then all edges
-                println!("{:#?} : {}", n.0, data.rope.rope.slice(n.1[0]..n.1[1]));
+            let mut name_buf = String::with_capacity(64);
+            let mut text_buf = String::with_capacity(256);
+            let mut node_iter = data.tree.node_references();
+            
+            node_iter.try_for_each(|n| -> std::result::Result<(), cmd::Error> {
+                let text = data.rope.rope.slice(n.1[0]..n.1[1]).as_str().ok_or_else(cmd::Error::default)?;
+                util::parse_node(text, &data.name_table, &mut name_buf, &mut text_buf)?;
+                println!("{} : {}", name_buf, text_buf);
                 data
                     .tree
                     .edges_directed(n.0, petgraph::Direction::Outgoing)
@@ -481,35 +486,8 @@ mod cmd {
                                 .slice(e.weight().text[0]..e.weight().text[1])
                         )
                     });
-            });
-            Ok(SUCCESS)
-        }
-    }
-
-    /// Start reading the currently loaded project from the start node
-    // TODO: This is a prototype for read functionality, likely needs to be moved in the future
-    #[derive(new, StructOpt, Debug)]
-    #[structopt(setting = AppSettings::NoBinaryName)]
-    pub struct Read {}
-
-    impl Executable for Read {
-        fn execute(&self, data: &mut DialogueTreeData) -> cmd::Result {
-            println!("reader mode:");
-            let node_idx = graph::node_index(0);
-            let iter = data
-                .tree
-                .edges_directed(node_idx, petgraph::Direction::Outgoing);
-            let _target_list = iter.enumerate().map(|(i, e)| {
-                println!(
-                    "{}. {}",
-                    i,
-                    data
-                        .rope
-                        .rope
-                        .slice(e.weight().text[0]..e.weight().text[1])
-                );
-                e.target()
-            });
+                Ok(())
+            })?;
             Ok(SUCCESS)
         }
     }
@@ -561,6 +539,42 @@ mod cmd {
     pub mod util {
         use super::*;
 
+        /// Helper method to parse a dialogue node's section of the text rope
+        ///
+        /// The input text rope section should have the following format
+        ///     name::text ::name:: more text
+        /// 
+        /// The first name is the speaker. This name must be a valid key to the name_table
+        /// Inside the text, additional names may be inserted inside a pair of % symbols. The
+        /// entire area inside the % symbols must be a valid key to the name_table.
+        ///
+        /// Both the name and text buf are cleared at the beginning of this method.
+        pub fn parse_node(text: &str, name_table: &HashMap<String, String>, name_buf: &mut String, text_buf: &mut String) -> cmd::Result {
+            // Implementation notes:
+            //  1. The first iterator element is always the speaker name and should be the only
+            //     thing written to the name buffer 
+            //  2. Since only a simple flow of name::text::name:::text ... etc is allowed, only
+            //  odd tokens ever need to be looked up in the hashtable 
+            name_buf.clear();
+            text_buf.clear();
+            let mut text_iter = text.split("::").enumerate();
+            let speaker_key = text_iter.next().ok_or_else(cmd::Error::default)?.1;
+            let speaker_name = name_table.get(speaker_key).ok_or_else(cmd::Error::default)?;
+            name_buf.push_str(speaker_name);
+            text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
+                if (i & 0x1) == 0 { // odd token
+                    let value = name_table.get(n).ok_or_else(cmd::Error::default)?;
+                    text_buf.push_str(value);
+                    Ok(())
+                } else { // even token 
+                    text_buf.push_str(n);
+                    Ok(())
+                }
+            })?;
+
+            Ok(SUCCESS)
+        }
+
         /// Helper method to prompt the user for input
         ///
         /// User input is stored into the provided buffer
@@ -582,28 +596,30 @@ mod cmd {
             range: Section,
             rope: &mut ropey::Rope,
             tree: &mut graph::DiGraph<Section, Choice>,
-        ) {
+        ) -> cmd::Result {
             // Implementation notes:
             //  1. Code is written to be branchless in case of a very large tree
             //  2. Range is non-inclusive, which means that num_removed has to be 1 larger than the
             //     difference between the ranges
-            //  3. Currently it is just blindly assumed that range[1] > range[0]
+            
+            // ensure range indices are in the proper order
+            (range[1] > range[0]).then(||{}).ok_or_else(cmd::Error::default)?;
+
             let num_removed = range[1] - range[0] + 1;
-            assert!(num_removed > 0);
-
+            
             rope.remove(range[0]..range[1]);
-
             // Iterate through each node & edge, and shift the range left by the number of removed
             // characters
             tree.node_weights_mut().for_each(|w| {
                 let shift = num_removed - (w[0] >= range[1]) as usize;
                 *w = [w[0] - shift, w[1] - shift]
             });
-
             tree.edge_weights_mut().for_each(|w| {
                 let shift = num_removed - (w.text[0] >= range[1]) as usize;
                 w.text = [w.text[0] - shift, w.text[1] - shift]
             });
+
+            Ok(SUCCESS)
         }
     }
 }
