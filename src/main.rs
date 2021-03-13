@@ -38,15 +38,16 @@ static SUCCESS: &str = "success\r\n";
 pub struct DialogueTreeData {
     tree: petgraph::graph::DiGraph<Section, Choice>,
     rope: SerialRope,
-    table: HashMap<String, String>,
+    name_table: HashMap<String, String>,
     name: String,
 }
+
 impl DialogueTreeData {
     fn default() -> Self {
         DialogueTreeData {
             tree: graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
             rope: SerialRope::new(ropey::Rope::new()),
-            table: HashMap::new(),
+            name_table: HashMap::new(),
             name: String::new(),
         }
     }
@@ -151,7 +152,7 @@ mod cmd {
             Project(new::Project),
             Node(new::Node),
             Edge(new::Edge),
-            Key(new::Key),
+            Name(new::Name),
         }
 
         /// Create a new project
@@ -171,6 +172,7 @@ mod cmd {
             #[structopt(short, long)]
             set_active: bool,
         }
+
         impl Executable for Project {
             // Create a new file on disk for new project, optionally set it as active in the editor
             // state
@@ -199,15 +201,18 @@ mod cmd {
         #[derive(new, StructOpt, Debug)]
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Node {
-            /// The speaker for this node
+            /// The speaker for this node. The speaker name must be a key in the name table
             speaker: String,
             /// The text or action for this node
             dialogue: String,
         }
+
         impl Executable for Node {
             /// Create a new section of text on the text rope, and then make a new node on the
             /// tree pointing to the section
             fn execute(&self, data: &mut DialogueTreeData) -> cmd::Result {
+                // verify the speaker name is valid
+                data.name_table.get(&self.speaker).ok_or_else(cmd::Error::default)?;
                 let start = data.rope.rope.len_chars();
                 data.rope.rope.append(ropey::Rope::from(format!(
                     "{}::{}",
@@ -253,30 +258,30 @@ mod cmd {
             }
         }
 
-        /// Create a new key in the dialogue tree
+        /// Create a new name for use in dialogue nodes and actions
         ///
-        /// A key represents some variable  text a segment of dialogue from a character.
+        /// A name represents some variable that may be substituted into the text. Examples
+        /// include player names, pronouns, and character traits 
         #[derive(new, StructOpt, Debug)]
         #[structopt(setting = AppSettings::NoBinaryName)]
-        pub struct Key {
+        pub struct Name {
             /// The keyword to reference the value with in the text 
             key: String,
             /// Value to store, able be updated by player actions
             value: String,
         }
-        impl Executable for Key {
+        impl Executable for Name {
             fn execute(&self, data: &mut DialogueTreeData) -> cmd::Result {
                 // Check that the key doesn't already exist, since we want new to not overwrite
                 // values. The user can use edit commands for that
-                if data.table.get(&self.key).is_some() {
+                if data.name_table.get(&self.key).is_some() {
                     Ok("Key already exists")
                 } else {
-                    data.table.insert(self.key.clone(), self.value.clone());
+                    data.name_table.insert(self.key.clone(), self.value.clone());
                     Ok(SUCCESS)
                 }
             }
         }
-
     }
 
     mod edit {
@@ -289,6 +294,7 @@ mod cmd {
         pub enum Parse {
             Node(edit::Node),
             Edge(edit::Edge),
+            Name(edit::Name)
         }
 
         /// Edit the contents of a node in the dialogue tree
@@ -384,6 +390,33 @@ mod cmd {
                 }
 
                 Ok(SUCCESS)
+            }
+        }
+
+        /// Edit the value of an existing name
+        ///
+        /// A name represents some variable that may be substituted into the text. Examples
+        /// include player names, pronouns, and character traits 
+        #[derive(new, StructOpt, Debug)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Name {
+            /// The keyword to reference the name with in the text 
+            key: String,
+            /// Value to store to the name
+            value: String,
+        }
+
+        impl Executable for Name {
+            fn execute(&self, data: &mut DialogueTreeData) -> cmd::Result {
+                // Check that the key already exists, and make sure not to accidently add a new key
+                // to the table. The user can use new commands for that
+                if data.name_table.get(&self.key).is_none() {
+                    Ok("Key does not exist")
+                } else {
+                    let name = data.name_table.get_mut(&self.key).ok_or_else(cmd::Error::default)?;
+                    *name = self.value.clone();
+                    Ok(SUCCESS)
+                }
             }
         }
     }
