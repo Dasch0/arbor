@@ -7,7 +7,7 @@ use hashbrown::HashMap;
 use petgraph::prelude::*;
 use petgraph::visit::IntoNodeReferences;
 use petgraph::*;
-use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize}; 
 use std::io;
 use std::io::Write;
 use structopt::*;
@@ -36,7 +36,7 @@ static SUCCESS: &str = "success\r\n";
 #[derive(new, Serialize, Deserialize)]
 pub struct DialogueTreeData {
     tree: petgraph::graph::DiGraph<Section, Choice>,
-    rope: SerialRope,
+    text: String,
     name_table: HashMap<String, String>,
     name: String,
 }
@@ -45,7 +45,7 @@ impl DialogueTreeData {
     fn default() -> Self {
         DialogueTreeData {
             tree: graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
-            rope: SerialRope::new(ropey::Rope::new()),
+            text: String::with_capacity(8192),
             name_table: HashMap::new(),
             name: String::new(),
         }
@@ -62,56 +62,6 @@ pub struct Choice {
     text: Section,
     action: action::Kind,
 }
-
-/// Wrapper for ropey::Rope struct to implement the serializable trait via the Rope::write_to
-/// method
-#[derive(new)]
-pub struct SerialRope {
-    rope: ropey::Rope,
-}
-
-impl Serialize for SerialRope {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let rope_string = self.rope.to_string();
-        serializer.serialize_str(rope_string.as_str())
-    }
-}
-
-impl std::str::FromStr for SerialRope {
-    type Err = ();
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Ok(SerialRope::new(ropey::Rope::from_str(s)))
-    }
-}
-
-impl<'de> Deserialize<'de> for SerialRope {
-    fn deserialize<D>(deserializer: D) -> Result<SerialRope, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct RopeVisitor;
-
-        impl<'de> Visitor<'de> for RopeVisitor {
-            type Value = SerialRope;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("text rope as string")
-            }
-
-            fn visit_str<E: serde::de::Error>(
-                self,
-                value: &str,
-            ) -> std::result::Result<Self::Value, E> {
-                value.parse().map_err(|_| serde::de::Error::custom(""))
-            }
-        }
-        deserializer.deserialize_str(RopeVisitor)
-    }
-}
-
 
 mod cmd {
     use super::*;
@@ -178,7 +128,7 @@ mod cmd {
             fn execute(&self, data: &mut DialogueTreeData) -> cmd::Result {
                 let mut new_state = DialogueTreeData::new(
                     graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
-                    SerialRope::new(ropey::Rope::new()),
+                    String::with_capacity(8192),
                     HashMap::new(),
                     self.name.clone(),
                 );
@@ -212,12 +162,12 @@ mod cmd {
             fn execute(&self, data: &mut DialogueTreeData) -> cmd::Result {
                 // verify the speaker name is valid
                 data.name_table.get(&self.speaker).ok_or_else(cmd::Error::default)?;
-                let start = data.rope.rope.len_chars();
-                data.rope.rope.append(ropey::Rope::from(format!(
+                let start = data.text.len();
+                data.text.push_str(&format!(
                     "{}::{}",
                     self.speaker, self.dialogue
-                )));
-                let end = data.rope.rope.len_chars();
+                ));
+                let end = data.text.len();
                 data.tree.add_node([start, end]);
                 Ok(SUCCESS)
             }
@@ -245,9 +195,9 @@ mod cmd {
 
         impl Executable for Edge {
             fn execute(&self, data: &mut DialogueTreeData) -> cmd::Result {
-                let start = data.rope.rope.len_chars();
-                data.rope.rope.append(ropey::Rope::from(self.text.clone()));
-                let end = data.rope.rope.len_chars();
+                let start = data.text.len();
+                data.text.push_str(&self.text);
+                let end = data.text.len();
                 data.tree.add_edge(
                     NodeIndex::from(self.start_index),
                     NodeIndex::from(self.end_index),
@@ -318,16 +268,16 @@ mod cmd {
                     .node_weight_mut(node_index)
                     .ok_or_else(cmd::Error::default)?;
 
-                let start = data.rope.rope.len_chars();
-                data.rope.rope.append(ropey::Rope::from(format!(
+                let start = data.text.len();
+                data.text.push_str(&format!(
                     "{}::{}",
                     self.speaker, self.dialogue
-                )));
-                let end = data.rope.rope.len_chars();
+                ));
+                let end = data.text.len();
 
                 // tree must be pruned before the tree is modified to preserve a valid tree
                 // if prune fails
-                util::prune(old_weight, &mut data.rope.rope, &mut data.tree)?;
+                util::prune(old_weight, &mut data.text, &mut data.tree)?;
                 let node = data
                     .tree
                     .node_weight_mut(node_index)
@@ -370,9 +320,9 @@ mod cmd {
                     .ok_or_else(cmd::Error::default)?;
                 let old_weight = *edge;
 
-                let start = data.rope.rope.len_chars();
-                data.rope.rope.append(ropey::Rope::from(self.text.clone()));
-                let end = data.rope.rope.len_chars();
+                let start = data.text.len();
+                data.text.push_str(&self.text);
+                let end = data.text.len();
                 let new_weight = Choice::new([start, end], self.action.unwrap_or_default());
 
                 // Handle deletion/recreation of edge if nodes need to change
@@ -387,7 +337,7 @@ mod cmd {
                     data
                         .tree
                         .add_edge(source_node_index, target_node_index, new_weight);
-                    util::prune(old_weight.text, &mut data.rope.rope, &mut data.tree)?;
+                    util::prune(old_weight.text, &mut data.text, &mut data.tree)?;
                 }
 
                 Ok(SUCCESS)
@@ -469,7 +419,7 @@ mod cmd {
             let mut node_iter = data.tree.node_references();
             
             node_iter.try_for_each(|n| -> std::result::Result<(), cmd::Error> {
-                let text = data.rope.rope.slice(n.1[0]..n.1[1]).as_str().ok_or_else(cmd::Error::default)?;
+                let text = &data.text[n.1[0]..n.1[1]];
                 util::parse_node(text, &data.name_table, &mut name_buf, &mut text_buf)?;
                 println!("{} : {}", name_buf, text_buf);
                 data
@@ -480,10 +430,7 @@ mod cmd {
                             "--> {:#?} : {} : {} ",
                             e.target(),
                             e.id().index(),
-                            data
-                                .rope
-                                .rope
-                                .slice(e.weight().text[0]..e.weight().text[1])
+                            &data.text[e.weight().text[0]..e.weight().text[1]],
                         )
                     });
                 Ok(())
@@ -592,9 +539,11 @@ mod cmd {
         ///
         /// Note that for prune to work properly, the section of text MUST not be referenced by
         /// any of the nodes or edges in the tree.
+        ///
+        // FIXME: redo prune now that we are no longer using text rope
         pub fn prune(
             range: Section,
-            rope: &mut ropey::Rope,
+            _text: &str,
             tree: &mut graph::DiGraph<Section, Choice>,
         ) -> cmd::Result {
             // Implementation notes:
@@ -607,7 +556,6 @@ mod cmd {
 
             let num_removed = range[1] - range[0] + 1;
             
-            rope.remove(range[0]..range[1]);
             // Iterate through each node & edge, and shift the range left by the number of removed
             // characters
             tree.node_weights_mut().for_each(|w| {

@@ -143,7 +143,6 @@ dependencies = [
  "hashbrown",
  "petgraph",
  "rayon",
- "ropey",
  "serde",
  "serde_json",
  "shellwords",
@@ -430,15 +429,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5eb417147ba9860a96cfe72a0b93bf88fee1744b5636ec99ab20c1aa9376581"
 
 [[package]]
-name = "ropey"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0f3ef16589fdbb3e8fbce3dca944c08e61f39c7f16064b21a257d68ea911a83"
-dependencies = [
- "smallvec",
-]
-
-[[package]]
 name = "rustversion"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -502,12 +492,6 @@ dependencies = [
  "lazy_static",
  "regex",
 ]
-
-[[package]]
-name = "smallvec"
-version = "1.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe0f37c9e8f3c5a4a66ad655a93c74daac4ad00c441533bf5c6e7990bb42604e"
 
 [[package]]
 name = "strsim"
