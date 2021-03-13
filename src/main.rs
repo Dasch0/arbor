@@ -15,6 +15,7 @@ use structopt::*;
 use crate::cmd::Executable;
 
 // TODO: Major Features
+// 0. String defragmenter for prune() now that we aren't using a text rope
 // 1. Actionable edge function calls, currently impossible to do anything with action::Kind enum
 // 2. Node and edge validation
 // 3. Tests
@@ -27,6 +28,7 @@ static TREE_EXT: &str = ".tree";
 static _NONAME: &str = "no name provided";
 static _UNIMPLEMENTED: &str = "unimplemented command";
 static SUCCESS: &str = "success\r\n";
+static TOKEN: &str = "::";
 
 /// Top level data structure for storing a dialogue tree
 ///
@@ -425,14 +427,17 @@ mod cmd {
                 data
                     .tree
                     .edges_directed(n.0, petgraph::Direction::Outgoing)
-                    .for_each(|e| {
+                    .try_for_each(|e| -> std::result::Result<(), cmd::Error> {
+                        let choice = e.weight();
+                        util::parse_edge(&data.text[choice.text[0]..choice.text[1]], choice.action, &data.name_table, &mut text_buf)?;
                         println!(
                             "--> {:#?} : {} : {} ",
                             e.target(),
                             e.id().index(),
-                            &data.text[e.weight().text[0]..e.weight().text[1]],
-                        )
-                    });
+                            text_buf,
+                        );
+                        Ok(())
+                    })?;
                 Ok(())
             })?;
             Ok(SUCCESS)
@@ -486,14 +491,15 @@ mod cmd {
     pub mod util {
         use super::*;
 
-        /// Helper method to parse a dialogue node's section of the text rope
+        /// Helper method to parse a dialogue node's section of the text and fill in any name
+        /// variables. 
         ///
         /// The input text rope section should have the following format
         ///     name::text ::name:: more text
         /// 
         /// The first name is the speaker. This name must be a valid key to the name_table
-        /// Inside the text, additional names may be inserted inside a pair of % symbols. The
-        /// entire area inside the % symbols must be a valid key to the name_table.
+        /// Inside the text, additional names may be inserted inside a :: symbol. The
+        /// entire area inside the :: symbols must be a valid key to the name_table.
         ///
         /// Both the name and text buf are cleared at the beginning of this method.
         pub fn parse_node(text: &str, name_table: &HashMap<String, String>, name_buf: &mut String, text_buf: &mut String) -> cmd::Result {
@@ -502,9 +508,12 @@ mod cmd {
             //     thing written to the name buffer 
             //  2. Since only a simple flow of name::text::name:::text ... etc is allowed, only
             //  odd tokens ever need to be looked up in the hashtable 
+            //  3. The above is only true because split() will return an empty strings on sides of
+            //     the separator with no text. For instance name::::name:: would split to ['name,
+            //     '', name, '']
             name_buf.clear();
             text_buf.clear();
-            let mut text_iter = text.split("::").enumerate();
+            let mut text_iter = text.split(TOKEN).enumerate();
             let speaker_key = text_iter.next().ok_or_else(cmd::Error::default)?.1;
             let speaker_name = name_table.get(speaker_key).ok_or_else(cmd::Error::default)?;
             name_buf.push_str(speaker_name);
@@ -515,6 +524,41 @@ mod cmd {
                     Ok(())
                 } else { // even token 
                     text_buf.push_str(n);
+                    Ok(())
+                }
+            })?;
+
+            Ok(SUCCESS)
+        }
+
+        /// Helper method to parse a player action (edge's) section of the text and fill in any
+        /// name variables.
+        ///
+        /// The input text section should have the following format
+        ///     action text ::name:: more action text
+        ///
+        /// Both the name and text buf are cleared at the beginning of this method
+        // TODO: Handling of actions are not implemented yet, if this ends up being done elsewhere
+        // the action arg may be removed
+        pub fn parse_edge(text: &str, _action: action::Kind, name_table: &HashMap<String, String>, text_buf: &mut String) -> cmd::Result {
+            // Implementation notes
+            //  1. Due to the format, only even iterator elements are names that need to be looked
+            //     up in the name table. This is true because split() will return an empty strings
+            //     on sides of the separator with no text. For instance name::::name:: would split
+            //     to ['name, '', name, '']
+            //  2. This behavior is the opposite of parse_node. This is because parse_node strings
+            //     start with the speaker name, where as for parse_edge strings, there is no
+            //     speaker as it represents a player action
+
+            text_buf.clear();
+            let mut text_iter = text.split(TOKEN).enumerate();
+            text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
+                if (i & 0x1) == 0 { // odd token
+                    text_buf.push_str(n);
+                    Ok(())
+                } else { // even token 
+                    let value = name_table.get(n).ok_or_else(cmd::Error::default)?;
+                    text_buf.push_str(value);
                     Ok(())
                 }
             })?;
