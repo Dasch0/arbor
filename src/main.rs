@@ -91,6 +91,7 @@ pub struct Choice {
 pub struct EditorState {
     act: DialogueTreeData,
     backup: DialogueTreeData,
+    scratchpad: String,
 }
 
 impl EditorState {
@@ -102,6 +103,7 @@ impl EditorState {
         EditorState {
             act: data.clone(),
             backup: data,
+            scratchpad: String::with_capacity(1000),
         }
     }
 
@@ -115,7 +117,7 @@ mod cmd {
     use super::*;
 
     /// Unified result type for propogating errors in cmd methods
-    type Result = std::result::Result<&'static str, cmd::Error>;
+    pub type Result = std::result::Result<&'static str, cmd::Error>;
 
     /// Trait to allow structopt generated
     #[enum_dispatch]
@@ -474,7 +476,7 @@ mod cmd {
         }
     }
 
-    /// Print all nodes, edges, and associated text
+    /// Print all nodes, edges, and associated text to the editor scratchpad
     ///
     /// Prints all nodes in index order (not necessarily the order they would appear when
     /// traversing the dialogue tree). Under each node definiton, a list of the outgoing edges from
@@ -488,29 +490,25 @@ mod cmd {
         fn execute(&self, state: &mut EditorState) -> cmd::Result {
             let mut name_buf = String::with_capacity(64);
             let mut text_buf = String::with_capacity(256);
-            let mut node_iter = state.act.tree.node_references();
+            let node_iter = state.act.tree.node_references();
 
-            node_iter.try_for_each(|n| -> std::result::Result<(), cmd::Error> {
+            for n in node_iter {
                 let text = &state.act.text[n.1[0]..n.1[1]];
                 util::parse_node(text, &state.act.name_table, &mut name_buf, &mut text_buf)?;
-                println!("{} : {}", name_buf, text_buf);
-                state
-                    .act
-                    .tree
-                    .edges_directed(n.0, petgraph::Direction::Outgoing)
-                    .try_for_each(|e| -> std::result::Result<(), cmd::Error> {
-                        let choice = e.weight();
-                        util::parse_edge(
-                            &state.act.text[choice.section[0]..choice.section[1]],
-                            choice.action,
-                            &state.act.name_table,
-                            &mut text_buf,
-                        )?;
-                        println!("--> {:#?} : {} : {} ", e.target(), e.id().index(), text_buf,);
-                        Ok(())
-                    })?;
-                Ok(())
-            })?;
+                state.scratchpad.push_str(&format!("{} : {}\r\n", name_buf, text_buf));
+                for e in state.act.tree.edges_directed(n.0, petgraph::Direction::Outgoing) {
+                    let choice = e.weight();
+                    util::parse_edge(
+                        &state.act.text[choice.section[0]..choice.section[1]],
+                        choice.action,
+                        &state.act.name_table,
+                        &mut text_buf,
+                    )?;
+                    state.scratchpad.push_str(
+                        &format!("--> {:#?} : {} : {}\r\n", e.target(), e.id().index(), text_buf));
+                }
+            };
+            println!("{}", state.scratchpad);
             Ok(SUCCESS)
         }
     }
@@ -644,6 +642,7 @@ mod cmd {
                     Ok(())
                 } else {
                     // even token
+                    println!("{}", n);
                     let value = name_table.get(n).ok_or_else(cmd::Error::default)?;
                     text_buf.push_str(value);
                     Ok(())
@@ -789,13 +788,81 @@ fn main() {
         }
 
         // clear input buffers before starting next input loop
+        state.scratchpad.clear();
         cmd_buf.clear();
     }
 }
 
+mod tests {
+    use super::*;
+
+    /// helper function to parse cmd_bufs in the same way the editor does
+    #[inline(always)]
+    fn run_cmd(cmd_buf: &str, state: &mut EditorState) -> cmd::Result {
+        let cmds = shellwords::split(&cmd_buf).unwrap();
+        let res = cmd::Parse::from_iter_safe(cmds);
+        let v = res.unwrap();
+        v.execute(state)
+    }
+
+    #[test]
+    /// Test basic use case of the editor, new project, add a few nodes and names, list the output,
+    /// save the project, reload, list the output again
+    fn simple_editor() {
+        let mut cmd_buf = String::with_capacity(1000);
+        let mut state = EditorState::new(DialogueTreeData::default());
+        cmd_buf.push_str("new project \"simple_test\" -s");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+        assert_eq!(state.act.name, "simple_test");
+
+        cmd_buf.push_str("new name cat Behemoth");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+        assert_eq!(state.act.name_table.get("cat").unwrap(), "Behemoth");
+
+        cmd_buf.push_str("new node cat \"Well, who knows, who knows\"");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+        cmd_buf.push_str(
+            "new node cat \"'I protest!' ::cat:: exclaimed hotly. 'Dostoevsky is immortal'\"");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+        cmd_buf.push_str("new edge 0 1 \"Dostoevsky's dead\"");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+
+        cmd_buf.push_str("list");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+
+        let expected_list = concat!("Behemoth : Well, who knows, who knows\r\n",
+            "--> NodeIndex(1) : 0 : Dostoevsky's dead\r\n",
+            "Behemoth : 'I protest!' Behemoth exclaimed hotly. 'Dostoevsky is immortal'\r\n");
+        assert_eq!(state.scratchpad, expected_list);
+        state.scratchpad.clear();
+
+        cmd_buf.push_str("save");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+
+        cmd_buf.push_str("load simple_test");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+
+        cmd_buf.push_str("list");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+
+        assert_eq!(state.scratchpad, expected_list);
+        state.scratchpad.clear();
+
+        std::fs::remove_file("simple_test.tree").unwrap();
+    }
+}
 
 #[cfg(test)]
-mod bench {
+mod benchmarks {
     use super::*;
     use test::Bencher;
 
@@ -837,14 +904,14 @@ mod bench {
     fn quick_parse_node(b: &mut Bencher) {
         let mut name_table = HashMap::<String, String>::new();
         name_table.insert("vamp".to_string(), "Dracula".to_string());
-        name_table.insert("king".to_string(), "King Laugh".to_string());
+        name_table.insert("king".to_string(), "::king::".to_string());
 
-        let text = "It is a strange world, a sad world, a world full of miseries, and woes, and troubles.
-        And yet when King Laugh come, he make them all dance to the tune he play. Bleeding hearts, 
+        let text = "vamp::It is a strange world, a sad world, a world full of miseries, and woes, and 
+        troubles. And yet when ::king:: come, he make them all dance to the tune he play. Bleeding hearts, 
         and dry bones of the churchyard, and tears that burn as they fall, all dance together to the music
         that he make with that smileless mouth of him. Ah, we men and women are like ropes drawn tight with
         strain that pull us different ways. Then tears come, and like the rain on the ropes, they brace us 
-        up, until perhaps the strain become too great, and we break. But King Laugh he come like the
+        up, until perhaps the strain become too great, and we break. But ::king:: he come like the
         sunshine, and he ease off the strain again, and we bear to go on with our labor, what it may be.";
 
         let mut name_buf = String::with_capacity(20);
