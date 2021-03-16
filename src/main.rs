@@ -1,4 +1,5 @@
 #![feature(test)]
+#![feature(backtrace)]
 extern crate test;
 use crate::cmd::Executable;
 use clap::AppSettings;
@@ -15,17 +16,16 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::io::Write;
 use structopt::*;
+use thiserror::Error;
+use anyhow::Result;
 
 // TODO: Major Features
 // 1. Actionable edge function calls, currently impossible to do anything with action::Kind enum
-// 2. Tests
-// 3. Proper error/Ok propogation
+// 2. Proper error/Ok propogation
+// 3. More tests and benchmarks!
 // 4. Switch to bincode serialization format, json should only be for debugging
 
 static TREE_EXT: &str = ".tree";
-static _NONAME: &str = "no name provided";
-static _UNIMPLEMENTED: &str = "unimplemented command";
-static SUCCESS: &str = "success\r\n";
 static TOKEN: &str = "::";
 
 /// typedef representing a section of text in a rope. This section contains a start and end index,
@@ -113,16 +113,41 @@ impl EditorState {
     }
 }
 
+
+/// Top level module for all dialogue_tree commands. These commands rely heavily on the structopt
+/// derive feature to easily implement a command line interface along with command structs for
+/// input through other methods (UI, test code, etc.). In any structopt derived structure or enum,
+/// the doc comments are displayed to the user through the CLI.
+///
+/// All commands also implement the generic Executable trait. This trait uses enum_dispatch to
+/// propagate through to all types contained in the Parse enums. This executable method is where
+/// the core logic of any command happens.
 mod cmd {
     use super::*;
 
-    /// Unified result type for propogating errors in cmd methods
-    pub type Result = std::result::Result<&'static str, cmd::Error>;
+    /// Error types for different commands 
+    ///
+    /// Uses thiserror to generate messages for common situations. This does not
+    /// attempt to implement From trait on any lower level error types, but relies 
+    /// on anyhow for unification and printing a stack trace
+    #[derive(Error, Debug)]
+    pub enum Error {
+        #[error("An unspecified error occured...")]
+        Generic,
+        #[error("The name already exists")]
+        NameExists,
+        #[error("The name does not exist")]
+        NameNotExists,
+        #[error("Attempted to access a node that is not present in the tree")]
+        InvalidNodeIndex, 
+        #[error("Attempted to access an edge that is not present in the tree")]
+        InvalidEdgeIndex,
+    }
 
     /// Trait to allow structopt generated
     #[enum_dispatch]
     pub trait Executable {
-        fn execute(&self, data: &mut EditorState) -> cmd::Result;
+        fn execute(&self, data: &mut EditorState) -> Result<()>;
     }
 
     /// A tree based dialogue editor
@@ -173,9 +198,8 @@ mod cmd {
         }
 
         impl Executable for Project {
-            // Create a new file on disk for new project, optionally set it as active in the editor
-            // state
-            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+            /// New Project
+            fn execute(&self, state: &mut EditorState) -> Result<()> {
                 let new_project = DialogueTreeData::new(
                     graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
                     String::with_capacity(8192),
@@ -188,10 +212,8 @@ mod cmd {
 
                 if self.set_active {
                     *state = EditorState::new(new_project);
-                    Ok("New project created and set as active")
-                } else {
-                    Ok("New project created on disk")
                 }
+                Ok(())
             }
         }
 
@@ -208,15 +230,14 @@ mod cmd {
         }
 
         impl Executable for Node {
-            /// Create a new section of text on the text rope, and then make a new node on the
-            /// tree pointing to the section
-            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+            /// New Node
+            fn execute(&self, state: &mut EditorState) -> Result<()> {
                 // verify the speaker name is valid
                 state
                     .act
                     .name_table
                     .get(&self.speaker)
-                    .ok_or_else(cmd::Error::default)?;
+                    .ok_or(cmd::Error::Generic)?;
                 let start = state.act.text.len();
                 state
                     .act
@@ -226,7 +247,7 @@ mod cmd {
                 // Create hash for verifying the text section in the future
                 let hash = hash(&state.act.text[start..end].as_bytes());
                 state.act.tree.add_node(Section::new([start, end], hash));
-                Ok(SUCCESS)
+                Ok(())
             }
         }
 
@@ -251,7 +272,8 @@ mod cmd {
         }
 
         impl Executable for Edge {
-            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+            /// New Edge
+            fn execute(&self, state: &mut EditorState) -> Result<()> {
                 let start = state.act.text.len();
                 state.act.text.push_str(&self.text);
                 let end = state.act.text.len();
@@ -265,7 +287,7 @@ mod cmd {
                         self.action.unwrap_or_default(),
                     ),
                 );
-                Ok(SUCCESS)
+                Ok(())
             }
         }
 
@@ -282,18 +304,19 @@ mod cmd {
             value: String,
         }
         impl Executable for Name {
-            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+            /// New Name
+            fn execute(&self, state: &mut EditorState) -> Result<()> {
                 // Check that the key doesn't already exist, since we want new to not overwrite
                 // values. The user can use edit commands for that
-                if state.act.name_table.get(&self.key).is_some() {
-                    Ok("Key already exists")
-                } else {
+                if state.act.name_table.get(&self.key).is_none() {
                     state
                         .act
                         .name_table
                         .insert(self.key.clone(), self.value.clone());
-                    Ok(SUCCESS)
+                } else {
+                   Err(cmd::Error::NameExists)?;
                 }
+                Ok(())
             }
         }
     }
@@ -326,7 +349,7 @@ mod cmd {
         }
         impl Executable for Node {
             /// Edit Node
-            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+            fn execute(&self, state: &mut EditorState) -> Result<()> {
                 let node_index = NodeIndex::new(self.node_id);
                 let start = state.act.text.len();
                 state
@@ -339,11 +362,11 @@ mod cmd {
                     .act
                     .tree
                     .node_weight_mut(node_index)
-                    .ok_or_else(cmd::Error::default)?;
+                    .ok_or(cmd::Error::InvalidNodeIndex)?;
                 // Since editing, recalculate hash
                 let hash = hash(state.act.text[start..end].as_bytes());
                 *node = Section::new([start, end], hash);
-                Ok(SUCCESS)
+                Ok(())
             }
         }
 
@@ -373,7 +396,7 @@ mod cmd {
 
         impl Executable for Edge {
             /// Edit Edge
-            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+            fn execute(&self, state: &mut EditorState) -> Result<()> {
                 let edge_index = EdgeIndex::<u32>::new(self.edge_id);
                 let start = state.act.text.len();
                 state.act.text.push_str(&self.text);
@@ -388,9 +411,9 @@ mod cmd {
                 if self.source_node_id.is_some() && self.target_node_id.is_some() {
                     // None is unexpected at this point, but double check
                     let source_node_index =
-                        NodeIndex::new(self.source_node_id.ok_or_else(cmd::Error::default)?);
+                        NodeIndex::new(self.source_node_id.ok_or(cmd::Error::Generic)?);
                     let target_node_index =
-                        NodeIndex::new(self.target_node_id.ok_or_else(cmd::Error::default)?);
+                        NodeIndex::new(self.target_node_id.ok_or(cmd::Error::Generic)?);
 
                     state.act.tree.remove_edge(edge_index);
                     state
@@ -399,7 +422,7 @@ mod cmd {
                         .add_edge(source_node_index, target_node_index, new_weight);
                 }
 
-                Ok(SUCCESS)
+                Ok(())
             }
         }
 
@@ -417,20 +440,20 @@ mod cmd {
         }
 
         impl Executable for Name {
-            fn execute(&self, state: &mut EditorState) -> cmd::Result {
+            fn execute(&self, state: &mut EditorState) -> Result<()> {
                 // Check that the key already exists, and make sure not to accidently add a new key
                 // to the table. The user can use new commands for that
-                if state.act.name_table.get(&self.key).is_none() {
-                    Ok("Key does not exist")
-                } else {
+                if state.act.name_table.get(&self.key).is_some() {
                     let name = state
                         .act
                         .name_table
                         .get_mut(&self.key)
-                        .ok_or_else(cmd::Error::default)?;
+                        .ok_or(cmd::Error::Generic)?;
                     *name = self.value.clone();
-                    Ok(SUCCESS)
+                } else {
+                    Err(cmd::Error::NameNotExists)?;
                 }
+                Ok(())
             }
         }
     }
@@ -441,7 +464,7 @@ mod cmd {
     pub struct Save {}
 
     impl Executable for Save {
-        fn execute(&self, state: &mut EditorState) -> cmd::Result {
+        fn execute(&self, state: &mut EditorState) -> Result<()> {
             // save states to backup buffer
             state.backup = state.act.clone();
 
@@ -455,7 +478,7 @@ mod cmd {
 
             let json = serde_json::to_string(&state.act).unwrap();
             std::fs::write(state.act.name.clone() + TREE_EXT, json)?;
-            Ok(SUCCESS)
+            Ok(())
         }
     }
 
@@ -467,12 +490,12 @@ mod cmd {
     }
 
     impl Executable for Load {
-        fn execute(&self, state: &mut EditorState) -> cmd::Result {
+        fn execute(&self, state: &mut EditorState) -> Result<()> {
             let new_state = EditorState::new(serde_json::from_reader(std::io::BufReader::new(
                 std::fs::File::open(self.name.clone() + TREE_EXT)?,
             ))?);
             *state = new_state;
-            Ok(SUCCESS)
+            Ok(())
         }
     }
 
@@ -487,7 +510,7 @@ mod cmd {
     pub struct List {}
 
     impl Executable for List {
-        fn execute(&self, state: &mut EditorState) -> cmd::Result {
+        fn execute(&self, state: &mut EditorState) -> Result<()> {
             let mut name_buf = String::with_capacity(64);
             let mut text_buf = String::with_capacity(256);
             let node_iter = state.act.tree.node_references();
@@ -509,51 +532,7 @@ mod cmd {
                 }
             };
             println!("{}", state.scratchpad);
-            Ok(SUCCESS)
-        }
-    }
-
-    /// Error types for different commands
-    // TODO: remove if not needed
-    #[derive(new, Debug, Default)]
-    pub struct Error {
-        details: String,
-    }
-
-    impl std::fmt::Display for Error {
-        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            write!(f, "{}", self.details)
-        }
-    }
-
-    impl std::error::Error for Error {
-        fn description(&self) -> &str {
-            &self.details
-        }
-    }
-
-    /// Placeholder from implementation for io Errors
-    // TODO: use non-default error type for io errors
-    impl From<std::io::Error> for Error {
-        fn from(_err: std::io::Error) -> Self {
-            Error::default()
-        }
-    }
-
-    /// Placeholder from implementation for str->int conversion errors
-    // TODO: use non-default error type for str->int conversion errors
-    impl From<std::num::ParseIntError> for Error {
-        fn from(_err: std::num::ParseIntError) -> Self {
-            Error::default()
-        }
-    }
-
-    /// Placeholder from implementation for serde serialization errors
-    // TODO: use non-default error type for serde serialization errors
-    impl From<serde_json::Error> for Error {
-        fn from(_err: serde_json::Error) -> Self {
-            println!("{}", _err);
-            Error::default()
+            Ok(())
         }
     }
 
@@ -576,7 +555,7 @@ mod cmd {
             name_table: &HashMap<String, String>,
             name_buf: &mut String,
             text_buf: &mut String,
-        ) -> cmd::Result {
+        ) -> Result<()> {
             // Implementation notes:
             //  1. The first iterator element is always the speaker name and should be the only
             //     thing written to the name buffer
@@ -588,15 +567,15 @@ mod cmd {
             name_buf.clear();
             text_buf.clear();
             let mut text_iter = text.split(TOKEN).enumerate();
-            let speaker_key = text_iter.next().ok_or_else(cmd::Error::default)?.1;
+            let speaker_key = text_iter.next().ok_or(cmd::Error::Generic)?.1;
             let speaker_name = name_table
                 .get(speaker_key)
-                .ok_or_else(cmd::Error::default)?;
+                .ok_or(cmd::Error::Generic)?;
             name_buf.push_str(speaker_name);
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
                 if (i & 0x1) == 0 {
                     // odd token
-                    let value = name_table.get(n).ok_or_else(cmd::Error::default)?;
+                    let value = name_table.get(n).ok_or(cmd::Error::Generic)?;
                     text_buf.push_str(value);
                     Ok(())
                 } else {
@@ -606,14 +585,14 @@ mod cmd {
                 }
             })?;
 
-            Ok(SUCCESS)
+            Ok(())
         }
 
         /// Helper method to parse a player action (edge's) section of the text and fill in any
         /// name variables.
         ///
         /// The input text section should have the following format
-        ///     action text ::name:: more action text
+        ///     'action text ::name:: more action text'
         ///
         /// Both the name and text buf are cleared at the beginning of this method
         // TODO: Handling of actions are not implemented yet, if this ends up being done elsewhere
@@ -623,7 +602,7 @@ mod cmd {
             _action: action::Kind,
             name_table: &HashMap<String, String>,
             text_buf: &mut String,
-        ) -> cmd::Result {
+        ) -> Result<()> {
             // Implementation notes
             //  1. Due to the format, only even iterator elements are names that need to be looked
             //     up in the name table. This is true because split() will return an empty strings
@@ -643,13 +622,13 @@ mod cmd {
                 } else {
                     // even token
                     println!("{}", n);
-                    let value = name_table.get(n).ok_or_else(cmd::Error::default)?;
+                    let value = name_table.get(n).ok_or(cmd::Error::Generic)?;
                     text_buf.push_str(value);
                     Ok(())
                 }
             })?;
 
-            Ok(SUCCESS)
+            Ok(())
         }
 
         /// Helper method to prompt the user for input
@@ -685,7 +664,7 @@ mod cmd {
             tree: &Tree,
             new_text: &mut String,
             new_tree: &mut Tree,
-        ) -> cmd::Result {
+        ) -> Result<()> {
             new_text.clear();
             new_tree.clear();
             // Clone the old tree into the new one such that the nodes and edge indices and layout
@@ -706,7 +685,7 @@ mod cmd {
                 let end = new_text.len();
                 let new_node = new_tree
                     .node_weight_mut(node_index)
-                    .ok_or_else(cmd::Error::default)?;
+                    .ok_or(cmd::Error::InvalidNodeIndex)?;
                 // verify new and old hash match
                 let new_hash = hash(new_text[start..end].as_bytes());
                 assert!(node.hash == new_hash);
@@ -730,7 +709,7 @@ mod cmd {
                     let end = new_text.len();
                     let mut new_edge = new_tree
                         .edge_weight_mut(edge_ref.id())
-                        .ok_or_else(cmd::Error::default)?;
+                        .ok_or(cmd::Error::InvalidEdgeIndex)?;
                     // verify new and old hash match
                     let new_hash = hash(new_text[start..end].as_bytes());
                     assert!(edge.section.hash == new_hash);
@@ -738,7 +717,7 @@ mod cmd {
                 }
             }
 
-            Ok(SUCCESS)
+            Ok(())
         }
     }
 }
@@ -781,10 +760,22 @@ fn main() {
         // Handle results/errors
         match cmd_result {
             Ok(v) => match v.execute(&mut state) {
-                Ok(r) => println!("{}", r),
-                Err(f) => println!("{}", f),
+                Ok(_r) => println!("success"),
+                // errors from dialogue_tree operations
+                Err(f) => { 
+                    // pretty print top level error message
+                    println!("\u{1b}[1;31merror:\u{1b}[0m {}", f);
+
+                    // print the interesting bits of the stacktrace
+                    // TODO: much to be improved here if backtrace.frames() can be
+                    // pulled in
+                    let s = format!("{}", f.backtrace());
+                    let mut split = s.split("backtrace");
+                    println!("{} . . .", split.next().unwrap());
+                }
             },
-            Err(e) => println!("{}", e),
+            // errors from CLI interface 
+            Err(e) => println!("{}", e)
         }
 
         // clear input buffers before starting next input loop
@@ -793,12 +784,13 @@ fn main() {
     }
 }
 
+/// Test code, generally these are integration level rather than unit level.
 mod tests {
     use super::*;
 
     /// helper function to parse cmd_bufs in the same way the editor does
     #[inline(always)]
-    fn run_cmd(cmd_buf: &str, state: &mut EditorState) -> cmd::Result {
+    fn run_cmd(cmd_buf: &str, state: &mut EditorState) -> Result<()> {
         let cmds = shellwords::split(&cmd_buf).unwrap();
         let res = cmd::Parse::from_iter_safe(cmds);
         let v = res.unwrap();
@@ -861,6 +853,7 @@ mod tests {
     }
 }
 
+/// Benchmarks are mainly created ad-hoc to help diagnose potential performance issues.
 #[cfg(test)]
 mod benchmarks {
     use super::*;
@@ -904,7 +897,7 @@ mod benchmarks {
     fn quick_parse_node(b: &mut Bencher) {
         let mut name_table = HashMap::<String, String>::new();
         name_table.insert("vamp".to_string(), "Dracula".to_string());
-        name_table.insert("king".to_string(), "::king::".to_string());
+        name_table.insert("king".to_string(), "King Laugh".to_string());
 
         let text = "vamp::It is a strange world, a sad world, a world full of miseries, and woes, and 
         troubles. And yet when ::king:: come, he make them all dance to the tune he play. Bleeding hearts, 
