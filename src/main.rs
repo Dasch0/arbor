@@ -21,9 +21,10 @@ use anyhow::Result;
 
 // TODO: Major Features
 // 1. Actionable edge function calls, currently impossible to do anything with action::Kind enum
-// 2. Proper error/Ok propogation
-// 3. More tests and benchmarks!
-// 4. Switch to bincode serialization format, json should only be for debugging
+// TODO: Minor features
+// 1. More tests and benchmarks!
+// 2. Switch to bincode serialization format
+// 3. Add more help messages for common errors, maybe with contexts?
 
 static TREE_EXT: &str = ".tree";
 static TOKEN: &str = "::";
