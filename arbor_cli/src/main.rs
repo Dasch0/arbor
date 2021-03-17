@@ -205,7 +205,7 @@ impl EditorState {
     }
 }
 
-/// Top level module for all dialogue_tree commands. These commands rely heavily on the structopt
+/// Top level module for all arbor commands. These commands rely heavily on the structopt
 /// derive feature to easily implement a command line interface along with command structs for
 /// input through other methods (UI, test code, etc.). In any structopt derived structure or enum,
 /// the doc comments are displayed to the user through the CLI.
@@ -248,7 +248,7 @@ mod cmd {
     /// A tree based dialogue editor
     // NoBinaryName is set so that the first arg is not parsed as binary name when using
     // StructOpt::from_iter_safe
-    // name is set as "" to prevent usage help from recommending to start commands with "dialogue_tree"
+    // name is set as "" to prevent usage help from recommending to start commands with "arbor"
     #[enum_dispatch(Executable)]
     #[derive(StructOpt)]
     #[structopt(name="", setting = AppSettings::NoBinaryName)]
@@ -1018,7 +1018,7 @@ fn main() {
         match cmd_result {
             Ok(v) => match v.execute(&mut state) {
                 Ok(_r) => println!("success"),
-                // errors from dialogue_tree operations
+                // errors from arbor operations
                 Err(f) => {
                     // pretty print top level error message
                     println!("\u{1b}[1;31merror:\u{1b}[0m {}", f);
