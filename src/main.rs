@@ -2,6 +2,7 @@
 #![feature(backtrace)]
 extern crate test;
 use crate::cmd::Executable;
+use anyhow::Result;
 use clap::AppSettings;
 use derive_new::*;
 use enum_dispatch::*;
@@ -17,11 +18,8 @@ use std::io;
 use std::io::Write;
 use structopt::*;
 use thiserror::Error;
-use anyhow::Result;
 
-// TODO: Major Features
-// 1. Actionable edge function calls, currently impossible to do anything with action::Kind enum
-// TODO: Minor features
+// TODO: Features List
 // 1. More tests and benchmarks!
 // 2. Switch to bincode serialization format
 // 3. Add more help messages for common errors, maybe with contexts?
@@ -80,11 +78,109 @@ impl DialogueTreeData {
     }
 }
 
+/// Represents a requirement to access a choice. 
+#[derive(Serialize, Deserialize, Clone)]
+pub enum ReqKind {
+    /// Must be greater than num
+    GT(String, u32),
+    /// Must be less than num
+    LT(String, u32),
+    /// Must be equal to num
+    EQ(String, u32),
+    CMP(String, String),
+}
+
+impl std::str::FromStr for ReqKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Implementation notes:
+        // The enum string format is set up to directly map to how the enum is declared in rust:
+        // e.g. 'GreaterThan(my_key, 10)'
+        // This is tokenized on the presence of '(' ',' and ')' special characters. In reverse
+        // order: 
+        // e.g. ['', '10', 'my_key', 'GreaterThan']
+        //
+        // This is done in reverse order so that the required key and val can be built up before
+        // converting the enum itself, (since the key and val are required to declare the enum
+        //
+        // Importantly, the 'val' that is tested against can be a string or a u32. This is handled
+        // by waiting to unwrap the val parameter until building the Enum
+        let mut split = s.rsplit(&['(', ',', ')'][..]);
+        // first item should be ''
+        anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)? == "");
+        // second item should be number or string, wait to check validity
+        let val = split
+            .next()
+            .ok_or(cmd::Error::Generic)?;
+        // third item should be key
+        let key: &str = split
+            .next()
+            .ok_or(cmd::Error::Generic)?;
+        // fourth item should be Enum type, build it!, and also try to resolve the val
+        match split.next().ok_or(cmd::Error::Generic)? {
+            "GT" => Ok(ReqKind::GT(key.to_string(), val.parse::<u32>()?)),
+            "LT" => Ok(ReqKind::LT(key.to_string(), val.parse::<u32>()?)),
+            "EQ" => Ok(ReqKind::EQ(key.to_string(), val.parse::<u32>()?)),
+            "CMP" => Ok(ReqKind::CMP(key.to_string(), val.to_string())),
+            _ => Err(cmd::Error::Generic)?,
+        }
+    }
+}
+
+/// Represents an effect that occurs when a choice is made.
+#[derive(Serialize, Deserialize, Clone)]
+pub enum EffectKind {
+    Add(String, u32),
+    Sub(String, u32),
+    Set(String, u32),
+    Assign(String, String),
+}
+
+impl std::str::FromStr for EffectKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Implementation notes:
+        // The enum string format is set up to directly map to how the enum is declared in rust:
+        // e.g. 'Add(my_key,10)'
+        // This is tokenized on the presence of '(' ',' and ')' special characters. In reverse
+        // order: 
+        // e.g. ['', '10', 'my_key', 'Add']
+        //
+        // This is done in reverse order so that the required key and val can be built up before
+        // converting the enum itself, (since the key and val are required to declare the enum.
+        //
+        // Importantly, the 'val' that is tested against can be a string or a u32. This is handled
+        // by waiting to unwrap the val parameter until building the Enum
+        let mut split = s.rsplit(&['(', ',', ')'][..]);
+        // first item should be ''
+        anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)? == "");
+        // second item should be number or string, don't check for validity yet 
+        let val = split
+            .next()
+            .ok_or(cmd::Error::Generic)?;
+        // third item should be key
+        let key: &str = split
+            .next()
+            .ok_or(cmd::Error::Generic)?;
+        // fourth item should be Enum type, build it!
+        match split.next().ok_or(cmd::Error::Generic)? {
+            "Add" => Ok(EffectKind::Add(key.to_string(), val.parse::<u32>()?)),
+            "Sub" => Ok(EffectKind::Sub(key.to_string(), val.parse::<u32>()?)),
+            "Set" => Ok(EffectKind::Set(key.to_string(), val.parse::<u32>()?)),
+            "Assign" => Ok(EffectKind::Assign(key.to_string(), val.to_string())),
+            _ => Err(cmd::Error::Generic)?,
+        }
+    }
+}
+
 /// Struct storing the information for a player choice. Stored in the edges of a dialogue tree
-#[derive(new, Serialize, Deserialize, Clone, Copy)]
+#[derive(new, Serialize, Deserialize, Clone)]
 pub struct Choice {
     section: Section,
-    action: action::Kind,
+    requirement: Option<ReqKind>,
+    effect: Option<EffectKind>,
 }
 
 /// State information for an editor instance. Includes two copies of the dialogue tree (one active
@@ -114,7 +210,6 @@ impl EditorState {
     }
 }
 
-
 /// Top level module for all dialogue_tree commands. These commands rely heavily on the structopt
 /// derive feature to easily implement a command line interface along with command structs for
 /// input through other methods (UI, test code, etc.). In any structopt derived structure or enum,
@@ -126,10 +221,10 @@ impl EditorState {
 mod cmd {
     use super::*;
 
-    /// Error types for different commands 
+    /// Error types for different commands
     ///
     /// Uses thiserror to generate messages for common situations. This does not
-    /// attempt to implement From trait on any lower level error types, but relies 
+    /// attempt to implement From trait on any lower level error types, but relies
     /// on anyhow for unification and printing a stack trace
     #[derive(Error, Debug)]
     pub enum Error {
@@ -140,7 +235,7 @@ mod cmd {
         #[error("The name does not exist")]
         NameNotExists,
         #[error("Attempted to access a node that is not present in the tree")]
-        InvalidNodeIndex, 
+        InvalidNodeIndex,
         #[error("Attempted to access an edge that is not present in the tree")]
         InvalidEdgeIndex,
     }
@@ -264,12 +359,13 @@ mod cmd {
             end_index: u32,
             /// Action text or dialogue
             text: String,
-            /// Special types for actions that may edit variables  
-            ///
-            /// An example action is if the user is prompted to input the name of their character,
-            /// or if the user picks up a variable item from a table and stores it in their
-            /// inventory
-            action: Option<action::Kind>,
+            /// Requirement for accessing this edge
+            #[structopt(short = "r")]
+            requirement: Option<ReqKind>,
+
+            /// Effect caused by accessing this edge
+            #[structopt(short = "e")]
+            effect: Option<EffectKind>,
         }
 
         impl Executable for Edge {
@@ -285,7 +381,8 @@ mod cmd {
                     NodeIndex::from(self.end_index),
                     Choice::new(
                         Section::new([start, end], hash),
-                        self.action.unwrap_or_default(),
+                        self.requirement.clone(),
+                        self.effect.clone(),
                     ),
                 );
                 Ok(())
@@ -315,7 +412,7 @@ mod cmd {
                         .name_table
                         .insert(self.key.clone(), self.value.clone());
                 } else {
-                   Err(cmd::Error::NameExists)?;
+                    Err(cmd::Error::NameExists)?;
                 }
                 Ok(())
             }
@@ -381,18 +478,19 @@ mod cmd {
             edge_id: usize,
             /// Action text or dialogue
             text: String,
-            /// Special types for actions that may edit variables  
-            ///
-            /// An example action is if the user is prompted to input the name of their character,
-            /// or if the user picks up a variable item from a table and stores it in their
-            /// inventory
-            action: Option<action::Kind>,
+            /// Requirement for accessing this edge
+            #[structopt(short = "r")]
+            requirement: Option<ReqKind>,
+            /// Effect caused by accessing this edge
+            #[structopt(short = "e")]
+            effect: Option<EffectKind>,
             /// dialogue node that this action originates from
             #[structopt(requires("target_node_id"))]
             source_node_id: Option<usize>,
             /// dialogue node that this action will lead to
             #[structopt(requires("source_node_id"))]
             target_node_id: Option<usize>,
+
         }
 
         impl Executable for Edge {
@@ -405,7 +503,8 @@ mod cmd {
                 let hash = hash(state.act.text[start..end].as_bytes());
                 let new_weight = Choice::new(
                     Section::new([start, end], hash),
-                    self.action.unwrap_or_default(),
+                    self.requirement.clone(),
+                    self.effect.clone(),
                 );
 
                 // Handle deletion/recreation of edge if nodes need to change
@@ -519,19 +618,28 @@ mod cmd {
             for n in node_iter {
                 let text = &state.act.text[n.1[0]..n.1[1]];
                 util::parse_node(text, &state.act.name_table, &mut name_buf, &mut text_buf)?;
-                state.scratchpad.push_str(&format!("{} : {}\r\n", name_buf, text_buf));
-                for e in state.act.tree.edges_directed(n.0, petgraph::Direction::Outgoing) {
+                state
+                    .scratchpad
+                    .push_str(&format!("{} : {}\r\n", name_buf, text_buf));
+                for e in state
+                    .act
+                    .tree
+                    .edges_directed(n.0, petgraph::Direction::Outgoing)
+                {
                     let choice = e.weight();
                     util::parse_edge(
                         &state.act.text[choice.section[0]..choice.section[1]],
-                        choice.action,
                         &state.act.name_table,
                         &mut text_buf,
                     )?;
-                    state.scratchpad.push_str(
-                        &format!("--> {:#?} : {} : {}\r\n", e.target(), e.id().index(), text_buf));
+                    state.scratchpad.push_str(&format!(
+                        "--> {:#?} : {} : {}\r\n",
+                        e.target(),
+                        e.id().index(),
+                        text_buf
+                    ));
                 }
-            };
+            }
             println!("{}", state.scratchpad);
             Ok(())
         }
@@ -569,9 +677,7 @@ mod cmd {
             text_buf.clear();
             let mut text_iter = text.split(TOKEN).enumerate();
             let speaker_key = text_iter.next().ok_or(cmd::Error::Generic)?.1;
-            let speaker_name = name_table
-                .get(speaker_key)
-                .ok_or(cmd::Error::Generic)?;
+            let speaker_name = name_table.get(speaker_key).ok_or(cmd::Error::Generic)?;
             name_buf.push_str(speaker_name);
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
                 if (i & 0x1) == 0 {
@@ -596,11 +702,8 @@ mod cmd {
         ///     'action text ::name:: more action text'
         ///
         /// Both the name and text buf are cleared at the beginning of this method
-        // TODO: Handling of actions are not implemented yet, if this ends up being done elsewhere
-        // the action arg may be removed
         pub fn parse_edge(
             text: &str,
-            _action: action::Kind,
             name_table: &HashMap<String, String>,
             text_buf: &mut String,
         ) -> Result<()> {
@@ -763,7 +866,7 @@ fn main() {
             Ok(v) => match v.execute(&mut state) {
                 Ok(_r) => println!("success"),
                 // errors from dialogue_tree operations
-                Err(f) => { 
+                Err(f) => {
                     // pretty print top level error message
                     println!("\u{1b}[1;31merror:\u{1b}[0m {}", f);
 
@@ -775,8 +878,8 @@ fn main() {
                     println!("{} . . .", split.next().unwrap());
                 }
             },
-            // errors from CLI interface 
-            Err(e) => println!("{}", e)
+            // errors from CLI interface
+            Err(e) => println!("{}", e),
         }
 
         // clear input buffers before starting next input loop
@@ -818,7 +921,8 @@ mod tests {
         run_cmd(&cmd_buf, &mut state).unwrap();
         cmd_buf.clear();
         cmd_buf.push_str(
-            "new node cat \"'I protest!' ::cat:: exclaimed hotly. 'Dostoevsky is immortal'\"");
+            "new node cat \"'I protest!' ::cat:: exclaimed hotly. 'Dostoevsky is immortal'\"",
+        );
         run_cmd(&cmd_buf, &mut state).unwrap();
         cmd_buf.clear();
         cmd_buf.push_str("new edge 0 1 \"Dostoevsky's dead\"");
@@ -829,9 +933,11 @@ mod tests {
         run_cmd(&cmd_buf, &mut state).unwrap();
         cmd_buf.clear();
 
-        let expected_list = concat!("Behemoth : Well, who knows, who knows\r\n",
+        let expected_list = concat!(
+            "Behemoth : Well, who knows, who knows\r\n",
             "--> NodeIndex(1) : 0 : Dostoevsky's dead\r\n",
-            "Behemoth : 'I protest!' Behemoth exclaimed hotly. 'Dostoevsky is immortal'\r\n");
+            "Behemoth : 'I protest!' Behemoth exclaimed hotly. 'Dostoevsky is immortal'\r\n"
+        );
         assert_eq!(state.scratchpad, expected_list);
         state.scratchpad.clear();
 
