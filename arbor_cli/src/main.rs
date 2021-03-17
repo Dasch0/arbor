@@ -90,7 +90,7 @@ pub enum ReqKind {
     LT(String, u32),
     /// Must be equal to num
     EQ(String, u32),
-    CMP(String, String),
+    Cmp(String, String),
 }
 
 impl std::str::FromStr for ReqKind {
@@ -121,7 +121,7 @@ impl std::str::FromStr for ReqKind {
             "GT" => Ok(ReqKind::GT(key.to_string(), val.parse::<u32>()?)),
             "LT" => Ok(ReqKind::LT(key.to_string(), val.parse::<u32>()?)),
             "EQ" => Ok(ReqKind::EQ(key.to_string(), val.parse::<u32>()?)),
-            "CMP" => Ok(ReqKind::CMP(key.to_string(), val.to_string())),
+            "Cmp" => Ok(ReqKind::Cmp(key.to_string(), val.to_string())),
             _ => Err(cmd::Error::Generic.into()),
         }
     }
@@ -941,7 +941,7 @@ mod cmd {
                 ReqKind::EQ(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
-                ReqKind::CMP(key, _val) => {
+                ReqKind::Cmp(key, _val) => {
                     name_table.get(key).ok_or(cmd::Error::NameNotExists)?;
                 }
             }
