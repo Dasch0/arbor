@@ -22,7 +22,8 @@ use thiserror::Error;
 // TODO: Features List
 // 1. More tests and benchmarks!
 // 2. Switch to bincode serialization format
-// 3. Add more help messages for common errors, maybe with contexts?
+// 3. Add more help messages and detail for error types, and clean up error reporting to the
+//    console, maybe with thiserror/anyhow .contexts?
 
 static TREE_EXT: &str = ".tree";
 static TOKEN: &str = "::";
@@ -64,6 +65,7 @@ pub struct DialogueTreeData {
     tree: Tree,
     text: String,
     name_table: HashMap<String, String>,
+    val_table: HashMap<String, u32>,
     name: String,
 }
 
@@ -73,13 +75,14 @@ impl DialogueTreeData {
             tree: graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
             text: String::with_capacity(8192),
             name_table: HashMap::new(),
+            val_table: HashMap::new(),
             name: String::new(),
         }
     }
 }
 
-/// Represents a requirement to access a choice. 
-#[derive(Serialize, Deserialize, Clone)]
+/// Represents a requirement to access a choice.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ReqKind {
     /// Must be greater than num
     GT(String, u32),
@@ -98,7 +101,7 @@ impl std::str::FromStr for ReqKind {
         // The enum string format is set up to directly map to how the enum is declared in rust:
         // e.g. 'GreaterThan(my_key, 10)'
         // This is tokenized on the presence of '(' ',' and ')' special characters. In reverse
-        // order: 
+        // order:
         // e.g. ['', '10', 'my_key', 'GreaterThan']
         //
         // This is done in reverse order so that the required key and val can be built up before
@@ -110,13 +113,9 @@ impl std::str::FromStr for ReqKind {
         // first item should be ''
         anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)? == "");
         // second item should be number or string, wait to check validity
-        let val = split
-            .next()
-            .ok_or(cmd::Error::Generic)?;
+        let val = split.next().ok_or(cmd::Error::Generic)?;
         // third item should be key
-        let key: &str = split
-            .next()
-            .ok_or(cmd::Error::Generic)?;
+        let key: &str = split.next().ok_or(cmd::Error::Generic)?;
         // fourth item should be Enum type, build it!, and also try to resolve the val
         match split.next().ok_or(cmd::Error::Generic)? {
             "GT" => Ok(ReqKind::GT(key.to_string(), val.parse::<u32>()?)),
@@ -129,7 +128,7 @@ impl std::str::FromStr for ReqKind {
 }
 
 /// Represents an effect that occurs when a choice is made.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum EffectKind {
     Add(String, u32),
     Sub(String, u32),
@@ -145,7 +144,7 @@ impl std::str::FromStr for EffectKind {
         // The enum string format is set up to directly map to how the enum is declared in rust:
         // e.g. 'Add(my_key,10)'
         // This is tokenized on the presence of '(' ',' and ')' special characters. In reverse
-        // order: 
+        // order:
         // e.g. ['', '10', 'my_key', 'Add']
         //
         // This is done in reverse order so that the required key and val can be built up before
@@ -156,14 +155,10 @@ impl std::str::FromStr for EffectKind {
         let mut split = s.rsplit(&['(', ',', ')'][..]);
         // first item should be ''
         anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)? == "");
-        // second item should be number or string, don't check for validity yet 
-        let val = split
-            .next()
-            .ok_or(cmd::Error::Generic)?;
+        // second item should be number or string, don't check for validity yet
+        let val = split.next().ok_or(cmd::Error::Generic)?;
         // third item should be key
-        let key: &str = split
-            .next()
-            .ok_or(cmd::Error::Generic)?;
+        let key: &str = split.next().ok_or(cmd::Error::Generic)?;
         // fourth item should be Enum type, build it!
         match split.next().ok_or(cmd::Error::Generic)? {
             "Add" => Ok(EffectKind::Add(key.to_string(), val.parse::<u32>()?)),
@@ -234,6 +229,10 @@ mod cmd {
         NameExists,
         #[error("The name does not exist")]
         NameNotExists,
+        #[error("The value already exists")]
+        ValExists,
+        #[error("The value does not exist")]
+        ValNotExists,
         #[error("Attempted to access a node that is not present in the tree")]
         InvalidNodeIndex,
         #[error("Attempted to access an edge that is not present in the tree")]
@@ -273,6 +272,7 @@ mod cmd {
             Node(new::Node),
             Edge(new::Edge),
             Name(new::Name),
+            Val(new::Val),
         }
 
         /// Create a new project
@@ -299,6 +299,7 @@ mod cmd {
                 let new_project = DialogueTreeData::new(
                     graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
                     String::with_capacity(8192),
+                    HashMap::new(),
                     HashMap::new(),
                     self.name.clone(),
                 );
@@ -376,6 +377,23 @@ mod cmd {
                 let end = state.act.text.len();
                 // Compute hash for verifying the text section later
                 let hash = hash(&state.act.text[start..end].as_bytes());
+
+                // Validate that any requirements/effects reference valid hashmap keys
+                if self.requirement.is_some() {
+                    util::validate_requirement(
+                        self.requirement.as_ref().ok_or(cmd::Error::Generic)?,
+                        &state.act.name_table,
+                        &state.act.val_table,
+                    )?;
+                }
+                if self.effect.is_some() {
+                    util::validate_effect(
+                        self.effect.as_ref().ok_or(cmd::Error::Generic)?,
+                        &state.act.name_table,
+                        &state.act.val_table,
+                    )?;
+                }
+
                 state.act.tree.add_edge(
                     NodeIndex::from(self.start_index),
                     NodeIndex::from(self.end_index),
@@ -396,10 +414,10 @@ mod cmd {
         #[derive(new, StructOpt, Debug)]
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Name {
-            /// The keyword to reference the value with in the text
+            /// The keyword to reference the name with in the text
             key: String,
-            /// Value to store, able be updated by player actions
-            value: String,
+            /// The name to store, able be updated by player actions
+            name: String,
         }
         impl Executable for Name {
             /// New Name
@@ -410,9 +428,35 @@ mod cmd {
                     state
                         .act
                         .name_table
-                        .insert(self.key.clone(), self.value.clone());
+                        .insert(self.key.clone(), self.name.clone());
                 } else {
                     Err(cmd::Error::NameExists)?;
+                }
+                Ok(())
+            }
+        }
+
+        /// Create a new value for use in dialogue nodes and actions
+        ///
+        /// A value represents some variable number that is used as requirements and effects for
+        /// choices. Examples include player skill levels, relationship stats, and presence of an item.
+        #[derive(new, StructOpt, Debug)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Val {
+            /// The keyword to reference the value with in the dialogue tree
+            key: String,
+            /// Value to store, able be updated by player actions
+            value: u32,
+        }
+        impl Executable for Val {
+            /// New Name
+            fn execute(&self, state: &mut EditorState) -> Result<()> {
+                // Check that the key doesn't already exist, since we want new to not overwrite
+                // values. The user can use edit commands for that
+                if state.act.val_table.get(&self.key).is_none() {
+                    state.act.val_table.insert(self.key.clone(), self.value);
+                } else {
+                    Err(cmd::Error::ValExists)?;
                 }
                 Ok(())
             }
@@ -430,6 +474,7 @@ mod cmd {
             Node(edit::Node),
             Edge(edit::Edge),
             Name(edit::Name),
+            Val(edit::Val),
         }
 
         /// Edit the contents of a node in the dialogue tree
@@ -490,7 +535,6 @@ mod cmd {
             /// dialogue node that this action will lead to
             #[structopt(requires("source_node_id"))]
             target_node_id: Option<usize>,
-
         }
 
         impl Executable for Edge {
@@ -501,6 +545,23 @@ mod cmd {
                 state.act.text.push_str(&self.text);
                 let end = state.act.text.len();
                 let hash = hash(state.act.text[start..end].as_bytes());
+
+                // Validate that any requirements/effects reference valid hashmap keys
+                if self.requirement.is_some() {
+                    util::validate_requirement(
+                        self.requirement.as_ref().ok_or(cmd::Error::Generic)?,
+                        &state.act.name_table,
+                        &state.act.val_table,
+                    )?;
+                }
+                if self.effect.is_some() {
+                    util::validate_effect(
+                        self.effect.as_ref().ok_or(cmd::Error::Generic)?,
+                        &state.act.name_table,
+                        &state.act.val_table,
+                    )?;
+                }
+                
                 let new_weight = Choice::new(
                     Section::new([start, end], hash),
                     self.requirement.clone(),
@@ -552,6 +613,37 @@ mod cmd {
                     *name = self.value.clone();
                 } else {
                     Err(cmd::Error::NameNotExists)?;
+                }
+                Ok(())
+            }
+        }
+
+        /// Edit an existing value
+        ///
+        /// A value represents some variable number that is used as requirements and effects for
+        /// choices. Examples include player skill levels, relationship stats, and presence of an item.
+        #[derive(new, StructOpt, Debug)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Val {
+            /// The keyword to reference the name with in the text
+            key: String,
+            /// Value to store to the name
+            value: String,
+        }
+
+        impl Executable for Val {
+            fn execute(&self, state: &mut EditorState) -> Result<()> {
+                // Check that the key already exists, and make sure not to accidently add a new key
+                // to the table. The user can use new commands for that
+                if state.act.name_table.get(&self.key).is_some() {
+                    let name = state
+                        .act
+                        .name_table
+                        .get_mut(&self.key)
+                        .ok_or(cmd::Error::Generic)?;
+                    *name = self.value.clone();
+                } else {
+                    Err(cmd::Error::ValNotExists)?;
                 }
                 Ok(())
             }
@@ -618,9 +710,12 @@ mod cmd {
             for n in node_iter {
                 let text = &state.act.text[n.1[0]..n.1[1]];
                 util::parse_node(text, &state.act.name_table, &mut name_buf, &mut text_buf)?;
-                state
-                    .scratchpad
-                    .push_str(&format!("{} : {}\r\n", name_buf, text_buf));
+                state.scratchpad.push_str(&format!(
+                    "node {}: {} says \"{}\"\r\n",
+                    n.0.index(),
+                    name_buf,
+                    text_buf
+                ));
                 for e in state
                     .act
                     .tree
@@ -633,10 +728,12 @@ mod cmd {
                         &mut text_buf,
                     )?;
                     state.scratchpad.push_str(&format!(
-                        "--> {:#?} : {} : {}\r\n",
-                        e.target(),
+                        "--> edge {} to node {}: \"{}\"\r\n    requirements: {:?}, effects: {:?}\r\n",
                         e.id().index(),
-                        text_buf
+                        e.target().index(),
+                        text_buf,
+                        choice.requirement,
+                        choice.effect,
                     ));
                 }
             }
@@ -823,6 +920,62 @@ mod cmd {
 
             Ok(())
         }
+
+        /// Validate that the contents of a requirement enum are valid
+        ///
+        /// This is mainly used when taking a requirement from CLI and checking that the key
+        /// is present in the val_table for u32 types, and the name_table for String types
+        pub fn validate_requirement(
+            req: &ReqKind,
+            name_table: &HashMap<String, String>,
+            val_table: &HashMap<String, u32>,
+        ) -> Result<()> {
+            // this match will stop compiling any time a new reqKind is added
+            match req {
+                ReqKind::GT(key, _val) => {
+                    val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
+                }
+                ReqKind::LT(key, _val) => {
+                    val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
+                }
+                ReqKind::EQ(key, _val) => {
+                    val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
+                }
+                ReqKind::CMP(key, _val) => {
+                    name_table.get(key).ok_or(cmd::Error::NameNotExists)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// Validate that the contents of a effect enum are valid
+        ///
+        /// This is mainly used when taking a effect from CLI and checking that the key
+        /// is present in the val_table for u32 types, and the name_table for String types
+        pub fn validate_effect(
+            effect: &EffectKind,
+            name_table: &HashMap<String, String>,
+            val_table: &HashMap<String, u32>,
+        ) -> Result<()> {
+            // this match will stop compiling any time a new EffectKind is added
+            // remember, if val is a u32, check the val_table, if val is a String, check the name
+            // table
+            match effect {
+                EffectKind::Add(key, _val) => {
+                    val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
+                }
+                EffectKind::Sub(key, _val) => {
+                    val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
+                }
+                EffectKind::Set(key, _val) => {
+                    val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
+                }
+                EffectKind::Assign(key, _val) => {
+                    name_table.get(key).ok_or(cmd::Error::NameNotExists)?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -904,7 +1057,7 @@ mod tests {
     #[test]
     /// Test basic use case of the editor, new project, add a few nodes and names, list the output,
     /// save the project, reload, list the output again
-    fn simple_editor() {
+    fn simple() {
         let mut cmd_buf = String::with_capacity(1000);
         let mut state = EditorState::new(DialogueTreeData::default());
         cmd_buf.push_str("new project \"simple_test\" -s");
@@ -917,6 +1070,11 @@ mod tests {
         cmd_buf.clear();
         assert_eq!(state.act.name_table.get("cat").unwrap(), "Behemoth");
 
+        cmd_buf.push_str("new val rus_lit 50");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+        assert_eq!(*state.act.val_table.get("rus_lit").unwrap(), 50);
+
         cmd_buf.push_str("new node cat \"Well, who knows, who knows\"");
         run_cmd(&cmd_buf, &mut state).unwrap();
         cmd_buf.clear();
@@ -925,7 +1083,7 @@ mod tests {
         );
         run_cmd(&cmd_buf, &mut state).unwrap();
         cmd_buf.clear();
-        cmd_buf.push_str("new edge 0 1 \"Dostoevsky's dead\"");
+        cmd_buf.push_str("new edge -r LT(rus_lit,51) -e Sub(rus_lit,1) 0 1 \"Dostoevsky's dead\"");
         run_cmd(&cmd_buf, &mut state).unwrap();
         cmd_buf.clear();
 
@@ -934,9 +1092,10 @@ mod tests {
         cmd_buf.clear();
 
         let expected_list = concat!(
-            "Behemoth : Well, who knows, who knows\r\n",
-            "--> NodeIndex(1) : 0 : Dostoevsky's dead\r\n",
-            "Behemoth : 'I protest!' Behemoth exclaimed hotly. 'Dostoevsky is immortal'\r\n"
+            "node 0: Behemoth says \"Well, who knows, who knows\"\r\n",
+            "--> edge 0 to node 1: \"Dostoevsky's dead\"\r\n",
+            "    requirements: Some(LT(\"rus_lit\", 51)), effects: Some(Sub(\"rus_lit\", 1))\r\n",
+            "node 1: Behemoth says \"'I protest!' Behemoth exclaimed hotly. 'Dostoevsky is immortal'\"\r\n",
         );
         assert_eq!(state.scratchpad, expected_list);
         state.scratchpad.clear();
