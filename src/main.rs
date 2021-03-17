@@ -111,7 +111,7 @@ impl std::str::FromStr for ReqKind {
         // by waiting to unwrap the val parameter until building the Enum
         let mut split = s.rsplit(&['(', ',', ')'][..]);
         // first item should be ''
-        anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)? == "");
+        anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)?.is_empty());
         // second item should be number or string, wait to check validity
         let val = split.next().ok_or(cmd::Error::Generic)?;
         // third item should be key
@@ -122,7 +122,7 @@ impl std::str::FromStr for ReqKind {
             "LT" => Ok(ReqKind::LT(key.to_string(), val.parse::<u32>()?)),
             "EQ" => Ok(ReqKind::EQ(key.to_string(), val.parse::<u32>()?)),
             "CMP" => Ok(ReqKind::CMP(key.to_string(), val.to_string())),
-            _ => Err(cmd::Error::Generic)?,
+            _ => Err(cmd::Error::Generic.into()),
         }
     }
 }
@@ -154,7 +154,7 @@ impl std::str::FromStr for EffectKind {
         // by waiting to unwrap the val parameter until building the Enum
         let mut split = s.rsplit(&['(', ',', ')'][..]);
         // first item should be ''
-        anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)? == "");
+        anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)?.is_empty()); 
         // second item should be number or string, don't check for validity yet
         let val = split.next().ok_or(cmd::Error::Generic)?;
         // third item should be key
@@ -165,7 +165,7 @@ impl std::str::FromStr for EffectKind {
             "Sub" => Ok(EffectKind::Sub(key.to_string(), val.parse::<u32>()?)),
             "Set" => Ok(EffectKind::Set(key.to_string(), val.parse::<u32>()?)),
             "Assign" => Ok(EffectKind::Assign(key.to_string(), val.to_string())),
-            _ => Err(cmd::Error::Generic)?,
+            _ => Err(cmd::Error::Generic.into()),
         }
     }
 }
@@ -429,10 +429,10 @@ mod cmd {
                         .act
                         .name_table
                         .insert(self.key.clone(), self.name.clone());
+                    Ok(())
                 } else {
-                    Err(cmd::Error::NameExists)?;
+                    Err(cmd::Error::NameExists.into())
                 }
-                Ok(())
             }
         }
 
@@ -455,10 +455,10 @@ mod cmd {
                 // values. The user can use edit commands for that
                 if state.act.val_table.get(&self.key).is_none() {
                     state.act.val_table.insert(self.key.clone(), self.value);
+                    Ok(())
                 } else {
-                    Err(cmd::Error::ValExists)?;
+                    Err(cmd::Error::ValExists.into())
                 }
-                Ok(())
             }
         }
     }
@@ -611,10 +611,10 @@ mod cmd {
                         .get_mut(&self.key)
                         .ok_or(cmd::Error::Generic)?;
                     *name = self.value.clone();
+                    Ok(())
                 } else {
-                    Err(cmd::Error::NameNotExists)?;
+                    Err(cmd::Error::NameNotExists.into())
                 }
-                Ok(())
             }
         }
 
@@ -642,10 +642,10 @@ mod cmd {
                         .get_mut(&self.key)
                         .ok_or(cmd::Error::Generic)?;
                     *name = self.value.clone();
+                    Ok(())
                 } else {
-                    Err(cmd::Error::ValNotExists)?;
+                    Err(cmd::Error::ValNotExists.into())
                 }
-                Ok(())
             }
         }
     }
