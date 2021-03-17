@@ -1,5 +1,5 @@
-# dialogue\_tree 
+# arbor 
 
 ## Introduction
-dialogue\_tree is a tree based text editor. Intended for storyboarding, dialogue, and branching narrative development.
+arbor a tree based text editor. Intended for storyboarding, dialogue, and branching narrative development.
 
