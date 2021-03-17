@@ -1047,6 +1047,7 @@ mod tests {
 
     /// helper function to parse cmd_bufs in the same way the editor does
     #[inline(always)]
+    #[allow(dead_code)]
     fn run_cmd(cmd_buf: &str, state: &mut EditorState) -> Result<()> {
         let cmds = shellwords::split(&cmd_buf).unwrap();
         let res = cmd::Parse::from_iter_safe(cmds);
