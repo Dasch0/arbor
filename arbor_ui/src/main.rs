@@ -46,7 +46,7 @@ fn main() {
         .unwrap();
 
     // GPU and surface
-    let (mut gpu, surface) = gfx::Gpu::new(&window);
+    let (gpu, surface) = gfx::Gpu::new(&window);
 
     // Swapchain
     let mut sc_desc = wgpu::SwapChainDescriptor {
@@ -119,7 +119,7 @@ fn main() {
                 }
                 .build();
 
-                arbor_ui.update(&mut platform.context(), &mut frame);
+                arbor_ui.update(&platform.context(), &mut frame);
 
                 // End the UI frame. We could now handle the output and draw the UI with the backend.
                 let (_output, paint_commands) = platform.end_frame();
@@ -140,7 +140,7 @@ fn main() {
                 };
                 egui_rpass.update_texture(&gpu.device, &gpu.queue, &platform.context().texture());
                 egui_rpass.update_user_textures(&gpu.device, &gpu.queue);
-                egui_rpass.update_buffers(&mut gpu.device, &mut gpu.queue, &paint_jobs, &screen_descriptor);
+                egui_rpass.update_buffers(&gpu.device, &gpu.queue, &paint_jobs, &screen_descriptor);
 
                 // Record all render passes.
                 egui_rpass.execute(

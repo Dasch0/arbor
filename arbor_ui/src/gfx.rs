@@ -396,8 +396,8 @@ impl CameraArray {
     /// pointing in the desired look direction. Requires a mutable camera array
     pub fn update_camera(
         &mut self,
-        eyes: &Vec<cgmath::Point3<f32>>,
-        look_dirs: &Vec<cgmath::Vector3<f32>>,
+        eyes: &[cgmath::Point3<f32>],
+        look_dirs: &[cgmath::Vector3<f32>],
     ) {
         let aspect_ratio = self.aspect_ratio;
         let normal = self.normal;

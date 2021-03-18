@@ -3,7 +3,6 @@ use egui::util::History;
 pub struct ArborUi {
     // Example stuff:
     buffer: String,
-    value: f32,
     painting: Painting,
     backend_panel: BackendPanel,
 }
@@ -13,7 +12,6 @@ impl Default for ArborUi{
         Self {
             // Example stuff:
             buffer: String::with_capacity(500),
-            value: 2.7,
             painting: Default::default(),
             backend_panel: Default::default(),
         }
@@ -284,9 +282,6 @@ impl Default for RunMode {
 }
 
 // ----------------------------------------------------------------------------
-
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "persistence", serde(default))]
 struct BackendPanel {
     open: bool,
 
@@ -297,11 +292,6 @@ struct BackendPanel {
     /// current slider value for current gui scale
     pixels_per_point: Option<f32>,
 
-    /// maximum size of the web browser canvas
-    max_size_points_ui: egui::Vec2,
-    max_size_points_active: egui::Vec2,
-
-    #[cfg_attr(feature = "persistence", serde(skip))]
     frame_history: FrameHistory,
 }
 
@@ -311,8 +301,6 @@ impl Default for BackendPanel {
             open: false,
             run_mode: Default::default(),
             pixels_per_point: Default::default(),
-            max_size_points_ui: egui::Vec2::new(1024.0, 2048.0),
-            max_size_points_active: egui::Vec2::new(1024.0, 2048.0),
             frame_history: Default::default(),
         }
     }
