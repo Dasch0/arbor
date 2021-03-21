@@ -1,6 +1,7 @@
 [workspace]
 
 members = [
+    "arbor_core",
     "arbor_cli",
     "arbor_ui",
 ]

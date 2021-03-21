@@ -421,4 +421,3 @@ impl CameraArray {
         queue.write_buffer(&self.buf, 0, bytemuck::cast_slice(&self.mat));
     }
 }
-

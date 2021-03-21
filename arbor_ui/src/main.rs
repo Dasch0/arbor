@@ -1,5 +1,6 @@
 mod gfx;
 mod ui;
+
 use std::iter;
 use std::time::Instant;
 
@@ -74,7 +75,18 @@ fn main() {
         physical_height: sc_desc.height,
         scale_factor: window.scale_factor(),
         font_definitions: FontDefinitions::default(),
-        style: Default::default(),
+        style: egui::Style {
+            body_text_style: egui::TextStyle::Body,
+            wrap: None,
+            spacing: egui::style::Spacing::default(),
+            interaction: egui::style::Interaction {
+                resize_grab_radius_side: 5.0,
+                resize_grab_radius_corner: 10.0,
+                show_tooltips_only_when_still: false,
+            },
+            visuals: egui::Visuals::default(),
+            animation_time: 1.0 / 12.0,
+        },
     });
 
     // We use the egui_wgpu_backend crate as the render backend.
@@ -128,9 +140,11 @@ fn main() {
                 let frame_time = (Instant::now() - egui_start).as_secs_f64() as f32;
                 previous_frame_time = Some(frame_time);
 
-                let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("encoder"),
-                });
+                let mut encoder =
+                    gpu.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("encoder"),
+                        });
 
                 // Upload all resources for the GPU.
                 let screen_descriptor = ScreenDescriptor {
