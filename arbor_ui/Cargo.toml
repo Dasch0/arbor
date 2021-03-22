@@ -10,16 +10,18 @@ edition = "2018"
 rand = "0.8.3"
 chrono = "0.4"
 futures-lite = "1.11"
-egui = "0.10"
+anyhow = "1.0"
+egui = { version = "0.10", features = ["persistence"] }
 epi = "0.10.0"
 egui_wgpu_backend = "0.5"
 egui_winit_platform = { version = "0.5", features = ["clipboard"] }
 wgpu = "0.7"
 winit = "0.24"
 bytemuck = { version = "1.4.1", features = ["derive"]}
+serde = "1.0.124"
 rayon = "1.5"
 cgmath = "0.18.0"
 log = "0.4.11"
 futures = "0.3.6"
-
+bincode = "1.3.2"
 arbor_core = { version = "0.1.0", path = "../arbor_core" }

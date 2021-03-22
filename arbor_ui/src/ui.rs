@@ -3,19 +3,21 @@ use egui::emath::{Pos2, Rect, RectTransform};
 use egui::util::History;
 
 // constants for maximum width to show for text throughout UI
-const MAX_NAME_WIDTH: f32 = 64.0;
+const MAX_NAME_WIDTH: f32 = 128.0;
 const MAX_TEXT_WIDTH: f32 = 160.0;
 
 // constants for maximum length to expect for text string buffers throughout UI
 // so far, longer names are allowed but will require some extra allocations
-const MAX_NAME_LEN: usize = 16;
+const MAX_NAME_LEN: usize = 32;
 const MAX_TEXT_LEN: usize = 256;
 
 pub struct ArborUi {
     painting: TreePainting,
-    new_project_window: NewProjectWindow,
+    new_window: NewProjectWindow,
+    load_window: LoadWindow,
     backend_panel: BackendPanel,
     name_editor: NameEditor,
+    value_editor: ValueEditor,
     node_editor: NodeEditor,
     edge_editor: EdgeEditor,
     state: arbor_core::EditorState,
@@ -25,9 +27,11 @@ impl Default for ArborUi {
     fn default() -> Self {
         Self {
             painting: Default::default(),
-            new_project_window: Default::default(),
+            new_window: Default::default(),
+            load_window: Default::default(),
             backend_panel: Default::default(),
             name_editor: Default::default(),
+            value_editor: Default::default(),
             node_editor: Default::default(),
             edge_editor: Default::default(),
             state: EditorState::new(DialogueTreeData::default()),
@@ -40,43 +44,61 @@ impl epi::App for ArborUi {
         "arbor"
     }
 
-    /// Called each time the UI needs repainting, which may be many times per second.
-    /// Put your widgets into a `SidePanel`, `TopPanel`, `CentralPanel`, `Window` or `Area`.
     fn update(&mut self, ctx: &egui::CtxRef, frame: &mut epi::Frame<'_>) {
+        // UI elements for loading/saving/new projects. Declare these first so that the project
+        // status is known early in the frame
 
         // Implementation notes:
         //  Window structs take a &mut bool to allow them to close themselves if the close button
         //  is clicked. However since that prevents us from borrowing mut elsewhere, right now a
         //  local bool variable is being created and passed to the window on each frame
-        let mut new_project_window_open = self.new_project_window.open; 
-        egui::Window::new("New Project").open(&mut new_project_window_open).show(ctx, |ui| {
-            self.new_project_window.ui_content(&mut self.state, ui);
-        });
-        self.new_project_window.open = new_project_window_open;
+        let mut new_window_open = self.new_window.open;
+        egui::Window::new("New Project")
+            .open(&mut new_window_open)
+            .show(ctx, |ui| {
+                self.new_window.ui_content(&mut self.state, ui);
+            });
+        self.new_window.open = new_window_open;
 
+        let mut load_window_open = self.load_window.open;
+        egui::Window::new("Load Project")
+            .open(&mut load_window_open)
+            .show(ctx, |ui| {
+                self.load_window.ui_content(&mut self.state, ui);
+            });
+        self.load_window.open = load_window_open;
 
         let mut backend_panel_open = self.backend_panel.open;
-        egui::Window::new("BackendPanel").open(&mut backend_panel_open).show(ctx, |ui| {
-            self.backend_panel.update(ctx, frame);
-            self.backend_panel.ui(ui, frame);
-        });
+        egui::Window::new("BackendPanel")
+            .open(&mut backend_panel_open)
+            .show(ctx, |ui| {
+                self.backend_panel.update(ctx, frame);
+                self.backend_panel.ui(ui, frame);
+            });
         self.backend_panel.open = backend_panel_open;
 
-        // Top panel for menu
+        // Draw rest of UI now that project status is sorted out
+        //
         egui::TopPanel::top("Menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 egui::menu::menu(ui, "File", |ui| {
-                    if ui.button("New").clicked() {
-                        self.new_project_window.open = true;
+                    if ui.button("new").clicked() {
+                        self.new_window.open = true;
                     }
-                    if ui.button("Load").clicked() {
-                        let res = cmd::Load::new("test".to_string()).execute(&mut self.state);
-                        println!("{:?}", res);
+                    if ui.button("load").clicked() {
+                        self.load_window.open = true;
                     }
-                    if ui.button("About").clicked() {
+                    if ui.button("save").clicked() {
+                        let res = cmd::Save::new().execute(&mut self.state);
+                        match res {
+                            Ok(_) => {},
+                            Err(e) => println!("{}", e),
+                        }
+                    }
+                    if ui.button("perf").clicked() {
                         self.backend_panel.open = true;
                     }
-                    if ui.button("Quit").clicked() {
+                    if ui.button("quit").clicked() {
                         frame.quit();
                     }
                 });
@@ -100,11 +122,21 @@ impl epi::App for ArborUi {
                 });
             });
 
+
+        egui::Window::new("Value Editor")
+            .default_size(egui::vec2(MAX_NAME_WIDTH, f32::INFINITY))
+            .show(ctx, |ui| {
+                // left panel for editing tools on selected node
+                egui::ScrollArea::auto_sized().show(ui, |ui| {
+                    self.value_editor.ui_content(&mut self.state, ui);
+                });
+            });
+
         egui::Window::new("Node Editor").show(ctx, |ui| {
             // left panel for editing tools on selected node
             egui::ScrollArea::auto_sized().show(ui, |ui| {
                 self.node_editor
-                    .ui_content(&mut self.state, &mut self.painting, ui);
+                    .ui_content(&mut self.state, ui);
             });
         });
 
@@ -116,6 +148,74 @@ impl epi::App for ArborUi {
     }
 }
 
+/// Window for loading a project
+pub struct LoadWindow {
+    name_buf: String,
+    open: bool,
+    was_none: bool,
+}
+
+impl Default for LoadWindow {
+    fn default() -> Self {
+        Self {
+            name_buf: String::with_capacity(MAX_NAME_LEN),
+            open: false,
+            was_none: false,
+        }
+    }
+}
+
+impl LoadWindow {
+    /// Content for Load Project window. Returns flag if a new project has been loaded into the
+    /// editor state by arbor_core
+    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) {
+        ui.label("project name");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.name_buf)
+                .text_style(egui::TextStyle::Monospace)
+                .desired_width(MAX_NAME_WIDTH),
+        );
+        ui.separator();
+        if ui.button("load project").clicked() {
+            let res = arbor_core::cmd::Load::new(self.name_buf.drain(..).collect()).execute(state);
+            match res {
+                Ok(_) => {
+                    // if ok, close the load project window
+                    self.open = false;
+                    // Check if tree has positions, if not, populate them with dummy values and
+                    // give the user a warning
+                    self.was_none = false;
+                    state.act.tree.node_weights_mut().for_each(|n| {
+                        if n.pos.is_none() {
+                            n.pos = Some(arbor_core::Pos::new(0.3, 0.3));
+                            self.was_none = true;
+                        }
+                    });
+                    if self.was_none {
+                        let mut temp_bool = self.was_none;
+                        egui::Window::new("Warning")
+                            .open(&mut temp_bool)
+                            .show(ui.ctx(), |ui| {
+                                ui.label(
+                                    concat!(
+            "The loaded tree did not contain preset positions for visualizing the dialogue tree.\r\n",
+            "This is likely because the dialogue tree was created outside the UI editor.\r\n",
+            "All nodes with no position information have been set to a default position and will\r\n",
+            "need to be manually arranged."
+                                ));
+                            });
+                        self.was_none = temp_bool;
+                    }
+                },
+                Err(e) => {
+                    println!("{}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Window for creating a new project
 pub struct NewProjectWindow {
     name_buf: String,
     open: bool,
@@ -127,27 +227,40 @@ impl Default for NewProjectWindow {
         Self {
             name_buf: String::with_capacity(MAX_NAME_LEN),
             open: false,
-            set_active: true
+            set_active: true,
         }
     }
 }
 
 impl NewProjectWindow {
+    /// Content for New Project Window. Returns if flag if a new project has been loaded into the
+    /// editor state by arbor_core
     pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) {
-        ui.label("New project name");
+        ui.label("new project name");
         ui.add(
             egui::TextEdit::singleline(&mut self.name_buf)
                 .text_style(egui::TextStyle::Monospace)
                 .desired_width(MAX_NAME_WIDTH),
         );
         ui.separator();
-        ui.checkbox(&mut self.set_active, "Set new project as active after creating");
-        if ui.button("Create New Project").clicked() {
-            let res = arbor_core::cmd::new::Project::new(self.name_buf.drain(..).collect(), self.set_active).execute(state);
-            // close window if new project was successful, but leave it open if there was a problem
+        ui.checkbox(
+            &mut self.set_active,
+            "Set new project as active after creating",
+        );
+        ui.separator();
+        if ui.button("create new project").clicked() {
+            let res = arbor_core::cmd::new::Project::new(
+                self.name_buf.drain(..).collect(),
+                self.set_active,
+            )
+            .execute(state);
             match res {
-                Ok(_) => return,
-                Err(e) => println!("{}", e),
+                // if result, new project was created and we can close the window 
+                Ok(_) => self.open = false,
+                // if error, a new project isn't present yet, don't close yet
+                Err(e) => {
+                    println!("{}", e);
+                }
             }
         }
     }
@@ -170,14 +283,14 @@ impl Default for NameEditor {
 impl NameEditor {
     pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) -> egui::Response {
         ui.vertical(|ui| {
-            ui.label("Key");
+            ui.label("key");
             ui.add(
                 egui::TextEdit::singleline(&mut self.key_buf)
                     .text_style(egui::TextStyle::Monospace)
                     .desired_width(MAX_NAME_WIDTH),
             );
             ui.separator();
-            ui.label("Name");
+            ui.label("name");
             ui.add(
                 egui::TextEdit::singleline(&mut self.text_buf)
                     .text_style(egui::TextStyle::Monospace)
@@ -185,14 +298,14 @@ impl NameEditor {
             );
             ui.separator();
 
-            if ui.button("New Name").clicked() {
+            if ui.button("new name").clicked() {
                 let res = cmd::new::Name::new(
                     self.key_buf.drain(..).collect(),
                     self.text_buf.drain(..).collect(),
                 )
                 .execute(state);
                 match res {
-                    Ok(_) => return,
+                    Ok(_) => {}
                     Err(e) => println!("{}", e),
                 }
             }
@@ -201,6 +314,49 @@ impl NameEditor {
     }
 }
 
+pub struct ValueEditor {
+    key_buf: String,
+    value: u32,
+}
+
+impl Default for ValueEditor {
+    fn default() -> Self {
+        Self {
+            key_buf: String::with_capacity(MAX_NAME_LEN),
+            value: 0,
+        }
+    }
+}
+
+impl ValueEditor {
+    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) -> egui::Response {
+        ui.vertical(|ui| {
+            ui.label("key");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.key_buf)
+                    .text_style(egui::TextStyle::Monospace)
+                    .desired_width(MAX_NAME_WIDTH),
+            );
+            ui.separator();
+            ui.label("initial value");
+            ui.add(egui::DragValue::u32(&mut self.value));
+            ui.separator();
+
+            if ui.button("new name").clicked() {
+                let res = cmd::new::Val::new(
+                    self.key_buf.drain(..).collect(),
+                    self.value,
+                )
+                .execute(state);
+                match res {
+                    Ok(_) => self.value = 0,
+                    Err(e) => println!("{}", e),
+                }
+            }
+        })
+        .response
+    }
+}
 pub struct NodeEditor {
     name_buf: String,
     text_buf: String,
@@ -219,11 +375,10 @@ impl NodeEditor {
     pub fn ui_content(
         &mut self,
         state: &mut EditorState,
-        painting: &mut TreePainting,
         ui: &mut egui::Ui,
     ) -> egui::Response {
         ui.vertical(|ui| {
-            ui.label("Name");
+            ui.label("name");
             egui::combo_box_with_label(
                 ui,
                 state // display the selected key's name value
@@ -240,7 +395,7 @@ impl NodeEditor {
                 },
             );
             ui.separator();
-            ui.label("Text");
+            ui.label("text");
             ui.add(
                 egui::TextEdit::multiline(&mut self.text_buf)
                     .text_style(egui::TextStyle::Monospace)
@@ -249,14 +404,17 @@ impl NodeEditor {
             );
             ui.separator();
 
-            if ui.button("New Node").clicked() {
+            if ui.button("new node").clicked() {
                 let res = cmd::new::Node::new(
                     self.name_buf.drain(..).collect(),
                     self.text_buf.drain(..).collect(),
                 )
                 .execute(state);
                 match res {
-                    Ok(_) => painting.node_pos_list.push(egui::Pos2::new(0.3, 0.3)),
+                    Ok(node_index) => {
+                        state.act.tree[NodeIndex::new(node_index)].pos =
+                            Some(arbor_core::Pos::new(0.3, 0.3))
+                    }
                     Err(e) => println!("{}", e),
                 }
             }
@@ -284,10 +442,10 @@ impl Default for EdgeEditor {
 impl EdgeEditor {
     pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) -> egui::Response {
         ui.vertical(|ui| {
-            ui.label("Source Node");
+            ui.label("source node");
             ui.add(egui::DragValue::u32(&mut self.source_node));
 
-            ui.label("Target Node");
+            ui.label("target Node");
             ui.add(egui::DragValue::u32(&mut self.target_node));
 
             ui.separator();
@@ -299,7 +457,7 @@ impl EdgeEditor {
             );
             ui.separator();
 
-            if ui.button("New Edge").clicked() {
+            if ui.button("new edge").clicked() {
                 let res = cmd::new::Edge::new(
                     self.source_node,
                     self.target_node,
@@ -319,7 +477,6 @@ impl EdgeEditor {
 }
 
 pub struct TreePainting {
-    pub node_pos_list: Vec<egui::Pos2>,
     pub stroke: egui::Stroke,
     pub fill: egui::Color32,
     pub hover_name_buf: String,
@@ -330,7 +487,6 @@ pub struct TreePainting {
 impl Default for TreePainting {
     fn default() -> Self {
         Self {
-            node_pos_list: Default::default(),
             stroke: egui::Stroke::new(1.0, egui::Color32::LIGHT_BLUE),
             fill: egui::Color32::LIGHT_GRAY,
             hover_name_buf: String::with_capacity(MAX_NAME_LEN),
@@ -345,7 +501,7 @@ impl TreePainting {
         ui.horizontal(|ui| {
             egui::stroke_ui(ui, &mut self.stroke, "Edge");
             ui.separator();
-            ui.label("Node");
+            ui.label("node");
             ui.color_edit_button_srgba(&mut self.fill);
         })
         .response
@@ -353,7 +509,7 @@ impl TreePainting {
 
     pub fn ui_content(
         &mut self,
-        data: &arbor_core::DialogueTreeData,
+        data: &mut arbor_core::DialogueTreeData,
         ui: &mut egui::Ui,
     ) -> egui::Response {
         // get an area to paint to
@@ -368,19 +524,7 @@ impl TreePainting {
         );
         let from_screen = to_screen.inverse();
 
-        // Implementation notes:
-        // in petgraphs standard graph implementation, the nodes are stored in a backing array, and
-        // per the docs, the node index is the raw position in the array. This means that the node
-        // index may change from frame to frame if nodes are removed, but at the same time it means
-        // that it is safe to iterate over the raw nodes array and directly map a node index to an
-        // index on the positions list (that we maintain ourselves).
-        //
-        // When implementing removals or saving (which shuffles node id's) in the UI, the points
-        // list will need to be updated accordingly
-        // NOTE: for those future implementations, maybe use the hash of the node before and after the
-        // removal to update the position list with
-
-        // draw edges
+        // draw edges first, since they need to be behind nodes
         painter.extend(
             data.tree
                 .edge_references()
@@ -390,14 +534,19 @@ impl TreePainting {
                     let _res =
                         cmd::util::parse_edge(slice, &data.name_table, &mut self.hover_text_buf);
 
-                    let source_node_index = edge_ref.source().index();
-                    let target_node_index = edge_ref.target().index();
+                    let source_node_index = edge_ref.source();
+                    let target_node_index = edge_ref.target();
+
+                    let source_pos = data.tree[source_node_index].pos.unwrap();
+                    let target_pos = data.tree[target_node_index].pos.unwrap();
+
+                    let source_coord = to_screen * egui::pos2(source_pos.x, source_pos.y);
+                    let target_coord = to_screen * egui::pos2(target_pos.x, target_pos.y);
+
                     // compute midpoint of line to place edge popup
-                    let source_pos = to_screen * self.node_pos_list[source_node_index];
-                    let target_pos = to_screen * self.node_pos_list[target_node_index];
                     let midpoint = egui::pos2(
-                        (source_pos.x + target_pos.x) / 2.0,
-                        (source_pos.y + target_pos.y) / 2.0,
+                        (source_coord.x + target_coord.x) / 2.0,
+                        (source_coord.y + target_coord.y) / 2.0,
                     );
 
                     // bias currently shifts the action text a bit up & left so it overlaps with
@@ -414,50 +563,41 @@ impl TreePainting {
                             });
                         },
                     );
-                    egui::Shape::line(vec![source_pos, target_pos], self.stroke)
+                    egui::Shape::line(vec![source_coord, target_coord], self.stroke)
                 })
                 .collect(),
         );
 
-        // draw nodes
-        painter.extend(
-            (0..self.node_pos_list.len())
-                .map(|i| {
-                    let p = self.node_pos_list[i];
-                    let coord = to_screen * p;
-                    let rect =
-                        Rect::from_center_size(coord, egui::vec2(self.node_size, self.node_size));
-                    let node_index = arbor_core::NodeIndex::new(i);
-                    let resp = ui.interact(rect, egui::Id::new(i), egui::Sense::click_and_drag());
-                    if let Some(node_weight) = data.tree.node_weight(node_index) {
-                        let node_slice = &data.text[node_weight[0]..node_weight[1]];
-                        let _res = cmd::util::parse_node(
-                            node_slice,
-                            &data.name_table,
-                            &mut self.hover_name_buf,
-                            &mut self.hover_text_buf,
-                        );
-                        Self::node_text_popup(&resp.ctx, i, coord, |ui| {
-                            ui.vertical(|ui| {
-                                ui.label(self.hover_name_buf.as_str());
-                                ui.label("------");
-                                ui.label(self.hover_text_buf.as_str());
-                            });
-                        });
+        // loop over the nodes, draw them, and update their location if being dragged
+        for n in data.tree.node_weights_mut() {
+            let pos = n.pos.unwrap();
 
-                        // move node
-                        if let Some(pointer_pos) = resp.interact_pointer_pos() {
-                            self.node_pos_list[i] = from_screen * pointer_pos;
-                        }
+            let p = egui::pos2(pos.x, pos.y);
+            let coord = to_screen * p;
+            let rect = Rect::from_center_size(coord, egui::vec2(self.node_size, self.node_size));
+            let resp = ui.interact(rect, egui::Id::new(n.hash), egui::Sense::click_and_drag());
+            let node_slice = &data.text[n[0]..n[1]];
+            let _res = cmd::util::parse_node(
+                node_slice,
+                &data.name_table,
+                &mut self.hover_name_buf,
+                &mut self.hover_text_buf,
+            );
+            Self::node_text_popup(&resp.ctx, n.hash, coord, |ui| {
+                ui.vertical(|ui| {
+                    ui.label(self.hover_name_buf.as_str());
+                    ui.label("------");
+                    ui.label(self.hover_text_buf.as_str());
+                });
+            });
 
-                        egui::Shape::circle_filled(coord, self.node_size, self.fill)
-                    } else {
-                        egui::Shape::Noop
-                    }
-                })
-                .collect(),
-        );
-
+            // move node
+            if let Some(pointer_pos) = resp.interact_pointer_pos() {
+                let new_pos = from_screen * pointer_pos;
+                n.pos = Some(arbor_core::Pos::new(new_pos.x, new_pos.y));
+            }
+            painter.add(egui::Shape::circle_filled(coord, self.node_size, self.fill));
+        }
         response
     }
 
@@ -481,11 +621,11 @@ impl TreePainting {
 
     fn node_text_popup(
         ctx: &egui::CtxRef,
-        node_index: usize,
+        node_hash: u64,
         window_pos: Pos2,
         add_contents: impl FnOnce(&mut egui::Ui),
     ) -> egui::Response {
-        egui::Area::new(egui::Id::new(node_index).with("__node_tooltip"))
+        egui::Area::new(egui::Id::new(node_hash).with("__node_tooltip"))
             .order(egui::Order::Middle) // middle allows other windows to get on top of the popups
             .fixed_pos(window_pos)
             .interactable(false)

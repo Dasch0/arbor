@@ -27,9 +27,19 @@ static TOKEN: &str = "::";
 /// stored in an array. The first element should always be smaller than the second
 
 #[derive(new, Serialize, Deserialize, Clone, Copy)]
+pub struct Pos {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(new, Serialize, Deserialize, Clone, Copy)]
 pub struct Section {
+    /// A start and end index to some section of text
     pub text: [usize; 2],
+    /// A hash of the text this section points to 
     pub hash: u64,
+    /// An optional 2d position for the section, used for graph visualizations
+    pub pos: Option<Pos>
 }
 
 impl std::ops::Index<usize> for Section {
@@ -57,6 +67,7 @@ pub type Tree = petgraph::graph::Graph<Section, Choice>;
 /// variables such as player names, conditionals, etc.
 #[derive(new, Serialize, Deserialize, Clone)]
 pub struct DialogueTreeData {
+    pub uid: usize,
     pub tree: Tree,
     pub text: String,
     pub name_table: HashMap<String, String>,
@@ -67,6 +78,7 @@ pub struct DialogueTreeData {
 impl DialogueTreeData {
     pub fn default() -> Self {
         DialogueTreeData {
+            uid: cmd::util::gen_uid(),
             tree: graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
             text: String::with_capacity(8192),
             name_table: HashMap::new(),
@@ -237,7 +249,7 @@ pub mod cmd {
     /// Trait to allow structopt generated
     #[enum_dispatch]
     pub trait Executable {
-        fn execute(&self, data: &mut EditorState) -> Result<()>;
+        fn execute(&self, data: &mut EditorState) -> Result<usize>;
     }
 
     /// A tree based dialogue editor
@@ -290,8 +302,9 @@ pub mod cmd {
 
         impl Executable for Project {
             /// New Project
-            fn execute(&self, state: &mut EditorState) -> Result<()> {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 let new_project = DialogueTreeData::new(
+                    util::gen_uid(),
                     graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
                     String::with_capacity(8192),
                     HashMap::new(),
@@ -305,7 +318,7 @@ pub mod cmd {
                 if self.set_active {
                     *state = EditorState::new(new_project);
                 }
-                Ok(())
+                Ok(state.act.uid)
             }
         }
 
@@ -323,7 +336,7 @@ pub mod cmd {
 
         impl Executable for Node {
             /// New Node
-            fn execute(&self, state: &mut EditorState) -> Result<()> {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // verify the speaker name is valid
                 state
                     .act
@@ -338,8 +351,8 @@ pub mod cmd {
                 let end = state.act.text.len();
                 // Create hash for verifying the text section in the future
                 let hash = hash(&state.act.text[start..end].as_bytes());
-                state.act.tree.add_node(Section::new([start, end], hash));
-                Ok(())
+                let index = state.act.tree.add_node(Section::new([start, end], hash, None));
+                Ok(index.index())
             }
         }
 
@@ -366,7 +379,7 @@ pub mod cmd {
 
         impl Executable for Edge {
             /// New Edge
-            fn execute(&self, state: &mut EditorState) -> Result<()> {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 let start = state.act.text.len();
                 state.act.text.push_str(&self.text);
                 let end = state.act.text.len();
@@ -389,16 +402,16 @@ pub mod cmd {
                     )?;
                 }
 
-                state.act.tree.add_edge(
+                let edge_index = state.act.tree.add_edge(
                     NodeIndex::from(self.start_index),
                     NodeIndex::from(self.end_index),
                     Choice::new(
-                        Section::new([start, end], hash),
+                        Section::new([start, end], hash, None),
                         self.requirement.clone(),
                         self.effect.clone(),
                     ),
                 );
-                Ok(())
+                Ok(edge_index.index())
             }
         }
 
@@ -416,7 +429,7 @@ pub mod cmd {
         }
         impl Executable for Name {
             /// New Name
-            fn execute(&self, state: &mut EditorState) -> Result<()> {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // Check that the key doesn't already exist, since we want new to not overwrite
                 // values. The user can use edit commands for that
                 if state.act.name_table.get(&self.key).is_none() {
@@ -424,7 +437,7 @@ pub mod cmd {
                         .act
                         .name_table
                         .insert(self.key.clone(), self.name.clone());
-                    Ok(())
+                    Ok(0)
                 } else {
                     Err(cmd::Error::NameExists.into())
                 }
@@ -445,12 +458,12 @@ pub mod cmd {
         }
         impl Executable for Val {
             /// New Name
-            fn execute(&self, state: &mut EditorState) -> Result<()> {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // Check that the key doesn't already exist, since we want new to not overwrite
                 // values. The user can use edit commands for that
                 if state.act.val_table.get(&self.key).is_none() {
                     state.act.val_table.insert(self.key.clone(), self.value);
-                    Ok(())
+                    Ok(self.value as usize)
                 } else {
                     Err(cmd::Error::ValExists.into())
                 }
@@ -487,7 +500,7 @@ pub mod cmd {
         }
         impl Executable for Node {
             /// Edit Node
-            fn execute(&self, state: &mut EditorState) -> Result<()> {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 let node_index = NodeIndex::new(self.node_id);
                 let start = state.act.text.len();
                 state
@@ -503,8 +516,8 @@ pub mod cmd {
                     .ok_or(cmd::Error::InvalidNodeIndex)?;
                 // Since editing, recalculate hash
                 let hash = hash(state.act.text[start..end].as_bytes());
-                *node = Section::new([start, end], hash);
-                Ok(())
+                *node = Section::new([start, end], hash, None);
+                Ok(node_index.index())
             }
         }
 
@@ -534,7 +547,7 @@ pub mod cmd {
 
         impl Executable for Edge {
             /// Edit Edge
-            fn execute(&self, state: &mut EditorState) -> Result<()> {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 let edge_index = EdgeIndex::<u32>::new(self.edge_id);
                 let start = state.act.text.len();
                 state.act.text.push_str(&self.text);
@@ -558,7 +571,7 @@ pub mod cmd {
                 }
                 
                 let new_weight = Choice::new(
-                    Section::new([start, end], hash),
+                    Section::new([start, end], hash, None),
                     self.requirement.clone(),
                     self.effect.clone(),
                 );
@@ -578,7 +591,7 @@ pub mod cmd {
                         .add_edge(source_node_index, target_node_index, new_weight);
                 }
 
-                Ok(())
+                Ok(edge_index.index())
             }
         }
 
@@ -596,7 +609,7 @@ pub mod cmd {
         }
 
         impl Executable for Name {
-            fn execute(&self, state: &mut EditorState) -> Result<()> {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // Check that the key already exists, and make sure not to accidently add a new key
                 // to the table. The user can use new commands for that
                 if state.act.name_table.get(&self.key).is_some() {
@@ -606,7 +619,7 @@ pub mod cmd {
                         .get_mut(&self.key)
                         .ok_or(cmd::Error::Generic)?;
                     *name = self.value.clone();
-                    Ok(())
+                    Ok(0)
                 } else {
                     Err(cmd::Error::NameNotExists.into())
                 }
@@ -623,21 +636,21 @@ pub mod cmd {
             /// The keyword to reference the name with in the text
             key: String,
             /// Value to store to the name
-            value: String,
+            value: u32,
         }
 
         impl Executable for Val {
-            fn execute(&self, state: &mut EditorState) -> Result<()> {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // Check that the key already exists, and make sure not to accidently add a new key
                 // to the table. The user can use new commands for that
                 if state.act.name_table.get(&self.key).is_some() {
                     let name = state
                         .act
-                        .name_table
+                        .val_table
                         .get_mut(&self.key)
                         .ok_or(cmd::Error::Generic)?;
                     *name = self.value.clone();
-                    Ok(())
+                    Ok(self.value as usize)
                 } else {
                     Err(cmd::Error::ValNotExists.into())
                 }
@@ -651,7 +664,7 @@ pub mod cmd {
     pub struct Save {}
 
     impl Executable for Save {
-        fn execute(&self, state: &mut EditorState) -> Result<()> {
+        fn execute(&self, state: &mut EditorState) -> Result<usize> {
             // save states to backup buffer
             state.backup = state.act.clone();
 
@@ -665,7 +678,7 @@ pub mod cmd {
 
             let json = serde_json::to_string(&state.act).unwrap();
             std::fs::write(state.act.name.clone() + TREE_EXT, json)?;
-            Ok(())
+            Ok(state.act.uid)
         }
     }
 
@@ -677,12 +690,12 @@ pub mod cmd {
     }
 
     impl Executable for Load {
-        fn execute(&self, state: &mut EditorState) -> Result<()> {
+        fn execute(&self, state: &mut EditorState) -> Result<usize> {
             let new_state = EditorState::new(serde_json::from_reader(std::io::BufReader::new(
                 std::fs::File::open(self.name.clone() + TREE_EXT)?,
             ))?);
             *state = new_state;
-            Ok(())
+            Ok(state.act.uid)
         }
     }
 
@@ -697,7 +710,7 @@ pub mod cmd {
     pub struct List {}
 
     impl Executable for List {
-        fn execute(&self, state: &mut EditorState) -> Result<()> {
+        fn execute(&self, state: &mut EditorState) -> Result<usize> {
             let mut name_buf = String::with_capacity(64);
             let mut text_buf = String::with_capacity(256);
             let node_iter = state.act.tree.node_references();
@@ -733,12 +746,24 @@ pub mod cmd {
                 }
             }
             println!("{}", state.scratchpad);
-            Ok(())
+            Ok(state.act.uid)
         }
     }
 
     pub mod util {
         use super::*;
+
+        /// Generate UID.
+        ///
+        /// UID is a 128 bit unique identifier for the project. This is stored in the dialogue
+        /// tree, and is useful for associating other metadata or resources with the correct tree
+        /// in the case that multiple files exist with the same name (likely if multiple users are
+        /// sharing files)
+        ///
+        /// This UID is not secure, and does not need to be as it is just for ID purposes
+        pub fn gen_uid() -> usize {
+            rand::random::<usize>()
+        }
 
         /// Helper method to parse a dialogue node's section of the text and fill in any name
         /// variables.
@@ -868,8 +893,6 @@ pub mod cmd {
             // be updated to point to the proper sections of the next text buffer
             *new_tree = tree.clone();
 
-            println!("cloned");
-
             let root_index = graph::node_index(0);
             let mut dfs = Dfs::new(&tree, root_index);
             while let Some(node_index) = dfs.next(&tree) {
@@ -885,7 +908,7 @@ pub mod cmd {
                 // verify new and old hash match
                 let new_hash = hash(new_text[start..end].as_bytes());
                 assert!(node.hash == new_hash);
-                *new_node = Section::new([start, end], new_hash);
+                *new_node = Section::new([start, end], new_hash, node.pos);
 
                 // Rebuild all edges sourced from this node
                 let edge_iter = tree.edges_directed(node_index, petgraph::Direction::Outgoing);
@@ -909,7 +932,7 @@ pub mod cmd {
                     // verify new and old hash match
                     let new_hash = hash(new_text[start..end].as_bytes());
                     assert!(edge.section.hash == new_hash);
-                    new_edge.section = Section::new([start, end], new_hash);
+                    new_edge.section = Section::new([start, end], new_hash, edge.section.pos);
                 }
             }
 
@@ -981,7 +1004,7 @@ mod tests {
     /// helper function to parse cmd_bufs in the same way the editor does
     #[inline(always)]
     #[allow(dead_code)]
-    fn run_cmd(cmd_buf: &str, state: &mut EditorState) -> Result<()> {
+    fn run_cmd(cmd_buf: &str, state: &mut EditorState) -> Result<usize> {
         let cmds = shellwords::split(&cmd_buf).unwrap();
         let res = cmd::Parse::from_iter_safe(cmds);
         let v = res.unwrap();
@@ -1079,7 +1102,7 @@ mod tests {
         // bench part
         let mut name_buf = String::with_capacity(1);
         let mut buf = String::with_capacity(1);
-        let _res = cmd::util::parse_node(text, &name_table, &mut name_buf, &mut buf);
+        cmd::util::parse_node(text, &name_table, &mut name_buf, &mut buf).unwrap();
     }
 
     #[test]
@@ -1101,6 +1124,6 @@ mod tests {
         let mut buf = String::with_capacity(text.len() + 50);
 
         // bench part
-        let _res = cmd::util::parse_node(text, &name_table, &mut name_buf, &mut buf);
+        cmd::util::parse_node(text, &name_table, &mut name_buf, &mut buf).unwrap();
     }
 }
