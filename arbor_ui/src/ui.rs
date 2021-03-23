@@ -91,7 +91,7 @@ impl epi::App for ArborUi {
                     if ui.button("save").clicked() {
                         let res = cmd::Save::new().execute(&mut self.state);
                         match res {
-                            Ok(_) => {},
+                            Ok(_) => {}
                             Err(e) => println!("{}", e),
                         }
                     }
@@ -122,7 +122,6 @@ impl epi::App for ArborUi {
                 });
             });
 
-
         egui::Window::new("Value Editor")
             .default_size(egui::vec2(MAX_NAME_WIDTH, f32::INFINITY))
             .show(ctx, |ui| {
@@ -135,8 +134,7 @@ impl epi::App for ArborUi {
         egui::Window::new("Node Editor").show(ctx, |ui| {
             // left panel for editing tools on selected node
             egui::ScrollArea::auto_sized().show(ui, |ui| {
-                self.node_editor
-                    .ui_content(&mut self.state, ui);
+                self.node_editor.ui_content(&mut self.state, ui);
             });
         });
 
@@ -206,7 +204,7 @@ impl LoadWindow {
                             });
                         self.was_none = temp_bool;
                     }
-                },
+                }
                 Err(e) => {
                     println!("{}", e);
                 }
@@ -255,7 +253,7 @@ impl NewProjectWindow {
             )
             .execute(state);
             match res {
-                // if result, new project was created and we can close the window 
+                // if result, new project was created and we can close the window
                 Ok(_) => self.open = false,
                 // if error, a new project isn't present yet, don't close yet
                 Err(e) => {
@@ -343,11 +341,8 @@ impl ValueEditor {
             ui.separator();
 
             if ui.button("new name").clicked() {
-                let res = cmd::new::Val::new(
-                    self.key_buf.drain(..).collect(),
-                    self.value,
-                )
-                .execute(state);
+                let res =
+                    cmd::new::Val::new(self.key_buf.drain(..).collect(), self.value).execute(state);
                 match res {
                     Ok(_) => self.value = 0,
                     Err(e) => println!("{}", e),
@@ -372,11 +367,7 @@ impl Default for NodeEditor {
 }
 
 impl NodeEditor {
-    pub fn ui_content(
-        &mut self,
-        state: &mut EditorState,
-        ui: &mut egui::Ui,
-    ) -> egui::Response {
+    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) -> egui::Response {
         ui.vertical(|ui| {
             ui.label("name");
             egui::combo_box_with_label(
@@ -477,32 +468,63 @@ impl EdgeEditor {
 }
 
 pub struct TreePainting {
-    pub stroke: egui::Stroke,
+    pub stroke: egui::Color32,
     pub fill: egui::Color32,
     pub hover_name_buf: String,
     pub hover_text_buf: String,
     pub node_size: f32,
+    pub zoom: f32,
+    /// the pan amount, equivalent to translation matrix
+    pub pan: egui::Pos2,
+    /// the start coordinates of a new pan action, driven by the pointer position
+    pub pan_start: egui::Pos2,
+    /// the origin, moved around by pans but only updated after pan completed
+    pub origin: egui::Pos2,
 }
 
 impl Default for TreePainting {
     fn default() -> Self {
         Self {
-            stroke: egui::Stroke::new(1.0, egui::Color32::LIGHT_BLUE),
+            stroke: egui::Color32::LIGHT_BLUE,
             fill: egui::Color32::LIGHT_GRAY,
             hover_name_buf: String::with_capacity(MAX_NAME_LEN),
             hover_text_buf: String::with_capacity(MAX_TEXT_LEN),
             node_size: 20.0,
+            zoom: 1.0,
+            pan: egui::pos2(0.0, 0.0),
+            pan_start: egui::pos2(0.0, 0.0),
+            origin: egui::pos2(0.0, 0.0),
         }
     }
 }
 
 impl TreePainting {
+    #[inline]
+    fn transform(&self, p: egui::Pos2) -> egui::Pos2 {
+        egui::pos2(p.x * self.zoom + self.pan.x, p.y * self.zoom + self.pan.y)
+    }
+
+    #[inline]
+    fn reform(&self, p: egui::Pos2) -> egui::Pos2 {
+        egui::pos2(p.x / self.zoom - self.pan.x, p.y / self.zoom - self.pan.y)
+    }
+
     pub fn ui_control(&mut self, ui: &mut egui::Ui) -> egui::Response {
         ui.horizontal(|ui| {
-            egui::stroke_ui(ui, &mut self.stroke, "Edge");
-            ui.separator();
-            ui.label("node");
+            ui.label("stroke");
             ui.color_edit_button_srgba(&mut self.fill);
+            ui.separator();
+            ui.label("fill");
+            ui.color_edit_button_srgba(&mut self.fill);
+            ui.label("x position");
+            ui.add(egui::Slider::f32(&mut self.zoom, 0.0001..=2.0));
+            ui.separator();
+            ui.label("x position");
+            ui.add(egui::DragValue::f32(&mut self.pan.x));
+            ui.separator();
+            ui.label("y position");
+            ui.add(egui::DragValue::f32(&mut self.pan.y));
+            ui.separator();
         })
         .response
     }
@@ -540,8 +562,10 @@ impl TreePainting {
                     let source_pos = data.tree[source_node_index].pos.unwrap();
                     let target_pos = data.tree[target_node_index].pos.unwrap();
 
-                    let source_coord = to_screen * egui::pos2(source_pos.x, source_pos.y);
-                    let target_coord = to_screen * egui::pos2(target_pos.x, target_pos.y);
+                    let source_coord =
+                        to_screen * self.transform(egui::pos2(source_pos.x, source_pos.y));
+                    let target_coord =
+                        to_screen * self.transform(egui::pos2(target_pos.x, target_pos.y));
 
                     // compute midpoint of line to place edge popup
                     let midpoint = egui::pos2(
@@ -553,17 +577,19 @@ impl TreePainting {
                     // the line.
                     // NOTE: This is has been tuned manually
                     let bias = egui::vec2(20.0, 10.0);
-                    Self::edge_text_popup(
-                        &response.ctx,
-                        edge_ref.id().index(),
-                        midpoint - bias,
-                        |ui| {
-                            ui.vertical(|ui| {
-                                ui.label(self.hover_text_buf.as_str());
-                            });
-                        },
-                    );
-                    egui::Shape::line(vec![source_coord, target_coord], self.stroke)
+                    if response.rect.contains(midpoint - bias) && self.zoom > 0.3 {
+                        Self::edge_text_popup(
+                            &response.ctx,
+                            edge_ref.id().index(),
+                            midpoint - bias,
+                            |ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(self.hover_text_buf.as_str());
+                                });
+                            },
+                        );
+                    }
+                    egui::Shape::line(vec![source_coord, target_coord], (self.zoom, self.stroke))
                 })
                 .collect(),
         );
@@ -573,7 +599,7 @@ impl TreePainting {
             let pos = n.pos.unwrap();
 
             let p = egui::pos2(pos.x, pos.y);
-            let coord = to_screen * p;
+            let coord = to_screen * self.transform(p);
             let rect = Rect::from_center_size(coord, egui::vec2(self.node_size, self.node_size));
             let resp = ui.interact(rect, egui::Id::new(n.hash), egui::Sense::click_and_drag());
             let node_slice = &data.text[n[0]..n[1]];
@@ -583,21 +609,43 @@ impl TreePainting {
                 &mut self.hover_name_buf,
                 &mut self.hover_text_buf,
             );
-            Self::node_text_popup(&resp.ctx, n.hash, coord, |ui| {
-                ui.vertical(|ui| {
-                    ui.label(self.hover_name_buf.as_str());
-                    ui.label("------");
-                    ui.label(self.hover_text_buf.as_str());
+
+            if response.rect.contains(coord) && self.zoom > 0.3 {
+                Self::node_text_popup(&resp.ctx, n.hash, coord, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(self.hover_name_buf.as_str());
+                        ui.label("------");
+                        ui.label(self.hover_text_buf.as_str());
+                    });
                 });
-            });
+            }
 
             // move node
             if let Some(pointer_pos) = resp.interact_pointer_pos() {
-                let new_pos = from_screen * pointer_pos;
+                let new_pos = self.reform(from_screen * pointer_pos);
                 n.pos = Some(arbor_core::Pos::new(new_pos.x, new_pos.y));
             }
-            painter.add(egui::Shape::circle_filled(coord, self.node_size, self.fill));
+            painter.add(egui::Shape::circle_filled(
+                coord,
+                self.node_size * self.zoom,
+                self.fill,
+            ));
         }
+
+        // handle dragging to pan screen after drawing nodes so that clicking/dragging nodes
+        // has priority
+        let pan_response = response.interact(egui::Sense::drag());
+        if let Some(pointer_pos) = pan_response.interact_pointer_pos() {
+            if pan_response.drag_started() {
+                self.pan_start = from_screen * pointer_pos;
+                self.origin = self.pan;
+            }
+            let pan_vec = (from_screen * pointer_pos) - self.pan_start;
+
+            println!("{:?} , {:?}", self.pan_start, from_screen * pointer_pos);
+            self.pan = self.origin + pan_vec;
+        }
+
         response
     }
 
