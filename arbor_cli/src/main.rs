@@ -1,5 +1,5 @@
-use arbor_core::*;
 use arbor_core::cmd::Executable;
+use arbor_core::*;
 
 fn main() {
     let mut cmd_buf = String::with_capacity(1000);
@@ -24,13 +24,6 @@ fn main() {
                 Err(f) => {
                     // pretty print top level error message
                     println!("\u{1b}[1;31merror:\u{1b}[0m {}", f);
-
-                    // print the interesting bits of the stacktrace
-                    // TODO: much to be improved here if backtrace.frames() can be
-                    // pulled in
-                    let s = format!("{}", f.backtrace());
-                    let mut split = s.split("backtrace");
-                    println!("{} . . .", split.next().unwrap());
                 }
             },
             // errors from CLI interface
@@ -42,4 +35,3 @@ fn main() {
         cmd_buf.clear();
     }
 }
-

@@ -1,17 +1,17 @@
 pub use anyhow::Result;
-pub use hashbrown::HashMap;
-pub use structopt::StructOpt;
 pub use cmd::Executable;
-pub use petgraph::prelude::*;
-pub use petgraph::*;
-use structopt::clap::AppSettings;
 use derive_new::*;
 use enum_dispatch::*;
+pub use hashbrown::HashMap;
+pub use petgraph::prelude::*;
 use petgraph::visit::IntoNodeReferences;
+pub use petgraph::*;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::io::Write;
+use structopt::clap::AppSettings;
+pub use structopt::StructOpt;
 use thiserror::Error;
 
 // TODO: Features List
@@ -36,10 +36,10 @@ pub struct Pos {
 pub struct Section {
     /// A start and end index to some section of text
     pub text: [usize; 2],
-    /// A hash of the text this section points to 
+    /// A hash of the text this section points to
     pub hash: u64,
     /// An optional 2d position for the section, used for graph visualizations
-    pub pos: Option<Pos>
+    pub pos: Option<Pos>,
 }
 
 impl std::ops::Index<usize> for Section {
@@ -196,7 +196,7 @@ impl std::str::FromStr for EffectKind {
         // by waiting to unwrap the val parameter until building the Enum
         let mut split = s.rsplit(&['(', ',', ')'][..]);
         // first item should be ''
-        anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)?.is_empty()); 
+        anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)?.is_empty());
         // second item should be number or string, don't check for validity yet
         let val = split.next().ok_or(cmd::Error::Generic)?;
         // third item should be key
@@ -351,7 +351,10 @@ pub mod cmd {
                 let end = state.act.text.len();
                 // Create hash for verifying the text section in the future
                 let hash = hash(&state.act.text[start..end].as_bytes());
-                let index = state.act.tree.add_node(Section::new([start, end], hash, None));
+                let index = state
+                    .act
+                    .tree
+                    .add_node(Section::new([start, end], hash, None));
                 Ok(index.index())
             }
         }
@@ -569,7 +572,7 @@ pub mod cmd {
                         &state.act.val_table,
                     )?;
                 }
-                
+
                 let new_weight = Choice::new(
                     Section::new([start, end], hash, None),
                     self.requirement.clone(),
@@ -649,7 +652,7 @@ pub mod cmd {
                         .val_table
                         .get_mut(&self.key)
                         .ok_or(cmd::Error::Generic)?;
-                    *name = self.value.clone();
+                    *name = self.value;
                     Ok(self.value as usize)
                 } else {
                     Err(cmd::Error::ValNotExists.into())
