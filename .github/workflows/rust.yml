@@ -5,7 +5,7 @@ name: Continuous integration
 jobs:
   check:
     name: Check
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -19,7 +19,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -29,11 +29,12 @@ jobs:
           override: true
       - uses: actions-rs/cargo@v1
         with:
-          command: test
+          # exclude arbor_ui as remote does not provide linux, and currently no automated tests are done on the gui itself
+          command: test --workspace --exclude arbor_ui
   
   clippy:
     name: Clippy
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
