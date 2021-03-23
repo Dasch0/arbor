@@ -30,7 +30,8 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           # exclude arbor_ui as remote does not provide linux, and currently no automated tests are done on the gui itself
-          command: test --workspace --exclude arbor_ui
+          command: test
+          args: --workspace --exclude arbor_ui
   
   clippy:
     name: Clippy
