@@ -48,7 +48,6 @@ impl Gpu {
         // TODO: support for setups without unsized_binding_array
         let required_features = wgpu::Features::default()
             | wgpu::Features::PUSH_CONSTANTS
-            | wgpu::Features::UNSIZED_BINDING_ARRAY
             | wgpu::Features::SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
             | wgpu::Features::SAMPLED_TEXTURE_BINDING_ARRAY;
 

@@ -1,37 +1,36 @@
 pub use anyhow::Result;
 pub use cmd::Executable;
-use derive_new::*;
-use enum_dispatch::*;
+pub use structopt::StructOpt;
 pub use hashbrown::HashMap;
 pub use petgraph::prelude::*;
-use petgraph::visit::IntoNodeReferences;
 pub use petgraph::*;
+use derive_new::*;
+use enum_dispatch::*;
+use petgraph::visit::IntoNodeReferences;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::io::Write;
 use structopt::clap::AppSettings;
-pub use structopt::StructOpt;
 use thiserror::Error;
 
 // TODO: Features List
-// 1. More tests and benchmarks!
-// 2. Switch to bincode serialization format
-// 3. Add more help messages and detail for error types, and clean up error reporting to the
-//    console, maybe with thiserror/anyhow .contexts?
+// 1. More tests and benchmarks, focus on rebuild_tree
+// 2. Add more help messages and detail for error types
+// 3. Add logging
 
 static TREE_EXT: &str = ".tree";
 static TOKEN: &str = "::";
 
-/// typedef representing a section of text in a rope. This section contains a start and end index,
-/// stored in an array. The first element should always be smaller than the second
-
+/// placeholder struct for storing the 2d position of a node. uUsed for graph visualization 
 #[derive(new, Serialize, Deserialize, Clone, Copy)]
 pub struct Pos {
     pub x: f32,
     pub y: f32,
 }
 
+/// typedef representing a section of text in a rope. This section contains a start and end index,
+/// stored in an array. The first element should always be smaller than the second
 #[derive(new, Serialize, Deserialize, Clone, Copy)]
 pub struct Section {
     /// A start and end index to some section of text
@@ -313,8 +312,8 @@ pub mod cmd {
                     self.name.clone(),
                 );
 
-                let json = serde_json::to_string(&new_project).unwrap();
-                std::fs::write(self.name.clone() + TREE_EXT, json)?;
+                let encoded = bincode::serialize(&new_project)?; 
+                std::fs::write(self.name.clone() + TREE_EXT, encoded)?;
 
                 if self.set_active {
                     *state = EditorState::new(new_project);
@@ -680,8 +679,8 @@ pub mod cmd {
                 &mut state.act.tree,
             )?;
 
-            let json = serde_json::to_string(&state.act).unwrap();
-            std::fs::write(state.act.name.clone() + TREE_EXT, json)?;
+            let encoded = bincode::serialize(&state.act)?;
+            std::fs::write(state.act.name.clone() + TREE_EXT, encoded)?;
             Ok(state.act.uid)
         }
     }
@@ -695,7 +694,7 @@ pub mod cmd {
 
     impl Executable for Load {
         fn execute(&self, state: &mut EditorState) -> Result<usize> {
-            let new_state = EditorState::new(serde_json::from_reader(std::io::BufReader::new(
+            let new_state = EditorState::new(bincode::deserialize_from(std::io::BufReader::new(
                 std::fs::File::open(self.name.clone() + TREE_EXT)?,
             ))?);
             *state = new_state;

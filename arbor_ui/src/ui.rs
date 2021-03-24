@@ -2,7 +2,6 @@ use arbor_core::*;
 use egui::emath::{Pos2, Rect, RectTransform};
 use egui::util::History;
 use serde::{Deserialize, Serialize};
-
 // constants for maximum width to show for text throughout UI
 const MAX_NAME_WIDTH: f32 = 128.0;
 const MAX_TEXT_WIDTH: f32 = 160.0;
@@ -517,7 +516,7 @@ impl TreePainting {
 
     #[inline]
     fn reform(&self, p: egui::Pos2) -> egui::Pos2 {
-        egui::pos2(p.x / self.zoom - self.pan.x, p.y / self.zoom - self.pan.y)
+        egui::pos2((p.x - self.pan.x) / self.zoom, (p.y - self.pan.y) / self.zoom)
     }
 
     pub fn ui_control(&mut self, ui: &mut egui::Ui) -> egui::Response {
