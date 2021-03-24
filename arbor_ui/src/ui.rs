@@ -1,6 +1,7 @@
 use arbor_core::*;
 use egui::emath::{Pos2, Rect, RectTransform};
 use egui::util::History;
+use serde::{Deserialize, Serialize};
 
 // constants for maximum width to show for text throughout UI
 const MAX_NAME_WIDTH: f32 = 128.0;
@@ -11,6 +12,7 @@ const MAX_TEXT_WIDTH: f32 = 160.0;
 const MAX_NAME_LEN: usize = 32;
 const MAX_TEXT_LEN: usize = 256;
 
+#[derive(Serialize, Deserialize)]
 pub struct ArborUi {
     painting: TreePainting,
     new_window: NewProjectWindow,
@@ -58,7 +60,6 @@ impl epi::App for ArborUi {
             .show(ctx, |ui| {
                 self.new_window.ui_content(&mut self.state, ui);
             });
-        self.new_window.open = new_window_open;
 
         let mut load_window_open = self.load_window.open;
         egui::Window::new("Load Project")
@@ -66,7 +67,6 @@ impl epi::App for ArborUi {
             .show(ctx, |ui| {
                 self.load_window.ui_content(&mut self.state, ui);
             });
-        self.load_window.open = load_window_open;
 
         let mut backend_panel_open = self.backend_panel.open;
         egui::Window::new("BackendPanel")
@@ -75,7 +75,6 @@ impl epi::App for ArborUi {
                 self.backend_panel.update(ctx, frame);
                 self.backend_panel.ui(ui, frame);
             });
-        self.backend_panel.open = backend_panel_open;
 
         // Draw rest of UI now that project status is sorted out
         //
@@ -143,10 +142,14 @@ impl epi::App for ArborUi {
                 self.edge_editor.ui_content(&mut self.state, ui);
             });
         });
+
+        let bincode = bincode::serialize(self).unwrap();
+        println!("{:#?}", bincode.len());
     }
 }
 
 /// Window for loading a project
+#[derive(Serialize, Deserialize)]
 pub struct LoadWindow {
     name_buf: String,
     open: bool,
@@ -214,6 +217,7 @@ impl LoadWindow {
 }
 
 /// Window for creating a new project
+#[derive(Serialize, Deserialize)]
 pub struct NewProjectWindow {
     name_buf: String,
     open: bool,
@@ -264,6 +268,8 @@ impl NewProjectWindow {
     }
 }
 
+/// Struct for editing names
+#[derive(Serialize, Deserialize)]
 pub struct NameEditor {
     key_buf: String,
     text_buf: String,
@@ -312,6 +318,7 @@ impl NameEditor {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct ValueEditor {
     key_buf: String,
     value: u32,
@@ -352,6 +359,8 @@ impl ValueEditor {
         .response
     }
 }
+
+#[derive(Serialize, Deserialize)]
 pub struct NodeEditor {
     name_buf: String,
     text_buf: String,
@@ -414,6 +423,7 @@ impl NodeEditor {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct EdgeEditor {
     source_node: u32,
     target_node: u32,
@@ -467,6 +477,7 @@ impl EdgeEditor {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct TreePainting {
     pub stroke: egui::Color32,
     pub fill: egui::Color32,
@@ -512,7 +523,7 @@ impl TreePainting {
     pub fn ui_control(&mut self, ui: &mut egui::Ui) -> egui::Response {
         ui.horizontal(|ui| {
             ui.label("stroke");
-            ui.color_edit_button_srgba(&mut self.fill);
+            ui.color_edit_button_srgba(&mut self.stroke);
             ui.separator();
             ui.label("fill");
             ui.color_edit_button_srgba(&mut self.fill);
@@ -547,52 +558,55 @@ impl TreePainting {
         let from_screen = to_screen.inverse();
 
         // draw edges first, since they need to be behind nodes
-        painter.extend(
-            data.tree
-                .edge_references()
-                .map(|edge_ref| {
-                    let choice = data.tree.edge_weight(edge_ref.id()).unwrap();
-                    let slice = &data.text[choice.section[0]..choice.section[1]];
-                    let _res =
-                        cmd::util::parse_edge(slice, &data.name_table, &mut self.hover_text_buf);
+        for edge_ref in data.tree.edge_references() {
+            let choice = data.tree.edge_weight(edge_ref.id()).unwrap();
+            let slice = &data.text[choice.section[0]..choice.section[1]];
+            let _res = cmd::util::parse_edge(slice, &data.name_table, &mut self.hover_text_buf);
 
-                    let source_node_index = edge_ref.source();
-                    let target_node_index = edge_ref.target();
+            let source_node_index = edge_ref.source();
+            let target_node_index = edge_ref.target();
 
-                    let source_pos = data.tree[source_node_index].pos.unwrap();
-                    let target_pos = data.tree[target_node_index].pos.unwrap();
+            let source_pos = data.tree[source_node_index].pos.unwrap();
+            let target_pos = data.tree[target_node_index].pos.unwrap();
 
-                    let source_coord =
-                        to_screen * self.transform(egui::pos2(source_pos.x, source_pos.y));
-                    let target_coord =
-                        to_screen * self.transform(egui::pos2(target_pos.x, target_pos.y));
+            let source_coord = to_screen * self.transform(egui::pos2(source_pos.x, source_pos.y));
+            let target_coord = to_screen * self.transform(egui::pos2(target_pos.x, target_pos.y));
 
-                    // compute midpoint of line to place edge popup
-                    let midpoint = egui::pos2(
-                        (source_coord.x + target_coord.x) / 2.0,
-                        (source_coord.y + target_coord.y) / 2.0,
-                    );
+            // compute midpoint of line to place edge popup
+            let midpoint = egui::pos2(
+                (source_coord.x + target_coord.x) / 2.0,
+                (source_coord.y + target_coord.y) / 2.0,
+            );
 
-                    // bias currently shifts the action text a bit up & left so it overlaps with
-                    // the line.
-                    // NOTE: This is has been tuned manually
-                    let bias = egui::vec2(20.0, 10.0);
-                    if response.rect.contains(midpoint - bias) && self.zoom > 0.3 {
-                        Self::edge_text_popup(
-                            &response.ctx,
-                            edge_ref.id().index(),
-                            midpoint - bias,
-                            |ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(self.hover_text_buf.as_str());
-                                });
-                            },
-                        );
-                    }
-                    egui::Shape::line(vec![source_coord, target_coord], (self.zoom, self.stroke))
-                })
-                .collect(),
-        );
+            // bias currently shifts the action text a bit up & left so it overlaps with
+            // the line.
+            // NOTE: This is has been tuned manually
+            let bias = egui::vec2(20.0, 10.0);
+
+            // paint popup with edge text if conditions are met
+            if response.rect.contains(midpoint - bias) && self.zoom > 0.3 {
+                Self::edge_text_popup(
+                    &response.ctx,
+                    edge_ref.id().index(),
+                    midpoint - bias,
+                    |ui| {
+                        ui.vertical(|ui| {
+                            ui.label(self.hover_text_buf.as_str());
+                        });
+                    },
+                );
+            }
+
+            // Finally, paint arrow along edge, stop at edge of target node to show arrow tip
+            Self::arrow(
+                &painter,
+                source_coord,
+                target_coord,
+                self.node_size,
+                self.zoom,
+                (self.zoom, self.stroke).into(),
+            );
+        }
 
         // loop over the nodes, draw them, and update their location if being dragged
         for n in data.tree.node_weights_mut() {
@@ -641,8 +655,6 @@ impl TreePainting {
                 self.origin = self.pan;
             }
             let pan_vec = (from_screen * pointer_pos) - self.pan_start;
-
-            println!("{:?} , {:?}", self.pan_start, from_screen * pointer_pos);
             self.pan = self.origin + pan_vec;
         }
 
@@ -683,6 +695,23 @@ impl TreePainting {
                     add_contents(ui);
                 })
             })
+    }
+
+    fn arrow(
+        painter: &egui::Painter,
+        source: Pos2,
+        target: egui::Pos2,
+        standoff: f32,
+        zoom: f32,
+        stroke: egui::Stroke,
+    ) {
+        let rot = egui::emath::Rot2::from_angle(std::f32::consts::TAU / 10.0);
+        let tip_length = 8.0 * zoom;
+        let dir = (target.to_vec2() - source.to_vec2()).normalized();
+        let tip = target - dir * (standoff * zoom);
+        painter.line_segment([source, tip], stroke);
+        painter.line_segment([tip, tip - tip_length * (rot * dir)], stroke);
+        painter.line_segment([tip, tip - tip_length * (rot.inverse() * dir)], stroke);
     }
 }
 
@@ -840,16 +869,19 @@ impl Default for RunMode {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct BackendPanel {
     pub open: bool,
 
-    #[cfg_attr(feature = "persistence", serde(skip))]
+    #[serde(skip)]
     // go back to `Reactive` mode each time we start
     run_mode: RunMode,
 
+    #[serde(skip)]
     /// current slider value for current gui scale
     pixels_per_point: Option<f32>,
 
+    #[serde(skip)]
     frame_history: FrameHistory,
 }
 

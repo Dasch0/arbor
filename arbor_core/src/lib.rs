@@ -90,6 +90,7 @@ impl DialogueTreeData {
 
 /// State information for an editor instance. Includes two copies of the dialogue tree (one active
 /// and one backup) as well as other state information
+#[derive(Serialize, Deserialize)]
 pub struct EditorState {
     pub act: DialogueTreeData,
     pub backup: DialogueTreeData,
