@@ -1,17 +1,18 @@
 pub use anyhow::Result;
 pub use cmd::Executable;
-pub use structopt::StructOpt;
-pub use hashbrown::HashMap;
-pub use petgraph::prelude::*;
-pub use petgraph::*;
 use derive_new::*;
 use enum_dispatch::*;
+pub use hashbrown::HashMap;
+pub use petgraph::prelude::*;
 use petgraph::visit::IntoNodeReferences;
+pub use petgraph::*;
+use rayon::prelude::*;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::io::Write;
 use structopt::clap::AppSettings;
+pub use structopt::StructOpt;
 use thiserror::Error;
 
 // TODO: Features List
@@ -20,9 +21,10 @@ use thiserror::Error;
 // 3. Add logging
 
 static TREE_EXT: &str = ".tree";
+static BACKUP_EXT: &str = ".bkp";
 static TOKEN: &str = "::";
 
-/// placeholder struct for storing the 2d position of a node. uUsed for graph visualization 
+/// placeholder struct for storing the 2d position of a node. uUsed for graph visualization
 #[derive(new, Serialize, Deserialize, Clone, Copy)]
 pub struct Pos {
     pub x: f32,
@@ -244,6 +246,10 @@ pub mod cmd {
         InvalidNodeIndex,
         #[error("Attempted to access an edge that is not present in the tree")]
         InvalidEdgeIndex,
+        #[error("Attempted to access an invalid section of the text")]
+        InvalidSection,
+        #[error("Hash does not match text section")]
+        InvalidHash,
     }
 
     /// Trait to allow structopt generated
@@ -264,6 +270,8 @@ pub mod cmd {
         Edit(edit::Parse),
         Save(Save),
         Load(Load),
+        Rebuild(Rebuild),
+        Swap(Swap),
         List(List),
     }
 
@@ -312,7 +320,7 @@ pub mod cmd {
                     self.name.clone(),
                 );
 
-                let encoded = bincode::serialize(&new_project)?; 
+                let encoded = bincode::serialize(&new_project)?;
                 std::fs::write(self.name.clone() + TREE_EXT, encoded)?;
 
                 if self.set_active {
@@ -668,8 +676,41 @@ pub mod cmd {
 
     impl Executable for Save {
         fn execute(&self, state: &mut EditorState) -> Result<usize> {
+            let encoded = bincode::serialize(&state.act)?;
+            std::fs::write(state.act.name.clone() + TREE_EXT, encoded)?;
+
+            // if save successful, sync backup with active copy
+            state.backup = state.act.clone();
+
+            Ok(state.act.uid)
+        }
+    }
+
+    /// Rebuild the tree and text buffer for efficient access and memory use. Rebuilding the tree
+    /// erases the undo/redo history.
+    ///
+    /// Rebuilding the tree is used to remove unused sections of text from the buffer. It performs
+    /// a DFS search through the tree, and creates a new tree and text buffer where the text sections
+    /// of a node and its outgoing edges are next to each other. This rebuilding process has a risk
+    /// of corrupting the tree, so a backup copy is is saved before hand. The backup is stored both
+    /// in memory and copied to disk as project_name.tree.bkp. To use the backup copy, either call
+    /// the swap subcommand to load from memory, or remove the .bkp tag from the end of the file
+    /// and then load it.
+    ///
+    /// Since the rebuild tree cleans out any artifacts from edits/removals, the undo/redo
+    ///
+    #[derive(new, StructOpt, Debug)]
+    #[structopt(setting = AppSettings::NoBinaryName)]
+    pub struct Rebuild {}
+
+    impl Executable for Rebuild {
+        fn execute(&self, state: &mut EditorState) -> Result<usize> {
             // save states to backup buffer
             state.backup = state.act.clone();
+
+            // save backup to filesystem
+            let encoded = bincode::serialize(&state.act)?;
+            std::fs::write(state.act.name.clone() + TREE_EXT + BACKUP_EXT, encoded)?;
 
             // attempt rebuild tree on active buffer, backup buffer is used as source
             util::rebuild_tree(
@@ -679,8 +720,9 @@ pub mod cmd {
                 &mut state.act.tree,
             )?;
 
-            let encoded = bincode::serialize(&state.act)?;
-            std::fs::write(state.act.name.clone() + TREE_EXT, encoded)?;
+            // Confirm that that rebuilt tree is valid
+            util::validate_tree(&state.act)?;
+
             Ok(state.act.uid)
         }
     }
@@ -697,7 +739,24 @@ pub mod cmd {
             let new_state = EditorState::new(bincode::deserialize_from(std::io::BufReader::new(
                 std::fs::File::open(self.name.clone() + TREE_EXT)?,
             ))?);
+            // check that the loaded tree is valid before loading into main state
+            util::validate_tree(&state.act)?;
             *state = new_state;
+            Ok(state.act.uid)
+        }
+    }
+
+    /// Swap the backup and active trees.
+    ///
+    /// The backup tree stores the state from the last new, load, save, or just before a rebuild
+    /// is attempted. This is mainly useful as a recovery option if the active tree gets corrupted.
+    #[derive(new, StructOpt, Debug)]
+    #[structopt(setting = AppSettings::NoBinaryName)]
+    pub struct Swap {}
+
+    impl Executable for Swap {
+        fn execute(&self, state: &mut EditorState) -> Result<usize> {
+            std::mem::swap(&mut state.act, &mut state.backup);
             Ok(state.act.uid)
         }
     }
@@ -753,6 +812,8 @@ pub mod cmd {
         }
     }
 
+    /// Utility methods used internally for various useful tasks. These cannot be called directly
+    /// from the command line, but are useful for working with dialogue_trees in other programs
     pub mod util {
         use super::*;
 
@@ -815,6 +876,24 @@ pub mod cmd {
             Ok(())
         }
 
+        /// Same routine as parse node, except the results are not actually written to a
+        /// thread. This is used for validating that the section of text is valid
+        pub fn validate_node(text: &str, name_table: &HashMap<String, String>) -> Result<()> {
+            let mut text_iter = text.split(TOKEN).enumerate();
+            let speaker_key = text_iter.next().ok_or(cmd::Error::Generic)?.1;
+            name_table.get(speaker_key).ok_or(cmd::Error::Generic)?;
+            text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
+                if (i & 0x1) == 0 {
+                    // odd token
+                    name_table.get(n).ok_or(cmd::Error::Generic)?;
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            })?;
+            Ok(())
+        }
+
         /// Helper method to parse a player action (edge's) section of the text and fill in any
         /// name variables.
         ///
@@ -848,6 +927,24 @@ pub mod cmd {
                     println!("{}", n);
                     let value = name_table.get(n).ok_or(cmd::Error::Generic)?;
                     text_buf.push_str(value);
+                    Ok(())
+                }
+            })?;
+
+            Ok(())
+        }
+
+        /// Same routine as parse_edge, but does not write to an output string buffer. Useful for
+        /// validating a section of text in an edge
+        pub fn validate_edge(text: &str, name_table: &HashMap<String, String>) -> Result<()> {
+            let mut text_iter = text.split(TOKEN).enumerate();
+            text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
+                if (i & 0x1) == 0 {
+                    // odd token
+                    Ok(())
+                } else {
+                    // even token
+                    name_table.get(n).ok_or(cmd::Error::Generic)?;
                     Ok(())
                 }
             })?;
@@ -997,6 +1094,59 @@ pub mod cmd {
             }
             Ok(())
         }
+
+        /// Validate that a given dialogue tree data structure contains all valid sections of text
+        /// that all edges point to valid nodes in the tree, all have valid action enums, and have
+        /// have correct hashes for all nodes and edges
+        ///
+        /// Returns a result with the error type if the tree was invalid, returns Ok(()) if valid
+        pub fn validate_tree(data: &DialogueTreeData) -> Result<()> {
+            // check nodes first
+            let nodes_iter = data.tree.raw_nodes().par_iter();
+            nodes_iter.try_for_each(|node: &petgraph::graph::Node<Section>| -> Result<()> {
+                // try to grab the text section as a slice, and return an error if the get() failed
+                let slice = data.text[..]
+                    .get(node.weight[0]..node.weight[1])
+                    .ok_or(cmd::Error::InvalidSection)?;
+                // if the slice was successful, check its hash
+                anyhow::ensure!(
+                    seahash::hash(slice.as_bytes()) == node.weight.hash,
+                    cmd::Error::InvalidHash
+                );
+                // Check that the section of text parses successfully (all names present in the
+                // name_table)
+                validate_node(slice, &data.name_table)?;
+                Ok(())
+            })?;
+
+            // check edges, will check that they point to nodes that exist, and validate the actionenums
+            let edges_iter = data.tree.raw_edges().par_iter();
+            edges_iter.try_for_each(|edge: &petgraph::graph::Edge<Choice>| -> Result<()> {
+                // try to grab the text section as a slice, and return an error if the get() failed
+                let slice = data.text[..]
+                    .get(edge.weight.section[0]..edge.weight.section[1])
+                    .ok_or(cmd::Error::InvalidSection)?;
+                // if the slice was successful, check its hash
+                anyhow::ensure!(
+                    seahash::hash(slice.as_bytes()) == edge.weight.section.hash,
+                    cmd::Error::InvalidHash
+                );
+                // Check that the section of text parses successfully (all names present in the
+                // name_table)
+                validate_edge(slice, &data.name_table)?;
+
+                match edge.weight.requirement {
+                    Some(ref req) => validate_requirement(req, &data.name_table, &data.val_table)?,
+                    None => {}
+                };
+                match edge.weight.effect {
+                    Some(ref effect) => validate_effect(effect, &data.name_table, &data.val_table)?,
+                    None => {}
+                };
+                Ok(())
+            })?;
+            Ok(())
+        }
     }
 }
 
@@ -1065,6 +1215,10 @@ mod tests {
         cmd_buf.clear();
 
         cmd_buf.push_str("load simple_test");
+        run_cmd(&cmd_buf, &mut state).unwrap();
+        cmd_buf.clear();
+
+        cmd_buf.push_str("rebuild");
         run_cmd(&cmd_buf, &mut state).unwrap();
         cmd_buf.clear();
 
