@@ -15,7 +15,7 @@ use structopt::clap::AppSettings;
 pub use structopt::StructOpt;
 use thiserror::Error;
 
-// TODO: Features List
+// TODO: Features 
 // 1. More tests and benchmarks, focus on rebuild_tree
 // 2. Add more help messages and detail for error types
 // 3. Add logging
@@ -121,13 +121,15 @@ impl EditorState {
 #[derive(new, Serialize, Deserialize, Clone)]
 pub struct Choice {
     pub section: Section,
-    pub requirement: Option<ReqKind>,
-    pub effect: Option<EffectKind>,
+    pub requirement: ReqKind,
+    pub effect: EffectKind,
 }
 
 /// Represents a requirement to access a choice.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ReqKind {
+    /// No requirement
+    No,
     /// Must be greater than num
     GT(String, u32),
     /// Must be less than num
@@ -174,6 +176,8 @@ impl std::str::FromStr for ReqKind {
 /// Represents an effect that occurs when a choice is made.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum EffectKind {
+    /// No effect
+    No,
     Add(String, u32),
     Sub(String, u32),
     Set(String, u32),
@@ -234,14 +238,22 @@ pub mod cmd {
     pub enum Error {
         #[error("An unspecified error occured...")]
         Generic,
+        #[error("Node parsing failed")]
+        NodeParse,
+        #[error("Edge parsing failed")]
+        EdgeParse,
         #[error("The name already exists")]
         NameExists,
         #[error("The name does not exist")]
         NameNotExists,
+        #[error("The name is in use")]
+        NameInUse,
         #[error("The value already exists")]
         ValExists,
         #[error("The value does not exist")]
         ValNotExists,
+        #[error("The value is in use")]
+        ValInUse,
         #[error("Attempted to access a node that is not present in the tree")]
         InvalidNodeIndex,
         #[error("Attempted to access an edge that is not present in the tree")]
@@ -268,6 +280,7 @@ pub mod cmd {
     pub enum Parse {
         New(new::Parse),
         Edit(edit::Parse),
+        Remove(remove::Parse),
         Save(Save),
         Load(Load),
         Rebuild(Rebuild),
@@ -355,7 +368,7 @@ pub mod cmd {
                 state
                     .act
                     .text
-                    .push_str(&format!("{}::{}", self.speaker, self.dialogue));
+                    .push_str(&format!("{}{}{}{}", TOKEN, self.speaker, TOKEN, self.dialogue));
                 let end = state.act.text.len();
                 // Create hash for verifying the text section in the future
                 let hash = hash(&state.act.text[start..end].as_bytes());
@@ -418,8 +431,8 @@ pub mod cmd {
                     NodeIndex::from(self.end_index),
                     Choice::new(
                         Section::new([start, end], hash, None),
-                        self.requirement.clone(),
-                        self.effect.clone(),
+                        self.requirement.clone().unwrap_or(ReqKind::No),
+                        self.effect.clone().unwrap_or(EffectKind::No),
                     ),
                 );
                 Ok(edge_index.index())
@@ -517,7 +530,7 @@ pub mod cmd {
                 state
                     .act
                     .text
-                    .push_str(&format!("{}::{}", self.speaker, self.dialogue));
+                    .push_str(&format!("{}{}{}{}", TOKEN, self.speaker, TOKEN, self.dialogue));
                 let end = state.act.text.len();
 
                 let node = state
@@ -583,8 +596,8 @@ pub mod cmd {
 
                 let new_weight = Choice::new(
                     Section::new([start, end], hash, None),
-                    self.requirement.clone(),
-                    self.effect.clone(),
+                    self.requirement.clone().unwrap_or(ReqKind::No),
+                    self.effect.clone().unwrap_or(EffectKind::No),
                 );
 
                 // Handle deletion/recreation of edge if nodes need to change
@@ -665,6 +678,153 @@ pub mod cmd {
                 } else {
                     Err(cmd::Error::ValNotExists.into())
                 }
+            }
+        }
+    }
+
+    mod remove {
+        use super::*;
+
+        /// Remove existing things
+        #[enum_dispatch(Executable)]
+        #[derive(StructOpt)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub enum Parse {
+            Node(remove::Node),
+            Edge(remove::Edge),
+            Name(remove::Name),
+            Val(remove::Val),
+        }
+
+        /// Remove the contents of a node in the dialogue tree and return the hash of the removed
+        /// node's text section
+        #[derive(new, StructOpt, Debug)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Node {
+            /// Id of the node to remove
+            node_id: usize,
+        }
+        impl Executable for Node {
+            /// Remove Node
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                let node_index = NodeIndex::new(self.node_id);
+                let removed_weight = state.act.tree.remove_node(node_index).ok_or(cmd::Error::InvalidNodeIndex)?;
+                Ok(removed_weight.hash as usize)
+            }
+        }
+
+        /// Remove an edge from the dialogue tree and return the hash of the removed edge's text
+        /// section
+        #[derive(new, StructOpt)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Edge {
+            /// Id of the edge to remove 
+            edge_id: usize,
+        }
+
+        impl Executable for Edge {
+            /// Remove Edge
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                let edge_index = EdgeIndex::<u32>::new(self.edge_id);
+                let removed_weight = state.act.tree.remove_edge(edge_index).ok_or(cmd::Error::InvalidEdgeIndex)?;
+
+                Ok(removed_weight.section.hash as usize)
+            }
+        }
+
+        /// Remove a name, only allowed if the name is not used anywhere
+        #[derive(new, StructOpt, Debug)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Name {
+            /// The keyword to reference the name with in the text
+            key: String,
+        }
+
+        impl Executable for Name {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                // Check if the key is referenced anywhere in the text
+                if let Some(_found) = state.act.text.find(format!("{}{}{}", TOKEN, self.key, TOKEN).as_str()) {
+                    return Err(cmd::Error::NameInUse.into());
+                }
+
+                // Check if the key is referenced in any requirements or effects
+                for edge in state.act.tree.raw_edges() {
+                    // this match will stop compiling any time a new reqKind is added
+                    match &edge.weight.requirement {
+                        ReqKind::No => Ok(()),
+                        ReqKind::GT(_, _) => Ok(()),
+                        ReqKind::LT(_, _) => Ok(()),
+                        ReqKind::EQ(_, _) => Ok(()),
+                        ReqKind::Cmp(key, _) => {
+                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
+                            else { Ok(()) }
+                        }
+                    }?;
+                    match &edge.weight.effect {
+                        EffectKind::No => Ok(()),
+                        EffectKind::Add(_, _) => Ok(()),
+                        EffectKind::Sub(_, _) => Ok(()),
+                        EffectKind::Set(_, _) => Ok(()),
+                        EffectKind::Assign(key, _) => {
+                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
+                            else { Ok(()) }
+                        }
+                    }?;
+                }
+                state.act.name_table.remove(self.key.as_str()).ok_or(cmd::Error::NameNotExists)?;
+                Ok(0)
+            }
+        }
+
+        /// Remove a value, only allowed if the value is not used anywhere
+        #[derive(new, StructOpt, Debug)]
+        #[structopt(setting = AppSettings::NoBinaryName)]
+        pub struct Val {
+            /// The keyword to reference the name with in the text
+            key: String,
+        }
+
+        impl Executable for Val {
+            fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                // Check if the key is referenced in any requirements or effects
+                // Check if the key is referenced in any requirements or effects
+                for edge in state.act.tree.raw_edges() {
+                    // this match will stop compiling any time a new reqKind is added
+                    match &edge.weight.requirement {
+                        ReqKind::No => Ok(()),
+                        ReqKind::GT(key, _) => {
+                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
+                            else { Ok(()) }
+                        },
+                        ReqKind::LT(key, _) => {
+                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
+                            else { Ok(()) }
+                        },
+                        ReqKind::EQ(key, _) => {
+                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
+                            else { Ok(()) }
+                        },
+                        ReqKind::Cmp(_, _) => Ok(()),
+                    }?;
+                    match &edge.weight.effect {
+                        EffectKind::No => Ok(()),
+                        EffectKind::Add(key, _) => {
+                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
+                            else { Ok(()) }
+                        },
+                        EffectKind::Sub(key, _) => {
+                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
+                            else { Ok(()) }
+                        },
+                        EffectKind::Set(key, _) => {
+                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
+                            else { Ok(()) }
+                        },
+                        EffectKind::Assign(_, _) => Ok(()),
+                    }?;
+                }
+                state.act.name_table.remove(self.key.as_str()).ok_or(cmd::Error::NameNotExists)?;
+                Ok(0)
             }
         }
     }
@@ -833,10 +993,10 @@ pub mod cmd {
         /// variables.
         ///
         /// The input text rope section should have the following format
-        ///     name::text ::name:: more text
+        ///     ::name::text ::name:: more text
         ///
         /// The first name is the speaker. This name must be a valid key to the name_table
-        /// Inside the text, additional names may be inserted inside a :: symbol. The
+        /// Inside the text, additional names may be inserted inside a pair of :: symbols. The
         /// entire area inside the :: symbols must be a valid key to the name_table.
         ///
         /// Both the name and text buf are cleared at the beginning of this method.
@@ -847,27 +1007,31 @@ pub mod cmd {
             text_buf: &mut String,
         ) -> Result<()> {
             // Implementation notes:
-            //  1. The first iterator element is always the speaker name and should be the only
+            //  0. The first iterator element should always be '', if not something is wrong
+            //  1. The second iterator element is always the speaker name and should be the only
             //     thing written to the name buffer
-            //  2. Since only a simple flow of name::text::name:::text ... etc is allowed, only
-            //  odd tokens ever need to be looked up in the hashtable
+            //  2. Since only a simple flow of ::speaker_name::text::name:::text ... etc is 
+            //     allowed, only every 'other' token (indices 1,3,5...) need to be looked up in the
+            //     hashtable
             //  3. The above is only true because split() will return an empty strings on sides of
             //     the separator with no text. For instance name::::name:: would split to ['name,
             //     '', name, '']
             name_buf.clear();
             text_buf.clear();
             let mut text_iter = text.split(TOKEN).enumerate();
+            let _ = text_iter.next(); // skip first token, it is '' for any correct string
             let speaker_key = text_iter.next().ok_or(cmd::Error::Generic)?.1;
-            let speaker_name = name_table.get(speaker_key).ok_or(cmd::Error::Generic)?;
+            let speaker_name = name_table.get(speaker_key).ok_or(cmd::Error::NodeParse)?;
             name_buf.push_str(speaker_name);
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
-                if (i & 0x1) == 0 {
-                    // odd token
-                    let value = name_table.get(n).ok_or(cmd::Error::Generic)?;
+                if (i & 0x1) == 1 {
+                    println!("{}:{}", i, n);
+                    // token is a name (index 1, 3, 5 ...)
+                    let value = name_table.get(n).ok_or(cmd::Error::NodeParse)?;
                     text_buf.push_str(value);
                     Ok(())
                 } else {
-                    // even token
+                    // token cannot be a name 
                     text_buf.push_str(n);
                     Ok(())
                 }
@@ -880,14 +1044,16 @@ pub mod cmd {
         /// thread. This is used for validating that the section of text is valid
         pub fn validate_node(text: &str, name_table: &HashMap<String, String>) -> Result<()> {
             let mut text_iter = text.split(TOKEN).enumerate();
-            let speaker_key = text_iter.next().ok_or(cmd::Error::Generic)?.1;
-            name_table.get(speaker_key).ok_or(cmd::Error::Generic)?;
+            text_iter.next(); // discard first empty string
+            let speaker_key = text_iter.next().ok_or(cmd::Error::EdgeParse)?.1;
+            name_table.get(speaker_key).ok_or(cmd::Error::EdgeParse)?;
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
-                if (i & 0x1) == 0 {
-                    // odd token
-                    name_table.get(n).ok_or(cmd::Error::Generic)?;
+                if (i & 0x1) == 1 {
+                    // token is a name (index 1, 3, 5 ...)
+                    name_table.get(n).ok_or(cmd::Error::EdgeParse)?;
                     Ok(())
                 } else {
+                    // token cannot be a name 
                     Ok(())
                 }
             })?;
@@ -911,21 +1077,18 @@ pub mod cmd {
             //     up in the name table. This is true because split() will return an empty strings
             //     on sides of the separator with no text. For instance name::::name:: would split
             //     to ['name', '', 'name', '']
-            //  2. This behavior is the opposite of parse_node. This is because parse_node strings
-            //     start with the speaker name, where as for parse_edge strings, there is no
-            //     speaker as it represents a player action
-
             text_buf.clear();
             let mut text_iter = text.split(TOKEN).enumerate();
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
+                println!("{}:{}", i, n);
                 if (i & 0x1) == 0 {
-                    // odd token
+                    // token cannot be a name 
                     text_buf.push_str(n);
                     Ok(())
                 } else {
-                    // even token
+                    // token is a name
                     println!("{}", n);
-                    let value = name_table.get(n).ok_or(cmd::Error::Generic)?;
+                    let value = name_table.get(n).ok_or(cmd::Error::EdgeParse)?;
                     text_buf.push_str(value);
                     Ok(())
                 }
@@ -940,15 +1103,12 @@ pub mod cmd {
             let mut text_iter = text.split(TOKEN).enumerate();
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
                 if (i & 0x1) == 0 {
-                    // odd token
                     Ok(())
                 } else {
-                    // even token
                     name_table.get(n).ok_or(cmd::Error::Generic)?;
                     Ok(())
                 }
             })?;
-
             Ok(())
         }
 
@@ -1050,6 +1210,7 @@ pub mod cmd {
         ) -> Result<()> {
             // this match will stop compiling any time a new reqKind is added
             match req {
+                ReqKind::No => {},
                 ReqKind::GT(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
@@ -1076,9 +1237,10 @@ pub mod cmd {
             val_table: &HashMap<String, u32>,
         ) -> Result<()> {
             // this match will stop compiling any time a new EffectKind is added
-            // remember, if val is a u32, check the val_table, if val is a String, check the name
-            // table
+            // NOTE: remember, if val is a u32, check the val_table, if val is a String, check the 
+            // name table
             match effect {
+                EffectKind::No => {},
                 EffectKind::Add(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
@@ -1134,13 +1296,8 @@ pub mod cmd {
                 // Check that the section of text parses successfully (all names present in the
                 // name_table)
                 validate_edge(slice, &data.name_table)?;
-
-                if let Some(ref req) = edge.weight.requirement {
-                    validate_requirement(req, &data.name_table, &data.val_table)?;
-                }
-                if let Some(ref effect) = edge.weight.effect {
-                    validate_effect(effect, &data.name_table, &data.val_table)?;
-                }
+                validate_requirement(&edge.weight.requirement, &data.name_table, &data.val_table)?;
+                validate_effect(&edge.weight.effect, &data.name_table, &data.val_table)?;
                 Ok(())
             })?;
             Ok(())
@@ -1202,7 +1359,7 @@ mod tests {
         let expected_list = concat!(
             "node 0: Behemoth says \"Well, who knows, who knows\"\r\n",
             "--> edge 0 to node 1: \"Dostoevsky's dead\"\r\n",
-            "    requirements: Some(LT(\"rus_lit\", 51)), effects: Some(Sub(\"rus_lit\", 1))\r\n",
+            "    requirements: LT(\"rus_lit\", 51), effects: Sub(\"rus_lit\", 1)\r\n",
             "node 1: Behemoth says \"'I protest!' Behemoth exclaimed hotly. 'Dostoevsky is immortal'\"\r\n",
         );
         assert_eq!(state.scratchpad, expected_list);
@@ -1228,6 +1385,7 @@ mod tests {
         state.scratchpad.clear();
 
         std::fs::remove_file("simple_test.tree").unwrap();
+        std::fs::remove_file("simple_test.tree.bkp").unwrap();
     }
 
     #[test]
@@ -1241,7 +1399,7 @@ mod tests {
         name_table.insert("Laura".to_string(), "Dagson".to_string());
         name_table.insert("John".to_string(), "Elliot".to_string());
 
-        let text = "Elle::xzunz::Anna::lxn ::Elle::cn::Patrick::o::Laura::sokxt::Patrick::eowln
+        let text = "::Elle::xzunz::Anna::lxn ::Elle::cn::Patrick::o::Laura::sokxt::Patrick::eowln
         ::Patrick::::John::c::Patrick::iw qyyhr.jxhccpyvchze::Anna::ox hi::Laura::nlv::John::peh
         swvnismjs::John::p::Laura::::John::slu.hlqzkei jhrskiswe::John::::John::m.rx::Patrick::pk
         te::Elle::h::John::m,z,.jwtol::Elle::h rwvnpuqw::John::::John::::Elle::tnz::Elle::.kv.
@@ -1267,7 +1425,7 @@ mod tests {
         name_table.insert("vamp".to_string(), "Dracula".to_string());
         name_table.insert("king".to_string(), "King Laugh".to_string());
 
-        let text = "vamp::It is a strange world, a sad world, a world full of miseries, and woes, and 
+        let text = "::vamp::It is a strange world, a sad world, a world full of miseries, and woes, and 
         troubles. And yet when ::king:: come, he make them all dance to the tune he play. Bleeding hearts, 
         and dry bones of the churchyard, and tears that burn as they fall, all dance together to the music
         that he make with that smileless mouth of him. Ah, we men and women are like ropes drawn tight with
