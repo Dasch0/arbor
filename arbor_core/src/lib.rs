@@ -1135,14 +1135,12 @@ pub mod cmd {
                 // name_table)
                 validate_edge(slice, &data.name_table)?;
 
-                match edge.weight.requirement {
-                    Some(ref req) => validate_requirement(req, &data.name_table, &data.val_table)?,
-                    None => {}
-                };
-                match edge.weight.effect {
-                    Some(ref effect) => validate_effect(effect, &data.name_table, &data.val_table)?,
-                    None => {}
-                };
+                if let Some(ref req) = edge.weight.requirement {
+                    validate_requirement(req, &data.name_table, &data.val_table)?;
+                }
+                if let Some(ref effect) = edge.weight.effect {
+                    validate_effect(effect, &data.name_table, &data.val_table)?;
+                }
                 Ok(())
             })?;
             Ok(())
