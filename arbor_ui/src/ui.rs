@@ -187,7 +187,7 @@ impl LoadWindow {
                     self.was_none = false;
                     state.act.tree.node_weights_mut().for_each(|n| {
                         if n.pos.is_none() {
-                            n.pos = Some(arbor_core::Pos::new(0.3, 0.3));
+                            n.pos = Some(arbor_core::Position::new(0.3, 0.3));
                             self.was_none = true;
                         }
                     });
@@ -412,7 +412,7 @@ impl NodeEditor {
                 match res {
                     Ok(node_index) => {
                         state.act.tree[NodeIndex::new(node_index)].pos =
-                            Some(arbor_core::Pos::new(0.3, 0.3))
+                            Some(arbor_core::Position::new(0.3, 0.3))
                     }
                     Err(e) => println!("{}", e),
                 }
@@ -516,7 +516,10 @@ impl TreePainting {
 
     #[inline]
     fn reform(&self, p: egui::Pos2) -> egui::Pos2 {
-        egui::pos2((p.x - self.pan.x) / self.zoom, (p.y - self.pan.y) / self.zoom)
+        egui::pos2(
+            (p.x - self.pan.x) / self.zoom,
+            (p.y - self.pan.y) / self.zoom,
+        )
     }
 
     pub fn ui_control(&mut self, ui: &mut egui::Ui) -> egui::Response {
@@ -636,7 +639,7 @@ impl TreePainting {
             // move node
             if let Some(pointer_pos) = resp.interact_pointer_pos() {
                 let new_pos = self.reform(from_screen * pointer_pos);
-                n.pos = Some(arbor_core::Pos::new(new_pos.x, new_pos.y));
+                n.pos = Some(arbor_core::Position::new(new_pos.x, new_pos.y));
             }
             painter.add(egui::Shape::circle_filled(
                 coord,

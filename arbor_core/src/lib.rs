@@ -15,7 +15,7 @@ use structopt::clap::AppSettings;
 pub use structopt::StructOpt;
 use thiserror::Error;
 
-// TODO: Features 
+// TODO: Features
 // 1. More tests and benchmarks, focus on rebuild_tree
 // 2. Add more help messages and detail for error types
 // 3. Add logging
@@ -24,23 +24,23 @@ static TREE_EXT: &str = ".tree";
 static BACKUP_EXT: &str = ".bkp";
 static TOKEN: &str = "::";
 
-/// placeholder struct for storing the 2d position of a node. uUsed for graph visualization
+/// Struct for storing the 2d position of a node. Used for graph visualization
 #[derive(new, Serialize, Deserialize, Clone, Copy)]
-pub struct Pos {
+pub struct Position {
     pub x: f32,
     pub y: f32,
 }
 
-/// typedef representing a section of text in a rope. This section contains a start and end index,
-/// stored in an array. The first element should always be smaller than the second
-#[derive(new, Serialize, Deserialize, Clone, Copy)]
+/// Struct representing a section of text in a rope. This section contains a start and end index,
+/// stored in an array. The first element should always be smaller than the second. Additionally
+/// the hash of that text section is stored in order to validate that the section is valid
+//TODO: Is hash necessary for actually running the dialogue tree?
+#[derive(new, Serialize, Deserialize, PartialEq, Hash, Eq, Clone, Copy)]
 pub struct Section {
     /// A start and end index to some section of text
     pub text: [usize; 2],
     /// A hash of the text this section points to
     pub hash: u64,
-    /// An optional 2d position for the section, used for graph visualizations
-    pub pos: Option<Pos>,
 }
 
 impl std::ops::Index<usize> for Section {
@@ -71,7 +71,7 @@ pub struct DialogueTreeData {
     pub uid: usize,
     pub tree: Tree,
     pub text: String,
-    pub name_table: HashMap<String, String>,
+    pub name_table: HashMap<Section, Section>,
     pub val_table: HashMap<String, u32>,
     pub name: String,
 }
@@ -123,6 +123,13 @@ pub struct Choice {
     pub section: Section,
     pub requirement: ReqKind,
     pub effect: EffectKind,
+}
+
+/// Struct for storing the information for a line of dialogue. Stored in the nodes of a dialogue
+/// tree
+pub struct Dialogue {
+    pub section: Section,
+    pub pos: Position,
 }
 
 /// Represents a requirement to access a choice.
@@ -365,10 +372,10 @@ pub mod cmd {
                     .get(&self.speaker)
                     .ok_or(cmd::Error::NameNotExists)?;
                 let start = state.act.text.len();
-                state
-                    .act
-                    .text
-                    .push_str(&format!("{}{}{}{}", TOKEN, self.speaker, TOKEN, self.dialogue));
+                state.act.text.push_str(&format!(
+                    "{}{}{}{}",
+                    TOKEN, self.speaker, TOKEN, self.dialogue
+                ));
                 let end = state.act.text.len();
                 // Create hash for verifying the text section in the future
                 let hash = hash(&state.act.text[start..end].as_bytes());
@@ -527,10 +534,10 @@ pub mod cmd {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 let node_index = NodeIndex::new(self.node_id);
                 let start = state.act.text.len();
-                state
-                    .act
-                    .text
-                    .push_str(&format!("{}{}{}{}", TOKEN, self.speaker, TOKEN, self.dialogue));
+                state.act.text.push_str(&format!(
+                    "{}{}{}{}",
+                    TOKEN, self.speaker, TOKEN, self.dialogue
+                ));
                 let end = state.act.text.len();
 
                 let node = state
@@ -708,7 +715,11 @@ pub mod cmd {
             /// Remove Node
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 let node_index = NodeIndex::new(self.node_id);
-                let removed_weight = state.act.tree.remove_node(node_index).ok_or(cmd::Error::InvalidNodeIndex)?;
+                let removed_weight = state
+                    .act
+                    .tree
+                    .remove_node(node_index)
+                    .ok_or(cmd::Error::InvalidNodeIndex)?;
                 Ok(removed_weight.hash as usize)
             }
         }
@@ -718,7 +729,7 @@ pub mod cmd {
         #[derive(new, StructOpt)]
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Edge {
-            /// Id of the edge to remove 
+            /// Id of the edge to remove
             edge_id: usize,
         }
 
@@ -726,7 +737,11 @@ pub mod cmd {
             /// Remove Edge
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 let edge_index = EdgeIndex::<u32>::new(self.edge_id);
-                let removed_weight = state.act.tree.remove_edge(edge_index).ok_or(cmd::Error::InvalidEdgeIndex)?;
+                let removed_weight = state
+                    .act
+                    .tree
+                    .remove_edge(edge_index)
+                    .ok_or(cmd::Error::InvalidEdgeIndex)?;
 
                 Ok(removed_weight.section.hash as usize)
             }
@@ -743,7 +758,11 @@ pub mod cmd {
         impl Executable for Name {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // Check if the key is referenced anywhere in the text
-                if let Some(_found) = state.act.text.find(format!("{}{}{}", TOKEN, self.key, TOKEN).as_str()) {
+                if let Some(_found) = state
+                    .act
+                    .text
+                    .find(format!("{}{}{}", TOKEN, self.key, TOKEN).as_str())
+                {
                     return Err(cmd::Error::NameInUse.into());
                 }
 
@@ -756,8 +775,11 @@ pub mod cmd {
                         ReqKind::LT(_, _) => Ok(()),
                         ReqKind::EQ(_, _) => Ok(()),
                         ReqKind::Cmp(key, _) => {
-                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
-                            else { Ok(()) }
+                            if key.eq(self.key.as_str()) {
+                                Err(cmd::Error::NameInUse)
+                            } else {
+                                Ok(())
+                            }
                         }
                     }?;
                     match &edge.weight.effect {
@@ -766,12 +788,19 @@ pub mod cmd {
                         EffectKind::Sub(_, _) => Ok(()),
                         EffectKind::Set(_, _) => Ok(()),
                         EffectKind::Assign(key, _) => {
-                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
-                            else { Ok(()) }
+                            if key.eq(self.key.as_str()) {
+                                Err(cmd::Error::NameInUse)
+                            } else {
+                                Ok(())
+                            }
                         }
                     }?;
                 }
-                state.act.name_table.remove(self.key.as_str()).ok_or(cmd::Error::NameNotExists)?;
+                state
+                    .act
+                    .name_table
+                    .remove(self.key.as_str())
+                    .ok_or(cmd::Error::NameNotExists)?;
                 Ok(0)
             }
         }
@@ -793,37 +822,59 @@ pub mod cmd {
                     match &edge.weight.requirement {
                         ReqKind::No => Ok(()),
                         ReqKind::GT(key, _) => {
-                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
-                            else { Ok(()) }
-                        },
+                            if key.eq(self.key.as_str()) {
+                                Err(cmd::Error::NameInUse)
+                            } else {
+                                Ok(())
+                            }
+                        }
                         ReqKind::LT(key, _) => {
-                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
-                            else { Ok(()) }
-                        },
+                            if key.eq(self.key.as_str()) {
+                                Err(cmd::Error::NameInUse)
+                            } else {
+                                Ok(())
+                            }
+                        }
                         ReqKind::EQ(key, _) => {
-                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
-                            else { Ok(()) }
-                        },
+                            if key.eq(self.key.as_str()) {
+                                Err(cmd::Error::NameInUse)
+                            } else {
+                                Ok(())
+                            }
+                        }
                         ReqKind::Cmp(_, _) => Ok(()),
                     }?;
                     match &edge.weight.effect {
                         EffectKind::No => Ok(()),
                         EffectKind::Add(key, _) => {
-                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
-                            else { Ok(()) }
-                        },
+                            if key.eq(self.key.as_str()) {
+                                Err(cmd::Error::NameInUse)
+                            } else {
+                                Ok(())
+                            }
+                        }
                         EffectKind::Sub(key, _) => {
-                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
-                            else { Ok(()) }
-                        },
+                            if key.eq(self.key.as_str()) {
+                                Err(cmd::Error::NameInUse)
+                            } else {
+                                Ok(())
+                            }
+                        }
                         EffectKind::Set(key, _) => {
-                            if key.eq(self.key.as_str()) { Err(cmd::Error::NameInUse) }
-                            else { Ok(()) }
-                        },
+                            if key.eq(self.key.as_str()) {
+                                Err(cmd::Error::NameInUse)
+                            } else {
+                                Ok(())
+                            }
+                        }
                         EffectKind::Assign(_, _) => Ok(()),
                     }?;
                 }
-                state.act.name_table.remove(self.key.as_str()).ok_or(cmd::Error::NameNotExists)?;
+                state
+                    .act
+                    .name_table
+                    .remove(self.key.as_str())
+                    .ok_or(cmd::Error::NameNotExists)?;
                 Ok(0)
             }
         }
@@ -1010,7 +1061,7 @@ pub mod cmd {
             //  0. The first iterator element should always be '', if not something is wrong
             //  1. The second iterator element is always the speaker name and should be the only
             //     thing written to the name buffer
-            //  2. Since only a simple flow of ::speaker_name::text::name:::text ... etc is 
+            //  2. Since only a simple flow of ::speaker_name::text::name:::text ... etc is
             //     allowed, only every 'other' token (indices 1,3,5...) need to be looked up in the
             //     hashtable
             //  3. The above is only true because split() will return an empty strings on sides of
@@ -1031,7 +1082,7 @@ pub mod cmd {
                     text_buf.push_str(value);
                     Ok(())
                 } else {
-                    // token cannot be a name 
+                    // token cannot be a name
                     text_buf.push_str(n);
                     Ok(())
                 }
@@ -1053,7 +1104,7 @@ pub mod cmd {
                     name_table.get(n).ok_or(cmd::Error::EdgeParse)?;
                     Ok(())
                 } else {
-                    // token cannot be a name 
+                    // token cannot be a name
                     Ok(())
                 }
             })?;
@@ -1082,7 +1133,7 @@ pub mod cmd {
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
                 println!("{}:{}", i, n);
                 if (i & 0x1) == 0 {
-                    // token cannot be a name 
+                    // token cannot be a name
                     text_buf.push_str(n);
                     Ok(())
                 } else {
@@ -1210,7 +1261,7 @@ pub mod cmd {
         ) -> Result<()> {
             // this match will stop compiling any time a new reqKind is added
             match req {
-                ReqKind::No => {},
+                ReqKind::No => {}
                 ReqKind::GT(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
@@ -1237,10 +1288,10 @@ pub mod cmd {
             val_table: &HashMap<String, u32>,
         ) -> Result<()> {
             // this match will stop compiling any time a new EffectKind is added
-            // NOTE: remember, if val is a u32, check the val_table, if val is a String, check the 
+            // NOTE: remember, if val is a u32, check the val_table, if val is a String, check the
             // name table
             match effect {
-                EffectKind::No => {},
+                EffectKind::No => {}
                 EffectKind::Add(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
