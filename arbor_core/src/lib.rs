@@ -2,7 +2,7 @@ pub use anyhow::Result;
 pub use cmd::Executable;
 use derive_new::*;
 use enum_dispatch::*;
-pub use hashbrown::HashMap;
+pub use std::collections::HashMap;
 pub use petgraph::prelude::*;
 use petgraph::visit::IntoNodeReferences;
 pub use petgraph::*;
@@ -14,15 +14,26 @@ use std::io::Write;
 use structopt::clap::AppSettings;
 pub use structopt::StructOpt;
 use thiserror::Error;
+use std::hash::BuildHasherDefault; 
 
 // TODO: Features
 // 1. More tests and benchmarks, focus on rebuild_tree
 // 2. Add more help messages and detail for error types
 // 3. Add logging
 
-static TREE_EXT: &str = ".tree";
-static BACKUP_EXT: &str = ".bkp";
-static TOKEN: &str = "::";
+pub static TREE_EXT: &str = ".tree";
+pub static BACKUP_EXT: &str = ".bkp";
+pub static TOKEN_SEP: &str = "::";
+
+pub const KEY_MAX_LEN: usize = 8;
+pub const NAME_MAX_LEN: usize = 32;
+
+
+/// Stack allocated string with max length suitable for keys
+type KeyString = staticvec::StaticString<KEY_MAX_LEN>;
+
+/// Stack allocated string with max length suitable for keys
+type NameString = staticvec::StaticString<NAME_MAX_LEN>;
 
 /// Struct for storing the 2d position of a node. Used for graph visualization
 #[derive(new, Serialize, Deserialize, Clone, Copy)]
@@ -35,7 +46,7 @@ pub struct Position {
 /// stored in an array. The first element should always be smaller than the second. Additionally
 /// the hash of that text section is stored in order to validate that the section is valid
 //TODO: Is hash necessary for actually running the dialogue tree?
-#[derive(new, Serialize, Deserialize, PartialEq, Hash, Eq, Clone, Copy)]
+#[derive(new, Serialize, Deserialize, Clone, Copy)]
 pub struct Section {
     /// A start and end index to some section of text
     pub text: [usize; 2],
@@ -71,8 +82,8 @@ pub struct DialogueTreeData {
     pub uid: usize,
     pub tree: Tree,
     pub text: String,
-    pub name_table: HashMap<Section, Section>,
-    pub val_table: HashMap<String, u32>,
+    pub name_table: HashMap<KeyString, NameString, BuildHasherDefault<seahash::SeaHasher>>,
+    pub val_table: HashMap<KeyString, NameString, BuildHasherDefault<seahash::SeaHasher>>,
     pub name: String,
 }
 
@@ -82,8 +93,8 @@ impl DialogueTreeData {
             uid: cmd::util::gen_uid(),
             tree: graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
             text: String::with_capacity(8192),
-            name_table: HashMap::new(),
-            val_table: HashMap::new(),
+            name_table: HashMap::default(),
+            val_table: HashMap::default(),
             name: String::new(),
         }
     }
@@ -335,8 +346,8 @@ pub mod cmd {
                     util::gen_uid(),
                     graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
                     String::with_capacity(8192),
-                    HashMap::new(),
-                    HashMap::new(),
+                    HashMap::default(),
+                    HashMap::default(),
                     self.name.clone(),
                 );
 
@@ -374,7 +385,7 @@ pub mod cmd {
                 let start = state.act.text.len();
                 state.act.text.push_str(&format!(
                     "{}{}{}{}",
-                    TOKEN, self.speaker, TOKEN, self.dialogue
+                    TOKEN_SEP, self.speaker, TOKEN_SEP, self.dialogue
                 ));
                 let end = state.act.text.len();
                 // Create hash for verifying the text section in the future
@@ -536,7 +547,7 @@ pub mod cmd {
                 let start = state.act.text.len();
                 state.act.text.push_str(&format!(
                     "{}{}{}{}",
-                    TOKEN, self.speaker, TOKEN, self.dialogue
+                    TOKEN_SEP, self.speaker, TOKEN_SEP, self.dialogue
                 ));
                 let end = state.act.text.len();
 
@@ -643,7 +654,7 @@ pub mod cmd {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // Check that the key already exists, and make sure not to accidently add a new key
                 // to the table. The user can use new commands for that
-                if state.act.name_table.get(&self.key).is_some() {
+                if state.act.name_table.get(&self.key.as_bytes()[0..8]).is_some() {
                     let name = state
                         .act
                         .name_table
@@ -674,7 +685,7 @@ pub mod cmd {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // Check that the key already exists, and make sure not to accidently add a new key
                 // to the table. The user can use new commands for that
-                if state.act.name_table.get(&self.key).is_some() {
+                if state.act.name_table.get(&self.key.as_str()).is_some() {
                     let name = state
                         .act
                         .val_table
@@ -761,7 +772,7 @@ pub mod cmd {
                 if let Some(_found) = state
                     .act
                     .text
-                    .find(format!("{}{}{}", TOKEN, self.key, TOKEN).as_str())
+                    .find(format!("{}{}{}", TOKEN_SEP, self.key, TOKEN_SEP).as_str())
                 {
                     return Err(cmd::Error::NameInUse.into());
                 }
@@ -1069,7 +1080,7 @@ pub mod cmd {
             //     '', name, '']
             name_buf.clear();
             text_buf.clear();
-            let mut text_iter = text.split(TOKEN).enumerate();
+            let mut text_iter = text.split(TOKEN_SEP).enumerate();
             let _ = text_iter.next(); // skip first token, it is '' for any correct string
             let speaker_key = text_iter.next().ok_or(cmd::Error::Generic)?.1;
             let speaker_name = name_table.get(speaker_key).ok_or(cmd::Error::NodeParse)?;
@@ -1094,7 +1105,7 @@ pub mod cmd {
         /// Same routine as parse node, except the results are not actually written to a
         /// thread. This is used for validating that the section of text is valid
         pub fn validate_node(text: &str, name_table: &HashMap<String, String>) -> Result<()> {
-            let mut text_iter = text.split(TOKEN).enumerate();
+            let mut text_iter = text.split(TOKEN_SEP).enumerate();
             text_iter.next(); // discard first empty string
             let speaker_key = text_iter.next().ok_or(cmd::Error::EdgeParse)?.1;
             name_table.get(speaker_key).ok_or(cmd::Error::EdgeParse)?;
@@ -1129,7 +1140,7 @@ pub mod cmd {
             //     on sides of the separator with no text. For instance name::::name:: would split
             //     to ['name', '', 'name', '']
             text_buf.clear();
-            let mut text_iter = text.split(TOKEN).enumerate();
+            let mut text_iter = text.split(TOKEN_SEP).enumerate();
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
                 println!("{}:{}", i, n);
                 if (i & 0x1) == 0 {
@@ -1151,7 +1162,7 @@ pub mod cmd {
         /// Same routine as parse_edge, but does not write to an output string buffer. Useful for
         /// validating a section of text in an edge
         pub fn validate_edge(text: &str, name_table: &HashMap<String, String>) -> Result<()> {
-            let mut text_iter = text.split(TOKEN).enumerate();
+            let mut text_iter = text.split(TOKEN_SEP).enumerate();
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
                 if (i & 0x1) == 0 {
                     Ok(())
