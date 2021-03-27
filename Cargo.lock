@@ -82,18 +82,21 @@ name = "arbor_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrayvec 0.6.0",
  "bincode",
+ "chrono",
  "derive-new",
  "enum_dispatch",
  "enum_from_str",
  "enum_from_str_derive",
+ "log",
  "petgraph",
  "rand",
  "rayon",
  "seahash",
  "serde",
  "shellwords",
- "staticvec",
+ "simple_logger",
  "structopt",
  "thiserror",
 ]
@@ -128,6 +131,15 @@ name = "arrayvec"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b62fc65de8e4e7f52534fb52b0f3ed04746ae267519eef2a83941e8085068b"
+
+[[package]]
+name = "arrayvec"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "682f88bd1270f264991da8922b89ee1fb520b0da73f97c9f73cda54980123017"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "ash"
@@ -356,6 +368,17 @@ dependencies = [
  "foreign-types",
  "libc",
  "objc",
+]
+
+[[package]]
+name = "colored"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4ffc801dacf156c5854b9df4f425a626539c3a6ef7893cc0c5084a23f0b6c59"
+dependencies = [
+ "atty",
+ "lazy_static",
+ "winapi 0.3.9",
 ]
 
 [[package]]
@@ -885,7 +908,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f851d03c2e8f117e3702bf41201a4fafa447d5cb1276d5375870ae7573d069dd"
 dependencies = [
- "arrayvec",
+ "arrayvec 0.5.2",
  "bitflags",
  "gfx-auxil",
  "gfx-hal",
@@ -907,7 +930,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36dc6ba2b7647e2c2b27b8f74ff5ccdd53c703776588eee5b1de515fdcbd6bc9"
 dependencies = [
- "arrayvec",
+ "arrayvec 0.5.2",
  "bit-set",
  "bitflags",
  "d3d12",
@@ -939,7 +962,7 @@ version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6717c50ab601efe4a669bfb44db615e3888695ac8263222aeaa702642b9fbc2"
 dependencies = [
- "arrayvec",
+ "arrayvec 0.5.2",
  "bitflags",
  "gfx-auxil",
  "gfx-hal",
@@ -962,7 +985,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8dc54b456ece69ef49f8893269ebf24ac70969ed34ba2719c3f3abcc8fbff14e"
 dependencies = [
- "arrayvec",
+ "arrayvec 0.5.2",
  "bitflags",
  "block",
  "cocoa-foundation",
@@ -987,7 +1010,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dabe88b1a5c91e0f969b441cc57e70364858066e4ba937deeb62065654ef9bd9"
 dependencies = [
- "arrayvec",
+ "arrayvec 0.5.2",
  "ash",
  "byteorder",
  "core-graphics-types",
@@ -1892,6 +1915,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "simple_logger"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd57f17c093ead1d4a1499dc9acaafdd71240908d64775465543b8d9a9f1d198"
+dependencies = [
+ "atty",
+ "chrono",
+ "colored",
+ "log",
+ "winapi 0.3.9",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1947,15 +1983,6 @@ checksum = "1f5b132530b1ac069df335577e3581765995cba5a13995cdbbdbc8fb057c532c"
 dependencies = [
  "bitflags",
  "num-traits",
-]
-
-[[package]]
-name = "staticvec"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "491ad6ad6b33b8e4ac9c704c63223c1cd501855332efee4524d1af068f470a83"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -2331,7 +2358,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c60007fc3748278a36b458d96f86105f43aa5f0e412b15a5f934950d61ec26a9"
 dependencies = [
- "arrayvec",
+ "arrayvec 0.5.2",
  "js-sys",
  "naga",
  "parking_lot",
@@ -2351,7 +2378,7 @@ version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c89fa2cc5d72236461ac09c5be967012663e29cb62f1a972654cbf35e49dffa8"
 dependencies = [
- "arrayvec",
+ "arrayvec 0.5.2",
  "bitflags",
  "cfg_aliases",
  "copyless",

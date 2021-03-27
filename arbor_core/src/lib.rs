@@ -2,19 +2,20 @@ pub use anyhow::Result;
 pub use cmd::Executable;
 use derive_new::*;
 use enum_dispatch::*;
-pub use std::collections::HashMap;
+use log::{debug, info, trace};
 pub use petgraph::prelude::*;
 use petgraph::visit::IntoNodeReferences;
 pub use petgraph::*;
 use rayon::prelude::*;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
+pub use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::io;
 use std::io::Write;
 use structopt::clap::AppSettings;
 pub use structopt::StructOpt;
 use thiserror::Error;
-use std::hash::BuildHasherDefault; 
 
 // TODO: Features
 // 1. More tests and benchmarks, focus on rebuild_tree
@@ -29,10 +30,10 @@ pub const KEY_MAX_LEN: usize = 8;
 pub const NAME_MAX_LEN: usize = 32;
 
 /// Stack allocated string with max length suitable for keys
-type KeyString = staticvec::StaticString<KEY_MAX_LEN>;
+type KeyString = arrayvec::ArrayString<KEY_MAX_LEN>;
 
 /// Stack allocated string with max length suitable for keys
-type NameString = staticvec::StaticString<NAME_MAX_LEN>;
+type NameString = arrayvec::ArrayString<NAME_MAX_LEN>;
 
 /// Struct for storing the 2d position of a node. Used for graph visualization
 #[derive(new, Serialize, Deserialize, Clone, Copy)]
@@ -43,10 +44,7 @@ pub struct Position {
 
 impl Default for Position {
     fn default() -> Self {
-        Self {
-            x: 0.0,
-            y: 0.0,
-        }
+        Self { x: 0.0, y: 0.0 }
     }
 }
 
@@ -98,7 +96,7 @@ pub struct DialogueTreeData {
     pub uid: usize,
     pub tree: Tree,
     pub text: String,
-    pub name_table: NameTable, 
+    pub name_table: NameTable,
     pub val_table: ValTable,
     pub name: String,
 }
@@ -162,8 +160,8 @@ pub struct Dialogue {
 
 /// Represents a requirement to access a choice.
 ///
-/// Name length strings are stored as a heap allocated String rather than a static NameString as 
-/// that would bloat enum size by 32 bytes, when Cmp will rarely be used compared to val based 
+/// Name length strings are stored as a heap allocated String rather than a static NameString as
+/// that would bloat enum size by 32 bytes, when Cmp will rarely be used compared to val based
 /// requirements
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ReqKind {
@@ -182,9 +180,10 @@ impl std::str::FromStr for ReqKind {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        info!("Parsing ReqKind from string");
         // Implementation notes:
         // The enum string format is set up to directly map to how the enum is declared in rust:
-        // e.g. 'GreaterThan(my_key, 10)'
+        // e.g. 'GreaterThan(my_key,10)'
         // This is tokenized on the presence of '(' ',' and ')' special characters. In reverse
         // order:
         // e.g. ['', '10', 'my_key', 'GreaterThan']
@@ -195,13 +194,22 @@ impl std::str::FromStr for ReqKind {
         // Importantly, the 'val' that is tested against can be a string or a u32. This is handled
         // by waiting to unwrap the val parameter until building the Enum
         let mut split = s.rsplit(&['(', ',', ')'][..]);
-        // first item should be ''
+        debug!("{}", s);
+
+        trace!("Check that first item is ''");
         anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)?.is_empty());
-        // second item should be number or string, wait to check validity
+
+        trace!("second item should be number or string, wait to check validity");
         let val = split.next().ok_or(cmd::Error::Generic)?;
-        // third item should be key, convert to keystring and check length
-        let key: KeyString = KeyString::try_from_str(split.next().ok_or(cmd::Error::Generic)?)?;
-        // fourth item should be Enum type, build it!, and also try to resolve the val
+
+        trace!("third item should be key, check that the key and name are of a valid length");
+        // match required due to lifetime limitations on CapacityError
+        let key = match KeyString::from(split.next().ok_or(cmd::Error::Generic)?) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.simplify()),
+        }?;
+
+        trace!("fourth item should be Enum type, build it!, and also try to resolve the val");
         match split.next().ok_or(cmd::Error::Generic)? {
             "GT" => Ok(ReqKind::GT(key, val.parse::<u32>()?)),
             "LT" => Ok(ReqKind::LT(key, val.parse::<u32>()?)),
@@ -214,8 +222,8 @@ impl std::str::FromStr for ReqKind {
 
 /// Represents an effect that occurs when a choice is made.
 ///
-/// Name length strings are stored as a heap allocated String rather than a static NameString as 
-/// that would bloat enum size by 32 bytes, when Cmp will rarely be used compared to val based 
+/// Name length strings are stored as a heap allocated String rather than a static NameString as
+/// that would bloat enum size by 32 bytes, when Cmp will rarely be used compared to val based
 /// requirements
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum EffectKind {
@@ -231,6 +239,7 @@ impl std::str::FromStr for EffectKind {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        info!("Parsing EffectKind from string");
         // Implementation notes:
         // The enum string format is set up to directly map to how the enum is declared in rust:
         // e.g. 'Add(my_key,10)'
@@ -244,13 +253,22 @@ impl std::str::FromStr for EffectKind {
         // Importantly, the 'val' that is tested against can be a string or a u32. This is handled
         // by waiting to unwrap the val parameter until building the Enum
         let mut split = s.rsplit(&['(', ',', ')'][..]);
-        // first item should be ''
+        debug!("{}", s);
+
+        trace!("First item should be ''");
         anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)?.is_empty());
-        // second item should be number or string, don't check for validity yet
+
+        trace!("Second item should be number or string, don't check for validity yet");
         let val = split.next().ok_or(cmd::Error::Generic)?;
-        // third item should be key, convert to KeyString and check length
-        let key: KeyString = KeyString::try_from_str(split.next().ok_or(cmd::Error::Generic)?)?;
-        // fourth item should be Enum type, build it!
+
+        trace!("Third item should be key, check that the key and name are of a valid length");
+        // match required due to lifetime limitations on CapacityError
+        let key = match KeyString::from(split.next().ok_or(cmd::Error::Generic)?) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.simplify()),
+        }?;
+
+        trace!("fourth item should be Enum type, build it!, and also try to resolve the val");
         match split.next().ok_or(cmd::Error::Generic)? {
             "Add" => Ok(EffectKind::Add(key, val.parse::<u32>()?)),
             "Sub" => Ok(EffectKind::Sub(key, val.parse::<u32>()?)),
@@ -415,10 +433,10 @@ pub mod cmd {
                 let end = state.act.text.len();
                 // Create hash for verifying the text section in the future
                 let hash = hash(&state.act.text[start..end].as_bytes());
-                let index = state
-                    .act
-                    .tree
-                    .add_node(Dialogue::new(Section::new([start, end], hash), Position::new(0.0, 0.0)));
+                let index = state.act.tree.add_node(Dialogue::new(
+                    Section::new([start, end], hash),
+                    Position::new(0.0, 0.0),
+                ));
                 Ok(index.index())
             }
         }
@@ -447,13 +465,19 @@ pub mod cmd {
         impl Executable for Edge {
             /// New Edge
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                info!("Creating new edge");
+
+                trace!("push choice text buffer");
                 let start = state.act.text.len();
                 state.act.text.push_str(&self.text);
                 let end = state.act.text.len();
-                // Compute hash for verifying the text section later
-                let hash = hash(&state.act.text[start..end].as_bytes());
+                debug!("start: {}, end: {}", start, end);
 
-                // Validate that any requirements/effects reference valid hashmap keys
+                trace!("Compute hash from text section");
+                let hash = hash(&state.act.text[start..end].as_bytes());
+                debug!("hash {}", hash);
+
+                trace!("Validate that any requirements/effects reference valid hashmap keys");
                 if self.requirement.is_some() {
                     util::validate_requirement(
                         self.requirement.as_ref().ok_or(cmd::Error::Generic)?,
@@ -469,6 +493,7 @@ pub mod cmd {
                     )?;
                 }
 
+                trace!("Adding new edge to tree");
                 let edge_index = state.act.tree.add_edge(
                     NodeIndex::from(self.start_index),
                     NodeIndex::from(self.end_index),
@@ -498,17 +523,21 @@ pub mod cmd {
         impl Executable for Name {
             /// New Name
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
-                // check that the key and value are valid lengths
-                let static_key: KeyString = KeyString::try_from_str(self.key.as_str())?;
-                let static_name: NameString = NameString::try_from_str(self.name.as_str())?;
+                // Check that the key and name are of a valid length
+                // match required due to lifetime limitations on CapacityError
+                let static_key = match KeyString::from(self.key.as_str()) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(e.simplify()),
+                }?;
+                let static_name = match NameString::from(self.name.as_str()) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(e.simplify()),
+                }?;
 
                 // Check that the key doesn't already exist, since we want new to not overwrite
                 // values. The user can use edit commands for that
                 if state.act.name_table.get(self.key.as_str()).is_none() {
-                    state
-                        .act
-                        .name_table
-                        .insert(static_key, static_name);
+                    state.act.name_table.insert(static_key, static_name);
                     Ok(0)
                 } else {
                     Err(cmd::Error::NameExists.into())
@@ -533,7 +562,11 @@ pub mod cmd {
             /// New Name
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // Check that the key is of a valid length
-                let static_key: KeyString = KeyString::try_from_str(self.key.as_str())?;
+                // match required due to lifetime limitations on CapacityError
+                let static_key = match KeyString::from(self.key.as_str()) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(e.simplify()),
+                }?;
 
                 // Check that the key doesn't already exist, since we want new to not overwrite
                 // values. The user can use edit commands for that
@@ -686,9 +719,18 @@ pub mod cmd {
 
         impl Executable for Name {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
-                // Check that key and name are valid length
-                let static_key: KeyString = KeyString::try_from_str(self.key.as_str())?;
-                let static_name: NameString = NameString::try_from_str(self.name.as_str())?;
+                // Check that the key is of a valid length
+                // match required due to lifetime limitations on CapacityError
+                let static_key = match KeyString::from(self.key.as_str()) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(e.simplify()),
+                }?;
+                // Check that the name is of a valid length
+                // match required due to lifetime limitations on CapacityError
+                let static_name = match NameString::from(self.name.as_str()) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(e.simplify()),
+                }?;
                 // Check that the key already exists, and make sure not to accidently add a new key
                 // to the table. The user can use new commands for that
                 if state.act.name_table.get(&static_key).is_some() {
@@ -721,7 +763,12 @@ pub mod cmd {
         impl Executable for Val {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // Check that the key is of a valid length
-                let static_key: KeyString = KeyString::try_from_str(self.key.as_str())?;
+                // match required due to lifetime limitations on CapacityError
+                let static_key = match KeyString::from(self.key.as_str()) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(e.simplify()),
+                }?;
+
                 // Check that the key already exists, and make sure not to accidently add a new key
                 // to the table. The user can use new commands for that
                 if state.act.name_table.get(&static_key).is_some() {
@@ -1168,11 +1215,7 @@ pub mod cmd {
         ///     'action text ::name:: more action text'
         ///
         /// Both the name and text buf are cleared at the beginning of this method
-        pub fn parse_edge(
-            text: &str,
-            name_table: &NameTable,
-            text_buf: &mut String,
-        ) -> Result<()> {
+        pub fn parse_edge(text: &str, name_table: &NameTable, text_buf: &mut String) -> Result<()> {
             // Implementation notes
             //  1. Due to the format, only even iterator elements are names that need to be looked
             //     up in the name table. This is true because split() will return an empty strings
@@ -1409,6 +1452,11 @@ pub mod cmd {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
+    fn setup_logger() {
+        simple_logger::SimpleLogger::new().init().unwrap();
+    }
+
     /// helper function to parse cmd_bufs in the same way the editor does
     #[inline(always)]
     #[allow(dead_code)]
@@ -1423,6 +1471,7 @@ mod tests {
     /// Test basic use case of the editor, new project, add a few nodes and names, list the output,
     /// save the project, reload, list the output again
     fn simple() {
+        setup_logger();
         let mut cmd_buf = String::with_capacity(1000);
         let mut state = EditorState::new(DialogueTreeData::default());
         cmd_buf.push_str("new project \"simple_test\" -s");
@@ -1459,7 +1508,7 @@ mod tests {
         let expected_list = concat!(
             "node 0: Behemoth says \"Well, who knows, who knows\"\r\n",
             "--> edge 0 to node 1: \"Dostoevsky's dead\"\r\n",
-            "    requirements: LT(StaticString { array: \"rus_lit\", size: 7 }, 51), effects: Sub(StaticString { array: \"rus_lit\", size: 7 }, 1)\r\n",
+            "    requirements: LT(\"rus_lit\", 51), effects: Sub(\"rus_lit\", 1)\r\n",
             "node 1: Behemoth says \"'I protest!' Behemoth exclaimed hotly. 'Dostoevsky is immortal'\"\r\n",
         );
         assert_eq!(state.scratchpad, expected_list);
@@ -1493,11 +1542,26 @@ mod tests {
     /// Benchmark node parsing worst case, many substitutions and improperly sized buffer
     fn stress_parse_node() {
         let mut name_table = NameTable::default();
-        name_table.insert(KeyString::from_str("Elle"), NameString::from_str("Amberson"));
-        name_table.insert(KeyString::from_str("Patrick"), NameString::from_str("Breakforest"));
-        name_table.insert(KeyString::from_str("Anna"), NameString::from_str("Catmire"));
-        name_table.insert(KeyString::from_str("Laura"), NameString::from_str("Dagson"));
-        name_table.insert(KeyString::from_str("John"), NameString::from_str("Elliot"));
+        name_table.insert(
+            KeyString::from("Elle").unwrap(),
+            NameString::from("Amberson").unwrap(),
+        );
+        name_table.insert(
+            KeyString::from("Patrick").unwrap(),
+            NameString::from("Breakforest").unwrap(),
+        );
+        name_table.insert(
+            KeyString::from("Anna").unwrap(),
+            NameString::from("Catmire").unwrap(),
+        );
+        name_table.insert(
+            KeyString::from("Laura").unwrap(),
+            NameString::from("Dagson").unwrap(),
+        );
+        name_table.insert(
+            KeyString::from("John").unwrap(),
+            NameString::from("Elliot").unwrap(),
+        );
 
         let text = "::Elle::xzunz::Anna::lxn ::Elle::cn::Patrick::o::Laura::sokxt::Patrick::eowln
         ::Patrick::::John::c::Patrick::iw qyyhr.jxhccpyvchze::Anna::ox hi::Laura::nlv::John::peh
@@ -1522,8 +1586,14 @@ mod tests {
     /// Benchmark standard node parsing case, few substitutions and pre-allocated buffer
     fn quick_parse_node() {
         let mut name_table = NameTable::default();
-        name_table.insert(KeyString::from_str("vamp"), NameString::from_str("Dracula"));
-        name_table.insert(KeyString::from_str("king"), NameString::from_str("King Laugh"));
+        name_table.insert(
+            KeyString::from("vamp").unwrap(),
+            NameString::from("Dracula").unwrap(),
+        );
+        name_table.insert(
+            KeyString::from("king").unwrap(),
+            NameString::from("King Laugh").unwrap(),
+        );
 
         let text = "::vamp::It is a strange world, a sad world, a world full of miseries, and woes, and 
         troubles. And yet when ::king:: come, he make them all dance to the tune he play. Bleeding hearts, 
