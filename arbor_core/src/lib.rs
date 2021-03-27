@@ -30,10 +30,10 @@ pub const KEY_MAX_LEN: usize = 8;
 pub const NAME_MAX_LEN: usize = 32;
 
 /// Stack allocated string with max length suitable for keys
-type KeyString = arrayvec::ArrayString<KEY_MAX_LEN>;
+pub type KeyString = arrayvec::ArrayString<KEY_MAX_LEN>;
 
 /// Stack allocated string with max length suitable for keys
-type NameString = arrayvec::ArrayString<NAME_MAX_LEN>;
+pub type NameString = arrayvec::ArrayString<NAME_MAX_LEN>;
 
 /// Struct for storing the 2d position of a node. Used for graph visualization
 #[derive(new, Serialize, Deserialize, Clone, Copy)]

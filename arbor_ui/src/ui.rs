@@ -16,6 +16,7 @@ pub struct ArborUi {
     painting: TreePainting,
     new_window: NewProjectWindow,
     load_window: LoadWindow,
+    rebuild_window: RebuildWindow,
     backend_panel: BackendPanel,
     name_editor: NameEditor,
     value_editor: ValueEditor,
@@ -30,6 +31,7 @@ impl Default for ArborUi {
             painting: Default::default(),
             new_window: Default::default(),
             load_window: Default::default(),
+            rebuild_window: Default::default(),
             backend_panel: Default::default(),
             name_editor: Default::default(),
             value_editor: Default::default(),
@@ -67,6 +69,13 @@ impl epi::App for ArborUi {
                 self.load_window.ui_content(&mut self.state, ui);
             });
 
+        let mut rebuild_window_open = self.rebuild_window.open;
+        egui::Window::new("Rebuild Project")
+            .open(&mut rebuild_window_open)
+            .show(ctx, |ui| {
+                self.rebuild_window.ui_content(&mut self.state, ui);
+            });
+
         let mut backend_panel_open = self.backend_panel.open;
         egui::Window::new("BackendPanel")
             .open(&mut backend_panel_open)
@@ -80,6 +89,7 @@ impl epi::App for ArborUi {
         egui::TopPanel::top("Menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 egui::menu::menu(ui, "File", |ui| {
+                    ui.separator();
                     if ui.button("new").clicked() {
                         self.new_window.open = true;
                     }
@@ -92,6 +102,9 @@ impl epi::App for ArborUi {
                             Ok(_) => {}
                             Err(e) => println!("{}", e),
                         }
+                    }
+                    if ui.button("rebuild").clicked() {
+                        self.rebuild_window.open = true;
                     }
                     if ui.button("perf").clicked() {
                         self.backend_panel.open = true;
@@ -141,9 +154,6 @@ impl epi::App for ArborUi {
                 self.edge_editor.ui_content(&mut self.state, ui);
             });
         });
-
-        let bincode = bincode::serialize(self).unwrap();
-        println!("{:#?}", bincode.len());
     }
 }
 
@@ -182,16 +192,13 @@ impl LoadWindow {
                 Ok(_) => {
                     // if ok, close the load project window
                     self.open = false;
-                    // Check if tree has positions, if not, populate them with dummy values and
-                    // give the user a warning
-                    self.was_none = false;
-                    state.act.tree.node_weights_mut().for_each(|n| {
-                        if n.pos.is_none() {
-                            n.pos = Some(arbor_core::Position::new(0.3, 0.3));
-                            self.was_none = true;
-                        }
+                    // Check if tree has many default positions, if so, give the user a warning
+                    let zeroed_count = state.act.tree.node_weights_mut().fold(0, |sum, n| {
+                        sum + (n.pos.x == 0.0 && n.pos.y == 0.0) as usize
                     });
-                    if self.was_none {
+                    // NOTE: Right now show the warning if more than 1 node is at zero, maybe
+                    // increase this threshold if using a really large tree?
+                    if zeroed_count > 1 {
                         let mut temp_bool = self.was_none;
                         egui::Window::new("Warning")
                             .open(&mut temp_bool)
@@ -259,6 +266,41 @@ impl NewProjectWindow {
                 // if result, new project was created and we can close the window
                 Ok(_) => self.open = false,
                 // if error, a new project isn't present yet, don't close yet
+                Err(e) => {
+                    println!("{}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Window for Rebuilding the current tree
+///
+/// Cleans up unused text, reorders nodes and edges for optimal access
+#[derive(Serialize, Deserialize)]
+pub struct RebuildWindow {
+    open: bool,
+}
+
+impl Default for RebuildWindow {
+    fn default() -> Self {
+        Self { open: false }
+    }
+}
+
+impl RebuildWindow {
+    /// Content for New Project Window. Returns if flag if a new project has been loaded into the
+    /// editor state by arbor_core
+    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) {
+        ui.label(concat!(
+            "This recreates the current dialogue tree, removing unused text and reordering nodes",
+            "and edges for optimal access. Rebuilding the tree clears the entire undo/redo history"
+        ));
+        ui.separator();
+        if ui.button("rebuild current project").clicked() {
+            let res = arbor_core::cmd::Rebuild::new().execute(state);
+            match res {
+                Ok(_) => self.open = false,
                 Err(e) => {
                     println!("{}", e);
                 }
@@ -384,12 +426,13 @@ impl NodeEditor {
                     .act
                     .name_table
                     .get(self.name_buf.as_str())
-                    .unwrap_or(&"".to_string()),
+                    .unwrap_or(&arbor_core::NameString::new())
+                    .to_string(),
                 self.name_buf.clone(),
                 |ui| {
                     // Name must be in key form when selecting,
                     for name in state.act.name_table.keys() {
-                        ui.selectable_value(&mut self.name_buf, name.clone(), name);
+                        ui.selectable_value(&mut self.name_buf, name.to_string(), name.as_str());
                     }
                 },
             );
@@ -412,7 +455,7 @@ impl NodeEditor {
                 match res {
                     Ok(node_index) => {
                         state.act.tree[NodeIndex::new(node_index)].pos =
-                            Some(arbor_core::Position::new(0.3, 0.3))
+                            arbor_core::Position::new(0.3, 0.3)
                     }
                     Err(e) => println!("{}", e),
                 }
@@ -568,8 +611,8 @@ impl TreePainting {
             let source_node_index = edge_ref.source();
             let target_node_index = edge_ref.target();
 
-            let source_pos = data.tree[source_node_index].pos.unwrap();
-            let target_pos = data.tree[target_node_index].pos.unwrap();
+            let source_pos = data.tree[source_node_index].pos;
+            let target_pos = data.tree[target_node_index].pos;
 
             let source_coord = to_screen * self.transform(egui::pos2(source_pos.x, source_pos.y));
             let target_coord = to_screen * self.transform(egui::pos2(target_pos.x, target_pos.y));
@@ -612,13 +655,17 @@ impl TreePainting {
 
         // loop over the nodes, draw them, and update their location if being dragged
         for n in data.tree.node_weights_mut() {
-            let pos = n.pos.unwrap();
+            let pos = n.pos;
 
             let p = egui::pos2(pos.x, pos.y);
             let coord = to_screen * self.transform(p);
             let rect = Rect::from_center_size(coord, egui::vec2(self.node_size, self.node_size));
-            let resp = ui.interact(rect, egui::Id::new(n.hash), egui::Sense::click_and_drag());
-            let node_slice = &data.text[n[0]..n[1]];
+            let resp = ui.interact(
+                rect,
+                egui::Id::new(n.section.hash),
+                egui::Sense::click_and_drag(),
+            );
+            let node_slice = &data.text[n.section[0]..n.section[1]];
             let _res = cmd::util::parse_node(
                 node_slice,
                 &data.name_table,
@@ -627,7 +674,7 @@ impl TreePainting {
             );
 
             if response.rect.contains(coord) && self.zoom > 0.3 {
-                Self::node_text_popup(&resp.ctx, n.hash, coord, |ui| {
+                Self::node_text_popup(&resp.ctx, n.section.hash, coord, |ui| {
                     ui.vertical(|ui| {
                         ui.label(self.hover_name_buf.as_str());
                         ui.label("------");
@@ -639,7 +686,7 @@ impl TreePainting {
             // move node
             if let Some(pointer_pos) = resp.interact_pointer_pos() {
                 let new_pos = self.reform(from_screen * pointer_pos);
-                n.pos = Some(arbor_core::Position::new(new_pos.x, new_pos.y));
+                n.pos = arbor_core::Position::new(new_pos.x, new_pos.y);
             }
             painter.add(egui::Shape::circle_filled(
                 coord,
