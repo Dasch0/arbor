@@ -28,7 +28,6 @@ pub static TOKEN_SEP: &str = "::";
 pub const KEY_MAX_LEN: usize = 8;
 pub const NAME_MAX_LEN: usize = 32;
 
-
 /// Stack allocated string with max length suitable for keys
 type KeyString = staticvec::StaticString<KEY_MAX_LEN>;
 
@@ -40,6 +39,15 @@ type NameString = staticvec::StaticString<NAME_MAX_LEN>;
 pub struct Position {
     pub x: f32,
     pub y: f32,
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+        }
+    }
 }
 
 /// Struct representing a section of text in a rope. This section contains a start and end index,
@@ -70,7 +78,15 @@ impl std::ops::IndexMut<usize> for Section {
 /// typedef representing the petgraph::Graph type used in dialogue trees. The nodes are made up of
 /// Sections, which define slices of a text buffer. The edges are Choice structs, which define a
 /// Section as well as data regarding different action types a player may perform
-pub type Tree = petgraph::graph::Graph<Section, Choice>;
+pub type Tree = petgraph::graph::Graph<Dialogue, Choice>;
+
+/// typedef representing the hashmap type used to store names in dialogue trees. These may be
+/// substituted into the text before displaying, or updated by choices in the tree.
+pub type NameTable = HashMap<KeyString, NameString, BuildHasherDefault<seahash::SeaHasher>>;
+
+/// typedef representing the hashmap type used to store values in dialogue trees. These are used as
+/// requirements or effects from player choices.
+pub type ValTable = HashMap<KeyString, u32, BuildHasherDefault<seahash::SeaHasher>>;
 
 /// Top level data structure for storing a dialogue tree
 ///
@@ -82,8 +98,8 @@ pub struct DialogueTreeData {
     pub uid: usize,
     pub tree: Tree,
     pub text: String,
-    pub name_table: HashMap<KeyString, NameString, BuildHasherDefault<seahash::SeaHasher>>,
-    pub val_table: HashMap<KeyString, NameString, BuildHasherDefault<seahash::SeaHasher>>,
+    pub name_table: NameTable, 
+    pub val_table: ValTable,
     pub name: String,
 }
 
@@ -91,7 +107,7 @@ impl DialogueTreeData {
     pub fn default() -> Self {
         DialogueTreeData {
             uid: cmd::util::gen_uid(),
-            tree: graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
+            tree: graph::DiGraph::<Dialogue, Choice>::with_capacity(512, 2048),
             text: String::with_capacity(8192),
             name_table: HashMap::default(),
             val_table: HashMap::default(),
@@ -138,23 +154,28 @@ pub struct Choice {
 
 /// Struct for storing the information for a line of dialogue. Stored in the nodes of a dialogue
 /// tree
+#[derive(new, Serialize, Deserialize, Clone, Copy)]
 pub struct Dialogue {
     pub section: Section,
     pub pos: Position,
 }
 
 /// Represents a requirement to access a choice.
+///
+/// Name length strings are stored as a heap allocated String rather than a static NameString as 
+/// that would bloat enum size by 32 bytes, when Cmp will rarely be used compared to val based 
+/// requirements
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ReqKind {
     /// No requirement
     No,
     /// Must be greater than num
-    GT(String, u32),
+    GT(KeyString, u32),
     /// Must be less than num
-    LT(String, u32),
+    LT(KeyString, u32),
     /// Must be equal to num
-    EQ(String, u32),
-    Cmp(String, String),
+    EQ(KeyString, u32),
+    Cmp(KeyString, String),
 }
 
 impl std::str::FromStr for ReqKind {
@@ -178,28 +199,32 @@ impl std::str::FromStr for ReqKind {
         anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)?.is_empty());
         // second item should be number or string, wait to check validity
         let val = split.next().ok_or(cmd::Error::Generic)?;
-        // third item should be key
-        let key: &str = split.next().ok_or(cmd::Error::Generic)?;
+        // third item should be key, convert to keystring and check length
+        let key: KeyString = KeyString::try_from_str(split.next().ok_or(cmd::Error::Generic)?)?;
         // fourth item should be Enum type, build it!, and also try to resolve the val
         match split.next().ok_or(cmd::Error::Generic)? {
-            "GT" => Ok(ReqKind::GT(key.to_string(), val.parse::<u32>()?)),
-            "LT" => Ok(ReqKind::LT(key.to_string(), val.parse::<u32>()?)),
-            "EQ" => Ok(ReqKind::EQ(key.to_string(), val.parse::<u32>()?)),
-            "Cmp" => Ok(ReqKind::Cmp(key.to_string(), val.to_string())),
+            "GT" => Ok(ReqKind::GT(key, val.parse::<u32>()?)),
+            "LT" => Ok(ReqKind::LT(key, val.parse::<u32>()?)),
+            "EQ" => Ok(ReqKind::EQ(key, val.parse::<u32>()?)),
+            "Cmp" => Ok(ReqKind::Cmp(key, val.to_string())),
             _ => Err(cmd::Error::Generic.into()),
         }
     }
 }
 
 /// Represents an effect that occurs when a choice is made.
+///
+/// Name length strings are stored as a heap allocated String rather than a static NameString as 
+/// that would bloat enum size by 32 bytes, when Cmp will rarely be used compared to val based 
+/// requirements
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum EffectKind {
     /// No effect
     No,
-    Add(String, u32),
-    Sub(String, u32),
-    Set(String, u32),
-    Assign(String, String),
+    Add(KeyString, u32),
+    Sub(KeyString, u32),
+    Set(KeyString, u32),
+    Assign(KeyString, String),
 }
 
 impl std::str::FromStr for EffectKind {
@@ -223,14 +248,14 @@ impl std::str::FromStr for EffectKind {
         anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)?.is_empty());
         // second item should be number or string, don't check for validity yet
         let val = split.next().ok_or(cmd::Error::Generic)?;
-        // third item should be key
-        let key: &str = split.next().ok_or(cmd::Error::Generic)?;
+        // third item should be key, convert to KeyString and check length
+        let key: KeyString = KeyString::try_from_str(split.next().ok_or(cmd::Error::Generic)?)?;
         // fourth item should be Enum type, build it!
         match split.next().ok_or(cmd::Error::Generic)? {
-            "Add" => Ok(EffectKind::Add(key.to_string(), val.parse::<u32>()?)),
-            "Sub" => Ok(EffectKind::Sub(key.to_string(), val.parse::<u32>()?)),
-            "Set" => Ok(EffectKind::Set(key.to_string(), val.parse::<u32>()?)),
-            "Assign" => Ok(EffectKind::Assign(key.to_string(), val.to_string())),
+            "Add" => Ok(EffectKind::Add(key, val.parse::<u32>()?)),
+            "Sub" => Ok(EffectKind::Sub(key, val.parse::<u32>()?)),
+            "Set" => Ok(EffectKind::Set(key, val.parse::<u32>()?)),
+            "Assign" => Ok(EffectKind::Assign(key, val.to_string())),
             _ => Err(cmd::Error::Generic.into()),
         }
     }
@@ -344,7 +369,7 @@ pub mod cmd {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 let new_project = DialogueTreeData::new(
                     util::gen_uid(),
-                    graph::DiGraph::<Section, Choice>::with_capacity(512, 2048),
+                    graph::DiGraph::<Dialogue, Choice>::with_capacity(512, 2048),
                     String::with_capacity(8192),
                     HashMap::default(),
                     HashMap::default(),
@@ -380,7 +405,7 @@ pub mod cmd {
                 state
                     .act
                     .name_table
-                    .get(&self.speaker)
+                    .get(self.speaker.as_str())
                     .ok_or(cmd::Error::NameNotExists)?;
                 let start = state.act.text.len();
                 state.act.text.push_str(&format!(
@@ -393,7 +418,7 @@ pub mod cmd {
                 let index = state
                     .act
                     .tree
-                    .add_node(Section::new([start, end], hash, None));
+                    .add_node(Dialogue::new(Section::new([start, end], hash), Position::new(0.0, 0.0)));
                 Ok(index.index())
             }
         }
@@ -448,7 +473,7 @@ pub mod cmd {
                     NodeIndex::from(self.start_index),
                     NodeIndex::from(self.end_index),
                     Choice::new(
-                        Section::new([start, end], hash, None),
+                        Section::new([start, end], hash),
                         self.requirement.clone().unwrap_or(ReqKind::No),
                         self.effect.clone().unwrap_or(EffectKind::No),
                     ),
@@ -464,21 +489,26 @@ pub mod cmd {
         #[derive(new, StructOpt, Debug)]
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Name {
-            /// The keyword to reference the name with in the text
+            /// The keyword to reference the name with in the text. Maximum length of 8 characters
             key: String,
-            /// The name to store, able be updated by player actions
+            /// The name to store, able be updated by player actions. Maximum length of 32
+            /// characters
             name: String,
         }
         impl Executable for Name {
             /// New Name
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                // check that the key and value are valid lengths
+                let static_key: KeyString = KeyString::try_from_str(self.key.as_str())?;
+                let static_name: NameString = NameString::try_from_str(self.name.as_str())?;
+
                 // Check that the key doesn't already exist, since we want new to not overwrite
                 // values. The user can use edit commands for that
-                if state.act.name_table.get(&self.key).is_none() {
+                if state.act.name_table.get(self.key.as_str()).is_none() {
                     state
                         .act
                         .name_table
-                        .insert(self.key.clone(), self.name.clone());
+                        .insert(static_key, static_name);
                     Ok(0)
                 } else {
                     Err(cmd::Error::NameExists.into())
@@ -493,7 +523,8 @@ pub mod cmd {
         #[derive(new, StructOpt, Debug)]
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Val {
-            /// The keyword to reference the value with in the dialogue tree
+            /// The keyword to reference the value with in the dialogue tree. Max length of 8
+            /// characters
             key: String,
             /// Value to store, able be updated by player actions
             value: u32,
@@ -501,10 +532,13 @@ pub mod cmd {
         impl Executable for Val {
             /// New Name
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                // Check that the key is of a valid length
+                let static_key: KeyString = KeyString::try_from_str(self.key.as_str())?;
+
                 // Check that the key doesn't already exist, since we want new to not overwrite
                 // values. The user can use edit commands for that
-                if state.act.val_table.get(&self.key).is_none() {
-                    state.act.val_table.insert(self.key.clone(), self.value);
+                if state.act.val_table.get(&static_key).is_none() {
+                    state.act.val_table.insert(static_key, self.value);
                     Ok(self.value as usize)
                 } else {
                     Err(cmd::Error::ValExists.into())
@@ -558,7 +592,7 @@ pub mod cmd {
                     .ok_or(cmd::Error::InvalidNodeIndex)?;
                 // Since editing, recalculate hash
                 let hash = hash(state.act.text[start..end].as_bytes());
-                *node = Section::new([start, end], hash, None);
+                *node = Dialogue::new(Section::new([start, end], hash), Position::default());
                 Ok(node_index.index())
             }
         }
@@ -613,7 +647,7 @@ pub mod cmd {
                 }
 
                 let new_weight = Choice::new(
-                    Section::new([start, end], hash, None),
+                    Section::new([start, end], hash),
                     self.requirement.clone().unwrap_or(ReqKind::No),
                     self.effect.clone().unwrap_or(EffectKind::No),
                 );
@@ -646,21 +680,24 @@ pub mod cmd {
         pub struct Name {
             /// The keyword to reference the name with in the text
             key: String,
-            /// Value to store to the name
-            value: String,
+            /// Value of the name to store
+            name: String,
         }
 
         impl Executable for Name {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                // Check that key and name are valid length
+                let static_key: KeyString = KeyString::try_from_str(self.key.as_str())?;
+                let static_name: NameString = NameString::try_from_str(self.name.as_str())?;
                 // Check that the key already exists, and make sure not to accidently add a new key
                 // to the table. The user can use new commands for that
-                if state.act.name_table.get(&self.key.as_bytes()[0..8]).is_some() {
+                if state.act.name_table.get(&static_key).is_some() {
                     let name = state
                         .act
                         .name_table
-                        .get_mut(&self.key)
+                        .get_mut(&static_key)
                         .ok_or(cmd::Error::Generic)?;
-                    *name = self.value.clone();
+                    *name = static_name;
                     Ok(0)
                 } else {
                     Err(cmd::Error::NameNotExists.into())
@@ -683,13 +720,15 @@ pub mod cmd {
 
         impl Executable for Val {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                // Check that the key is of a valid length
+                let static_key: KeyString = KeyString::try_from_str(self.key.as_str())?;
                 // Check that the key already exists, and make sure not to accidently add a new key
                 // to the table. The user can use new commands for that
-                if state.act.name_table.get(&self.key.as_str()).is_some() {
+                if state.act.name_table.get(&static_key).is_some() {
                     let name = state
                         .act
                         .val_table
-                        .get_mut(&self.key)
+                        .get_mut(&static_key)
                         .ok_or(cmd::Error::Generic)?;
                     *name = self.value;
                     Ok(self.value as usize)
@@ -731,7 +770,7 @@ pub mod cmd {
                     .tree
                     .remove_node(node_index)
                     .ok_or(cmd::Error::InvalidNodeIndex)?;
-                Ok(removed_weight.hash as usize)
+                Ok(removed_weight.section.hash as usize)
             }
         }
 
@@ -999,19 +1038,19 @@ pub mod cmd {
             let mut text_buf = String::with_capacity(256);
             let node_iter = state.act.tree.node_references();
 
-            for n in node_iter {
-                let text = &state.act.text[n.1[0]..n.1[1]];
+            for (idx, n) in node_iter {
+                let text = &state.act.text[n.section[0]..n.section[1]];
                 util::parse_node(text, &state.act.name_table, &mut name_buf, &mut text_buf)?;
                 state.scratchpad.push_str(&format!(
                     "node {}: {} says \"{}\"\r\n",
-                    n.0.index(),
+                    idx.index(),
                     name_buf,
                     text_buf
                 ));
                 for e in state
                     .act
                     .tree
-                    .edges_directed(n.0, petgraph::Direction::Outgoing)
+                    .edges_directed(idx, petgraph::Direction::Outgoing)
                 {
                     let choice = e.weight();
                     util::parse_edge(
@@ -1064,7 +1103,7 @@ pub mod cmd {
         /// Both the name and text buf are cleared at the beginning of this method.
         pub fn parse_node(
             text: &str,
-            name_table: &HashMap<String, String>,
+            name_table: &NameTable,
             name_buf: &mut String,
             text_buf: &mut String,
         ) -> Result<()> {
@@ -1104,7 +1143,7 @@ pub mod cmd {
 
         /// Same routine as parse node, except the results are not actually written to a
         /// thread. This is used for validating that the section of text is valid
-        pub fn validate_node(text: &str, name_table: &HashMap<String, String>) -> Result<()> {
+        pub fn validate_node(text: &str, name_table: &NameTable) -> Result<()> {
             let mut text_iter = text.split(TOKEN_SEP).enumerate();
             text_iter.next(); // discard first empty string
             let speaker_key = text_iter.next().ok_or(cmd::Error::EdgeParse)?.1;
@@ -1131,7 +1170,7 @@ pub mod cmd {
         /// Both the name and text buf are cleared at the beginning of this method
         pub fn parse_edge(
             text: &str,
-            name_table: &HashMap<String, String>,
+            name_table: &NameTable,
             text_buf: &mut String,
         ) -> Result<()> {
             // Implementation notes
@@ -1155,13 +1194,12 @@ pub mod cmd {
                     Ok(())
                 }
             })?;
-
             Ok(())
         }
 
         /// Same routine as parse_edge, but does not write to an output string buffer. Useful for
         /// validating a section of text in an edge
-        pub fn validate_edge(text: &str, name_table: &HashMap<String, String>) -> Result<()> {
+        pub fn validate_edge(text: &str, name_table: &NameTable) -> Result<()> {
             let mut text_iter = text.split(TOKEN_SEP).enumerate();
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
                 if (i & 0x1) == 0 {
@@ -1220,7 +1258,7 @@ pub mod cmd {
             while let Some(node_index) = dfs.next(&tree) {
                 // Rebuild node
                 let node = tree[node_index];
-                let slice: &str = &text[node[0]..node[1]];
+                let slice: &str = &text[node.section[0]..node.section[1]];
                 let start = new_text.len();
                 new_text.push_str(slice);
                 let end = new_text.len();
@@ -1229,8 +1267,8 @@ pub mod cmd {
                     .ok_or(cmd::Error::InvalidNodeIndex)?;
                 // verify new and old hash match
                 let new_hash = hash(new_text[start..end].as_bytes());
-                assert!(node.hash == new_hash);
-                *new_node = Section::new([start, end], new_hash, node.pos);
+                assert!(node.section.hash == new_hash);
+                *new_node = Dialogue::new(Section::new([start, end], new_hash), node.pos);
 
                 // Rebuild all edges sourced from this node
                 let edge_iter = tree.edges_directed(node_index, petgraph::Direction::Outgoing);
@@ -1254,7 +1292,7 @@ pub mod cmd {
                     // verify new and old hash match
                     let new_hash = hash(new_text[start..end].as_bytes());
                     assert!(edge.section.hash == new_hash);
-                    new_edge.section = Section::new([start, end], new_hash, edge.section.pos);
+                    new_edge.section = Section::new([start, end], new_hash);
                 }
             }
 
@@ -1267,8 +1305,8 @@ pub mod cmd {
         /// is present in the val_table for u32 types, and the name_table for String types
         pub fn validate_requirement(
             req: &ReqKind,
-            name_table: &HashMap<String, String>,
-            val_table: &HashMap<String, u32>,
+            name_table: &NameTable,
+            val_table: &ValTable,
         ) -> Result<()> {
             // this match will stop compiling any time a new reqKind is added
             match req {
@@ -1295,8 +1333,8 @@ pub mod cmd {
         /// is present in the val_table for u32 types, and the name_table for String types
         pub fn validate_effect(
             effect: &EffectKind,
-            name_table: &HashMap<String, String>,
-            val_table: &HashMap<String, u32>,
+            name_table: &NameTable,
+            val_table: &ValTable,
         ) -> Result<()> {
             // this match will stop compiling any time a new EffectKind is added
             // NOTE: remember, if val is a u32, check the val_table, if val is a String, check the
@@ -1327,14 +1365,14 @@ pub mod cmd {
         pub fn validate_tree(data: &DialogueTreeData) -> Result<()> {
             // check nodes first
             let nodes_iter = data.tree.raw_nodes().par_iter();
-            nodes_iter.try_for_each(|node: &petgraph::graph::Node<Section>| -> Result<()> {
+            nodes_iter.try_for_each(|node: &petgraph::graph::Node<Dialogue>| -> Result<()> {
                 // try to grab the text section as a slice, and return an error if the get() failed
                 let slice = data.text[..]
-                    .get(node.weight[0]..node.weight[1])
+                    .get(node.weight.section[0]..node.weight.section[1])
                     .ok_or(cmd::Error::InvalidSection)?;
                 // if the slice was successful, check its hash
                 anyhow::ensure!(
-                    seahash::hash(slice.as_bytes()) == node.weight.hash,
+                    seahash::hash(slice.as_bytes()) == node.weight.section.hash,
                     cmd::Error::InvalidHash
                 );
                 // Check that the section of text parses successfully (all names present in the
@@ -1421,7 +1459,7 @@ mod tests {
         let expected_list = concat!(
             "node 0: Behemoth says \"Well, who knows, who knows\"\r\n",
             "--> edge 0 to node 1: \"Dostoevsky's dead\"\r\n",
-            "    requirements: LT(\"rus_lit\", 51), effects: Sub(\"rus_lit\", 1)\r\n",
+            "    requirements: LT(StaticString { array: \"rus_lit\", size: 7 }, 51), effects: Sub(StaticString { array: \"rus_lit\", size: 7 }, 1)\r\n",
             "node 1: Behemoth says \"'I protest!' Behemoth exclaimed hotly. 'Dostoevsky is immortal'\"\r\n",
         );
         assert_eq!(state.scratchpad, expected_list);
@@ -1454,12 +1492,12 @@ mod tests {
     // TODO: move to criterion
     /// Benchmark node parsing worst case, many substitutions and improperly sized buffer
     fn stress_parse_node() {
-        let mut name_table = HashMap::<String, String>::new();
-        name_table.insert("Elle".to_string(), "Amberson".to_string());
-        name_table.insert("Patrick".to_string(), "Breakforest".to_string());
-        name_table.insert("Anna".to_string(), "Catmire".to_string());
-        name_table.insert("Laura".to_string(), "Dagson".to_string());
-        name_table.insert("John".to_string(), "Elliot".to_string());
+        let mut name_table = NameTable::default();
+        name_table.insert(KeyString::from_str("Elle"), NameString::from_str("Amberson"));
+        name_table.insert(KeyString::from_str("Patrick"), NameString::from_str("Breakforest"));
+        name_table.insert(KeyString::from_str("Anna"), NameString::from_str("Catmire"));
+        name_table.insert(KeyString::from_str("Laura"), NameString::from_str("Dagson"));
+        name_table.insert(KeyString::from_str("John"), NameString::from_str("Elliot"));
 
         let text = "::Elle::xzunz::Anna::lxn ::Elle::cn::Patrick::o::Laura::sokxt::Patrick::eowln
         ::Patrick::::John::c::Patrick::iw qyyhr.jxhccpyvchze::Anna::ox hi::Laura::nlv::John::peh
@@ -1483,9 +1521,9 @@ mod tests {
     #[test]
     /// Benchmark standard node parsing case, few substitutions and pre-allocated buffer
     fn quick_parse_node() {
-        let mut name_table = HashMap::<String, String>::new();
-        name_table.insert("vamp".to_string(), "Dracula".to_string());
-        name_table.insert("king".to_string(), "King Laugh".to_string());
+        let mut name_table = NameTable::default();
+        name_table.insert(KeyString::from_str("vamp"), NameString::from_str("Dracula"));
+        name_table.insert(KeyString::from_str("king"), NameString::from_str("King Laugh"));
 
         let text = "::vamp::It is a strange world, a sad world, a world full of miseries, and woes, and 
         troubles. And yet when ::king:: come, he make them all dance to the tune he play. Bleeding hearts, 

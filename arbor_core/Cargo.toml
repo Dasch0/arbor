@@ -9,7 +9,7 @@ edition = "2018"
 [dependencies]
 rand = "0.8.3"
 rayon = "1.5.0"
-staticvec = { version = "0.10.6", features = ["serde"] }
+staticvec = { version = "0.10.6", features = ["serde_support"] }
 petgraph = { version = "0.5.1", features = ["serde-1"] }
 serde = { version = "1.0.125", features = ["derive"] }
 bincode = "1.3.2"
