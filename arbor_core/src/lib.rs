@@ -22,6 +22,61 @@ use thiserror::Error;
 // 2. Add more help messages and detail for error types
 // 3. Add logging
 
+// TODO: Undo
+// Need to store history of each action so that we can implement undo/redo
+//
+// Target flow for user is
+// 1. undo, undoes last action
+// 2. redo, redoes last action
+// 3. if undo('s) then edit, redo history is cleared,
+//
+// Thats a stack!
+//
+// Ok, so now... what are some common examples of actions to undo, and what would we need on hand
+// to store them. Keep in mind we will also have to keep the ability to redo
+//
+// 1. New node, need the name, text section, and pos (undo is free, redo needs this). Oh, also need
+//    the index, since we would need to make sure any edges that are undone/redone still apply to
+//    the correct node
+// 2. New edge, need the text, source/target, requirement and effect (with key/value for each)
+//
+// 3. Edit node, need node index, and what changed. How do we store this?
+//      a) Well, naive way is to jsut store everything from old and new node...This could get
+//      inefficient if, for instance, we are just moving nodes around, only position changes
+//
+// 4. Edit edge, Same situation as edit node, more wasteful though since req/effects take up 9
+//    bytes each
+//
+// 5. Remove node, same as new
+//
+// 6. Remove edge, same as new
+//
+// 7. Add/remove names and values, just store the kv/pair
+//
+// 8. Edit name/value, store the key and before/after value?
+//
+// That should cover it, potential memory usage is a little worrying, but way way better than the approach
+// with serializing anything.
+//
+// One last question, can we use the backup tree to lower memory usage anywhere?
+// 1. Well, we could have it store large state changes close together that would cause multiple
+//    edits on the stack
+//      a) How to decide this, and how to order it inline with the stack
+//          i.) could order it with the "SWAP" operator on the stack. That is 0 cost to add to a
+//          stack of events because it is reversable with no information
+//      b) What sort of large state changes could even happen?
+//          i.) user loads a large project (obvious case)
+//          ii.) user select/moves multiple nodes at once (UI can't do this, but it could)
+//          iii.) So this could be an "external undo" where large state changes implemented outside
+//          of the normal commands could still have undo functionality.
+//
+// Ok, so that sounds good, but how do we actually implement this stack of changes.
+//
+// Well first off, it has to be a circular buffer of some sort, because its got to eat its own tail
+// if we are going to remove old changes.
+//
+//
+
 pub static TREE_EXT: &str = ".tree";
 pub static BACKUP_EXT: &str = ".bkp";
 pub static TOKEN_SEP: &str = "::";
