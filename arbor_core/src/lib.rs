@@ -168,11 +168,11 @@ pub enum ReqKind {
     /// No requirement
     No,
     /// Must be greater than num
-    GT(KeyString, u32),
+    Greater(KeyString, u32),
     /// Must be less than num
-    LT(KeyString, u32),
+    Less(KeyString, u32),
     /// Must be equal to num
-    EQ(KeyString, u32),
+    Equal(KeyString, u32),
     Cmp(KeyString, String),
 }
 
@@ -211,9 +211,9 @@ impl std::str::FromStr for ReqKind {
 
         trace!("fourth item should be Enum type, build it!, and also try to resolve the val");
         match split.next().ok_or(cmd::Error::Generic)? {
-            "GT" => Ok(ReqKind::GT(key, val.parse::<u32>()?)),
-            "LT" => Ok(ReqKind::LT(key, val.parse::<u32>()?)),
-            "EQ" => Ok(ReqKind::EQ(key, val.parse::<u32>()?)),
+            "Greater" => Ok(ReqKind::Greater(key, val.parse::<u32>()?)),
+            "Less" => Ok(ReqKind::Less(key, val.parse::<u32>()?)),
+            "Equal" => Ok(ReqKind::Equal(key, val.parse::<u32>()?)),
             "Cmp" => Ok(ReqKind::Cmp(key, val.to_string())),
             _ => Err(cmd::Error::Generic.into()),
         }
@@ -868,9 +868,9 @@ pub mod cmd {
                     // this match will stop compiling any time a new reqKind is added
                     match &edge.weight.requirement {
                         ReqKind::No => Ok(()),
-                        ReqKind::GT(_, _) => Ok(()),
-                        ReqKind::LT(_, _) => Ok(()),
-                        ReqKind::EQ(_, _) => Ok(()),
+                        ReqKind::Greater(_, _) => Ok(()),
+                        ReqKind::Less(_, _) => Ok(()),
+                        ReqKind::Equal(_, _) => Ok(()),
                         ReqKind::Cmp(key, _) => {
                             if key.eq(self.key.as_str()) {
                                 Err(cmd::Error::NameInUse)
@@ -918,21 +918,21 @@ pub mod cmd {
                     // this match will stop compiling any time a new reqKind is added
                     match &edge.weight.requirement {
                         ReqKind::No => Ok(()),
-                        ReqKind::GT(key, _) => {
+                        ReqKind::Greater(key, _) => {
                             if key.eq(self.key.as_str()) {
                                 Err(cmd::Error::NameInUse)
                             } else {
                                 Ok(())
                             }
                         }
-                        ReqKind::LT(key, _) => {
+                        ReqKind::Less(key, _) => {
                             if key.eq(self.key.as_str()) {
                                 Err(cmd::Error::NameInUse)
                             } else {
                                 Ok(())
                             }
                         }
-                        ReqKind::EQ(key, _) => {
+                        ReqKind::Equal(key, _) => {
                             if key.eq(self.key.as_str()) {
                                 Err(cmd::Error::NameInUse)
                             } else {
@@ -1354,13 +1354,13 @@ pub mod cmd {
             // this match will stop compiling any time a new reqKind is added
             match req {
                 ReqKind::No => {}
-                ReqKind::GT(key, _val) => {
+                ReqKind::Greater(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
-                ReqKind::LT(key, _val) => {
+                ReqKind::Less(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
-                ReqKind::EQ(key, _val) => {
+                ReqKind::Equal(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
                 ReqKind::Cmp(key, _val) => {
@@ -1497,7 +1497,8 @@ mod tests {
         );
         run_cmd(&cmd_buf, &mut state).unwrap();
         cmd_buf.clear();
-        cmd_buf.push_str("new edge -r LT(rus_lit,51) -e Sub(rus_lit,1) 0 1 \"Dostoevsky's dead\"");
+        cmd_buf
+            .push_str("new edge -r Less(rus_lit,51) -e Sub(rus_lit,1) 0 1 \"Dostoevsky's dead\"");
         run_cmd(&cmd_buf, &mut state).unwrap();
         cmd_buf.clear();
 
@@ -1508,7 +1509,7 @@ mod tests {
         let expected_list = concat!(
             "node 0: Behemoth says \"Well, who knows, who knows\"\r\n",
             "--> edge 0 to node 1: \"Dostoevsky's dead\"\r\n",
-            "    requirements: LT(\"rus_lit\", 51), effects: Sub(\"rus_lit\", 1)\r\n",
+            "    requirements: Less(\"rus_lit\", 51), effects: Sub(\"rus_lit\", 1)\r\n",
             "node 1: Behemoth says \"'I protest!' Behemoth exclaimed hotly. 'Dostoevsky is immortal'\"\r\n",
         );
         assert_eq!(state.scratchpad, expected_list);
