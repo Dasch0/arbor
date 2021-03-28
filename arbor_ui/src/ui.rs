@@ -61,6 +61,7 @@ impl epi::App for ArborUi {
             .show(ctx, |ui| {
                 self.new_window.ui_content(&mut self.state, ui);
             });
+        self.new_window.open &= new_window_open;
 
         let mut load_window_open = self.load_window.open;
         egui::Window::new("Load Project")
@@ -68,6 +69,7 @@ impl epi::App for ArborUi {
             .show(ctx, |ui| {
                 self.load_window.ui_content(&mut self.state, ui);
             });
+        self.load_window.open &= load_window_open;
 
         let mut rebuild_window_open = self.rebuild_window.open;
         egui::Window::new("Rebuild Project")
@@ -75,6 +77,7 @@ impl epi::App for ArborUi {
             .show(ctx, |ui| {
                 self.rebuild_window.ui_content(&mut self.state, ui);
             });
+        self.rebuild_window.open &= rebuild_window_open;
 
         let mut backend_panel_open = self.backend_panel.open;
         egui::Window::new("BackendPanel")
@@ -83,6 +86,7 @@ impl epi::App for ArborUi {
                 self.backend_panel.update(ctx, frame);
                 self.backend_panel.ui(ui, frame);
             });
+        self.backend_panel.open &= backend_panel_open;
 
         // Draw rest of UI now that project status is sorted out
         //
