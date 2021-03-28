@@ -37,15 +37,15 @@ use thiserror::Error;
 //
 // 1. New node, need the name, text section, and pos (undo is free, redo needs this). Oh, also need
 //    the index, since we would need to make sure any edges that are undone/redone still apply to
-//    the correct node
-// 2. New edge, need the text, source/target, requirement and effect (with key/value for each)
+//    the correct node. 6 words
+// 2. New edge, need the text, source/target, requirement and effect (with key/value for each) 14 words
 //
 // 3. Edit node, need node index, and what changed. How do we store this?
 //      a) Well, naive way is to jsut store everything from old and new node...This could get
 //      inefficient if, for instance, we are just moving nodes around, only position changes
 //
-// 4. Edit edge, Same situation as edit node, more wasteful though since req/effects take up 9
-//    bytes each
+// 4. Edit edge, Same situation as edit node, more wasteful though since req/effects. 14 words
+//    could be split in two stages 
 //
 // 5. Remove node, same as new
 //
@@ -75,7 +75,7 @@ use thiserror::Error;
 // Well first off, it has to be a circular buffer of some sort, because its got to eat its own tail
 // if we are going to remove old changes.
 //
-//
+// 
 
 pub static TREE_EXT: &str = ".tree";
 pub static BACKUP_EXT: &str = ".bkp";
@@ -89,6 +89,12 @@ pub type KeyString = arrayvec::ArrayString<KEY_MAX_LEN>;
 
 /// Stack allocated string with max length suitable for keys
 pub type NameString = arrayvec::ArrayString<NAME_MAX_LEN>;
+
+//TODO: Undo
+
+pub enum ArborDiff {
+
+}
 
 /// Struct for storing the 2d position of a node. Used for graph visualization
 #[derive(new, Serialize, Deserialize, Clone, Copy)]
@@ -214,10 +220,6 @@ pub struct Dialogue {
 }
 
 /// Represents a requirement to access a choice.
-///
-/// Name length strings are stored as a heap allocated String rather than a static NameString as
-/// that would bloat enum size by 32 bytes, when Cmp will rarely be used compared to val based
-/// requirements
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ReqKind {
     /// No requirement
@@ -228,7 +230,7 @@ pub enum ReqKind {
     Less(KeyString, u32),
     /// Must be equal to num
     Equal(KeyString, u32),
-    Cmp(KeyString, String),
+    Cmp(KeyString, NameString),
 }
 
 impl std::str::FromStr for ReqKind {
@@ -1182,12 +1184,10 @@ pub mod cmd {
 
         /// Generate UID.
         ///
-        /// UID is a 128 bit unique identifier for the project. This is stored in the dialogue
+        /// UID is a 64 bit unique identifier for the project. This is stored in the dialogue
         /// tree, and is useful for associating other metadata or resources with the correct tree
         /// in the case that multiple files exist with the same name (likely if multiple users are
         /// sharing files)
-        ///
-        /// This UID is not secure, and does not need to be as it is just for ID purposes
         pub fn gen_uid() -> usize {
             rand::random::<usize>()
         }
