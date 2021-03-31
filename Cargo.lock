@@ -95,6 +95,7 @@ dependencies = [
  "rayon",
  "seahash",
  "serde",
+ "serde-diff",
  "shellwords",
  "simple_logger",
  "structopt",

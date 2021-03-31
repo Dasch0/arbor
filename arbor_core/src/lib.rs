@@ -9,6 +9,7 @@ pub use petgraph::*;
 use rayon::prelude::*;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
+use serde_diff::SerdeDiff;
 pub use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::io;
@@ -21,6 +22,20 @@ use thiserror::Error;
 // 1. More tests and benchmarks, focus on rebuild_tree
 // 2. Add more help messages and detail for error types
 // 3. Add logging
+
+// TODO: Targets for performance improvement
+// 1. SPEED: Change dialogue/choice text in cmd Structs (new/edit node/edge) to use something other than a
+//    heap allocated string. Right now string slices cannot be used with structopt, and each time a
+//    cmd struct is created a heap allocation happens. This isn't all that common, but it still
+//    incurs at least two unnessecary copies
+// 2. FILE SIZE: right now the dialogue tree contains a lot of data that isn't technically needed
+//    for just reading through the tree. Includes hashes, node positions. This could be optimized
+//    by exporting a minimal struct type of tree that doesn't use any of that stuff
+// 3. MEMORY: right now the DiffKind enum is super space inefficient. This means the undo/redo
+//    history deQue is mostly wasted space (around 75% of the buffer). This may be improved by
+//    first, minimizing the enum size for the edit node and edge edge diff events, and more
+//    intensely by serializing the diffs and pushing them to a packed buffer of u8's, but that
+//    introduces some validity considerations and serialization/deserialization overhead
 
 // TODO: Undo
 // Need to store history of each action so that we can implement undo/redo
@@ -45,7 +60,7 @@ use thiserror::Error;
 //      inefficient if, for instance, we are just moving nodes around, only position changes
 //
 // 4. Edit edge, Same situation as edit node, more wasteful though since req/effects. 14 words
-//    could be split in two stages 
+//    could be split in two stages
 //
 // 5. Remove node, same as new
 //
@@ -75,7 +90,7 @@ use thiserror::Error;
 // Well first off, it has to be a circular buffer of some sort, because its got to eat its own tail
 // if we are going to remove old changes.
 //
-// 
+//
 
 pub static TREE_EXT: &str = ".tree";
 pub static BACKUP_EXT: &str = ".bkp";
@@ -90,14 +105,8 @@ pub type KeyString = arrayvec::ArrayString<KEY_MAX_LEN>;
 /// Stack allocated string with max length suitable for keys
 pub type NameString = arrayvec::ArrayString<NAME_MAX_LEN>;
 
-//TODO: Undo
-
-pub enum ArborDiff {
-
-}
-
 /// Struct for storing the 2d position of a node. Used for graph visualization
-#[derive(new, Serialize, Deserialize, Clone, Copy)]
+#[derive(new, Serialize, Deserialize, SerdeDiff, Clone, Copy)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
@@ -113,7 +122,7 @@ impl Default for Position {
 /// stored in an array. The first element should always be smaller than the second. Additionally
 /// the hash of that text section is stored in order to validate that the section is valid
 //TODO: Is hash necessary for actually running the dialogue tree?
-#[derive(new, Serialize, Deserialize, Clone, Copy)]
+#[derive(new, Serialize, Deserialize, SerdeDiff, Clone, Copy)]
 pub struct Section {
     /// A start and end index to some section of text
     pub text: [usize; 2],
@@ -150,7 +159,7 @@ pub type ValTable = HashMap<KeyString, u32, BuildHasherDefault<seahash::SeaHashe
 /// Top level data structure for storing a dialogue tree
 ///
 /// This struct contains the tree representing the dialogue nodes and player actions connecting
-/// them, the rope which stores all text in a tightly packed manner, and a hashtable for storing
+/// them, the buffer which stores all text in a tightly packed manner, and hashtables for storing
 /// variables such as player names, conditionals, etc.
 #[derive(new, Serialize, Deserialize, Clone)]
 pub struct DialogueTreeData {
@@ -204,23 +213,25 @@ impl EditorState {
 }
 
 /// Struct storing the information for a player choice. Stored in the edges of a dialogue tree
-#[derive(new, Serialize, Deserialize, Clone)]
+#[derive(new, Serialize, Deserialize, SerdeDiff, Clone)]
 pub struct Choice {
     pub section: Section,
+    #[serde_diff(opaque)]
     pub requirement: ReqKind,
+    #[serde_diff(opaque)]
     pub effect: EffectKind,
 }
 
 /// Struct for storing the information for a line of dialogue. Stored in the nodes of a dialogue
 /// tree
-#[derive(new, Serialize, Deserialize, Clone, Copy)]
+#[derive(new, Serialize, Deserialize, SerdeDiff, Clone, Copy)]
 pub struct Dialogue {
     pub section: Section,
     pub pos: Position,
 }
 
 /// Represents a requirement to access a choice.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum ReqKind {
     /// No requirement
     No,
@@ -230,6 +241,7 @@ pub enum ReqKind {
     Less(KeyString, u32),
     /// Must be equal to num
     Equal(KeyString, u32),
+    /// Must match name string
     Cmp(KeyString, NameString),
 }
 
@@ -256,10 +268,15 @@ impl std::str::FromStr for ReqKind {
         trace!("Check that first item is ''");
         anyhow::ensure!(split.next().ok_or(cmd::Error::Generic)?.is_empty());
 
-        trace!("second item should be number or string, wait to check validity");
-        let val = split.next().ok_or(cmd::Error::Generic)?;
+        trace!(
+            "second item should be number or string, check for valid length, wait to check if int"
+        );
+        let val = match NameString::from(split.next().ok_or(cmd::Error::Generic)?) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.simplify()),
+        }?;
 
-        trace!("third item should be key, check that the key and name are of a valid length");
+        trace!("third item should be key, check that the key is a valid length");
         // match required due to lifetime limitations on CapacityError
         let key = match KeyString::from(split.next().ok_or(cmd::Error::Generic)?) {
             Ok(v) => Ok(v),
@@ -271,7 +288,7 @@ impl std::str::FromStr for ReqKind {
             "Greater" => Ok(ReqKind::Greater(key, val.parse::<u32>()?)),
             "Less" => Ok(ReqKind::Less(key, val.parse::<u32>()?)),
             "Equal" => Ok(ReqKind::Equal(key, val.parse::<u32>()?)),
-            "Cmp" => Ok(ReqKind::Cmp(key, val.to_string())),
+            "Cmp" => Ok(ReqKind::Cmp(key, val)),
             _ => Err(cmd::Error::Generic.into()),
         }
     }
@@ -282,7 +299,7 @@ impl std::str::FromStr for ReqKind {
 /// Name length strings are stored as a heap allocated String rather than a static NameString as
 /// that would bloat enum size by 32 bytes, when Cmp will rarely be used compared to val based
 /// requirements
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum EffectKind {
     /// No effect
     No,
@@ -572,29 +589,18 @@ pub mod cmd {
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Name {
             /// The keyword to reference the name with in the text. Maximum length of 8 characters
-            key: String,
+            key: KeyString,
             /// The name to store, able be updated by player actions. Maximum length of 32
             /// characters
-            name: String,
+            name: NameString,
         }
         impl Executable for Name {
             /// New Name
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
-                // Check that the key and name are of a valid length
-                // match required due to lifetime limitations on CapacityError
-                let static_key = match KeyString::from(self.key.as_str()) {
-                    Ok(v) => Ok(v),
-                    Err(e) => Err(e.simplify()),
-                }?;
-                let static_name = match NameString::from(self.name.as_str()) {
-                    Ok(v) => Ok(v),
-                    Err(e) => Err(e.simplify()),
-                }?;
-
                 // Check that the key doesn't already exist, since we want new to not overwrite
                 // values. The user can use edit commands for that
                 if state.act.name_table.get(self.key.as_str()).is_none() {
-                    state.act.name_table.insert(static_key, static_name);
+                    state.act.name_table.insert(self.key, self.name);
                     Ok(0)
                 } else {
                     Err(cmd::Error::NameExists.into())
@@ -611,7 +617,7 @@ pub mod cmd {
         pub struct Val {
             /// The keyword to reference the value with in the dialogue tree. Max length of 8
             /// characters
-            key: String,
+            key: KeyString,
             /// Value to store, able be updated by player actions
             value: u32,
         }
@@ -660,7 +666,7 @@ pub mod cmd {
             /// Id of the node to edit
             node_id: usize,
             /// The speaker for this node
-            speaker: String,
+            speaker: KeyString,
             /// The text or action for this node
             dialogue: String,
         }
@@ -687,9 +693,10 @@ pub mod cmd {
             }
         }
 
-        /// Edit the contents and connections of an edge in the dialogue tree
+        /// Edit the contents of an edge in the dialogue tree
         ///
-        /// Note: Editing the source or target node will change the edge index
+        /// The source and target node of an edge may not be edited, you must remove the edge and
+        /// then create a new one to do this.
         #[derive(new, StructOpt)]
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Edge {
@@ -714,7 +721,8 @@ pub mod cmd {
         impl Executable for Edge {
             /// Edit Edge
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
-                let edge_index = EdgeIndex::<u32>::new(self.edge_id);
+                // Edge index is mutable in case we delete/add new edge in case of re-targetting
+                let mut edge_index = EdgeIndex::<u32>::new(self.edge_id);
                 let start = state.act.text.len();
                 state.act.text.push_str(&self.text);
                 let end = state.act.text.len();
@@ -744,17 +752,24 @@ pub mod cmd {
 
                 // Handle deletion/recreation of edge if nodes need to change
                 if self.source_node_id.is_some() && self.target_node_id.is_some() {
-                    // None is unexpected at this point, but double check
                     let source_node_index =
                         NodeIndex::new(self.source_node_id.ok_or(cmd::Error::Generic)?);
                     let target_node_index =
                         NodeIndex::new(self.target_node_id.ok_or(cmd::Error::Generic)?);
 
                     state.act.tree.remove_edge(edge_index);
-                    state
+                    edge_index =
+                        state
+                            .act
+                            .tree
+                            .add_edge(source_node_index, target_node_index, new_weight);
+                } else {
+                    let edge_weight = state
                         .act
                         .tree
-                        .add_edge(source_node_index, target_node_index, new_weight);
+                        .edge_weight_mut(edge_index)
+                        .ok_or(cmd::Error::Generic)?;
+                    *edge_weight = new_weight;
                 }
 
                 Ok(edge_index.index())
@@ -769,9 +784,9 @@ pub mod cmd {
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Name {
             /// The keyword to reference the name with in the text
-            key: String,
+            key: KeyString,
             /// Value of the name to store
-            name: String,
+            name: NameString,
         }
 
         impl Executable for Name {
@@ -812,7 +827,7 @@ pub mod cmd {
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Val {
             /// The keyword to reference the name with in the text
-            key: String,
+            key: KeyString,
             /// Value to store to the name
             value: u32,
         }
@@ -906,7 +921,7 @@ pub mod cmd {
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Name {
             /// The keyword to reference the name with in the text
-            key: String,
+            key: KeyString,
         }
 
         impl Executable for Name {
@@ -964,7 +979,7 @@ pub mod cmd {
         #[structopt(setting = AppSettings::NoBinaryName)]
         pub struct Val {
             /// The keyword to reference the name with in the text
-            key: String,
+            key: KeyString,
         }
 
         impl Executable for Val {
@@ -1664,5 +1679,31 @@ mod tests {
 
         // bench part
         cmd::util::parse_node(text, &name_table, &mut name_buf, &mut buf).unwrap();
+    }
+
+    #[test]
+    fn serde_diff_minimal() {
+        use serde_diff::{Apply, Diff};
+        let dia = Dialogue::new(Section::new([0, 10], 1230489712), Position::new(0.0, 0.0));
+
+        // create dummy graph with a bunch of nodes
+        let mut old_graph = Tree::new();
+        for _ in 0..100 {
+            old_graph.add_node(dia.clone());
+        }
+
+        let test_vec: Vec<Dialogue> = vec![dia.clone(), dia.clone()];
+
+        let mut test_vec_new = test_vec.clone();
+        test_vec_new[0].section.hash += 1;
+
+        let undo_diff = bincode::serialize(&Diff::serializable(&test_vec_new, &test_vec)).unwrap();
+        let redo_diff = bincode::serialize(&Diff::serializable(&test_vec, &test_vec_new)).unwrap();
+
+        bincode::config()
+            .deserialize_seed(Apply::deserializable(&mut test_vec_new), &undo_diff)
+            .unwrap();
+
+        assert_eq!(test_vec_new[0].section.hash, test_vec[0].section.hash);
     }
 }
