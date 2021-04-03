@@ -345,8 +345,9 @@ impl NameEditor {
 
             if ui.button("new name").clicked() {
                 let res = cmd::new::Name::new(
-                    self.key_buf.drain(..).collect(),
-                    self.text_buf.drain(..).collect(),
+                    // FIXME: proper error handling for if keystring/namestring are too long
+                    KeyString::from(self.key_buf.as_str()).unwrap_or_default(),
+                    NameString::from(self.text_buf.as_str()).unwrap_or_default(),
                 )
                 .execute(state);
                 match res {
@@ -389,8 +390,11 @@ impl ValueEditor {
             ui.separator();
 
             if ui.button("new name").clicked() {
-                let res =
-                    cmd::new::Val::new(self.key_buf.drain(..).collect(), self.value).execute(state);
+                let res = cmd::new::Val::new(
+                    KeyString::from(self.key_buf.as_str()).unwrap_or_default(),
+                    self.value,
+                )
+                .execute(state);
                 match res {
                     Ok(_) => self.value = 0,
                     Err(e) => println!("{}", e),

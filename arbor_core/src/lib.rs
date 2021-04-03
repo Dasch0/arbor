@@ -4,13 +4,12 @@ use derive_new::*;
 use enum_dispatch::*;
 use log::{debug, info, trace};
 pub use petgraph::prelude::*;
-use petgraph::visit::IntoNodeReferences;
-pub use petgraph::*;
+pub use petgraph::stable_graph;
+pub use petgraph::visit::{IntoEdgeReferences, IntoNodeReferences};
 use rayon::prelude::*;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
-use serde_diff::SerdeDiff;
-pub use std::collections::HashMap;
+pub use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::io;
 use std::io::Write;
@@ -18,7 +17,11 @@ use structopt::clap::AppSettings;
 pub use structopt::StructOpt;
 use thiserror::Error;
 
-// TODO: Features
+// TODO: Future plans
+// 1. Replace petgraph with lower level graph implementation (petgraph limits us on diffing,
+//    parallel iteration, and general lack of lower level access to data structures)
+
+// TODO: Minor Features
 // 1. More tests and benchmarks, focus on rebuild_tree
 // 2. Add more help messages and detail for error types
 // 3. Add logging
@@ -37,61 +40,6 @@ use thiserror::Error;
 //    intensely by serializing the diffs and pushing them to a packed buffer of u8's, but that
 //    introduces some validity considerations and serialization/deserialization overhead
 
-// TODO: Undo
-// Need to store history of each action so that we can implement undo/redo
-//
-// Target flow for user is
-// 1. undo, undoes last action
-// 2. redo, redoes last action
-// 3. if undo('s) then edit, redo history is cleared,
-//
-// Thats a stack!
-//
-// Ok, so now... what are some common examples of actions to undo, and what would we need on hand
-// to store them. Keep in mind we will also have to keep the ability to redo
-//
-// 1. New node, need the name, text section, and pos (undo is free, redo needs this). Oh, also need
-//    the index, since we would need to make sure any edges that are undone/redone still apply to
-//    the correct node. 6 words
-// 2. New edge, need the text, source/target, requirement and effect (with key/value for each) 14 words
-//
-// 3. Edit node, need node index, and what changed. How do we store this?
-//      a) Well, naive way is to jsut store everything from old and new node...This could get
-//      inefficient if, for instance, we are just moving nodes around, only position changes
-//
-// 4. Edit edge, Same situation as edit node, more wasteful though since req/effects. 14 words
-//    could be split in two stages
-//
-// 5. Remove node, same as new
-//
-// 6. Remove edge, same as new
-//
-// 7. Add/remove names and values, just store the kv/pair
-//
-// 8. Edit name/value, store the key and before/after value?
-//
-// That should cover it, potential memory usage is a little worrying, but way way better than the approach
-// with serializing anything.
-//
-// One last question, can we use the backup tree to lower memory usage anywhere?
-// 1. Well, we could have it store large state changes close together that would cause multiple
-//    edits on the stack
-//      a) How to decide this, and how to order it inline with the stack
-//          i.) could order it with the "SWAP" operator on the stack. That is 0 cost to add to a
-//          stack of events because it is reversable with no information
-//      b) What sort of large state changes could even happen?
-//          i.) user loads a large project (obvious case)
-//          ii.) user select/moves multiple nodes at once (UI can't do this, but it could)
-//          iii.) So this could be an "external undo" where large state changes implemented outside
-//          of the normal commands could still have undo functionality.
-//
-// Ok, so that sounds good, but how do we actually implement this stack of changes.
-//
-// Well first off, it has to be a circular buffer of some sort, because its got to eat its own tail
-// if we are going to remove old changes.
-//
-//
-
 pub static TREE_EXT: &str = ".tree";
 pub static BACKUP_EXT: &str = ".bkp";
 pub static TOKEN_SEP: &str = "::";
@@ -106,7 +54,7 @@ pub type KeyString = arrayvec::ArrayString<KEY_MAX_LEN>;
 pub type NameString = arrayvec::ArrayString<NAME_MAX_LEN>;
 
 /// Struct for storing the 2d position of a node. Used for graph visualization
-#[derive(new, Serialize, Deserialize, SerdeDiff, Clone, Copy)]
+#[derive(new, Serialize, Deserialize, Clone, Copy)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
@@ -118,11 +66,40 @@ impl Default for Position {
     }
 }
 
+/// Diff of a position
+impl Diff for Position {
+    /// Position struct already hold field types used to diff
+    ///
+    /// diff is the arithmetic difference of x and y stored in the same format
+    type Diff = Position;
+
+    fn diff(&self, old: &Self) -> Self::Diff {
+        Self::Diff {
+            x: self.x - old.x,
+            y: self.y - old.y,
+        }
+    }
+
+    fn undo(&self, diff: &Self::Diff) -> Self {
+        Self {
+            x: self.x - diff.x,
+            y: self.y - diff.y,
+        }
+    }
+
+    fn redo(&self, diff: &Self::Diff) -> Self {
+        Self {
+            x: self.x + diff.x,
+            y: self.y + diff.y,
+        }
+    }
+}
+
 /// Struct representing a section of text in a rope. This section contains a start and end index,
 /// stored in an array. The first element should always be smaller than the second. Additionally
 /// the hash of that text section is stored in order to validate that the section is valid
 //TODO: Is hash necessary for actually running the dialogue tree?
-#[derive(new, Serialize, Deserialize, SerdeDiff, Clone, Copy)]
+#[derive(new, Serialize, Deserialize, Clone, Copy)]
 pub struct Section {
     /// A start and end index to some section of text
     pub text: [usize; 2],
@@ -143,16 +120,48 @@ impl std::ops::IndexMut<usize> for Section {
     }
 }
 
-/// typedef representing the petgraph::Graph type used in dialogue trees. The nodes are made up of
+/// Diff struct definition for dialogue nodes
+impl Diff for Section {
+    /// Section struct already hold field types used to diff
+    ///
+    /// diff of text is the arithmetic difference of start and end indices, stored in same format
+    /// as the text indicies themselves
+    ///
+    /// hash diff is the arithmetic difference of the hash stored in same format
+    type Diff = Section;
+
+    fn diff(&self, old: &Self) -> Self::Diff {
+        Self::Diff {
+            text: [self.text[0] - old.text[0], self.text[1] - old.text[1]],
+            hash: self.hash - old.hash,
+        }
+    }
+
+    fn undo(&self, diff: &Self::Diff) -> Self {
+        Self {
+            text: [self.text[0] - diff.text[0], self.text[1] - diff.text[1]],
+            hash: self.hash - diff.hash,
+        }
+    }
+
+    fn redo(&self, diff: &Self::Diff) -> Self {
+        Self {
+            text: [self.text[0] + diff.text[0], self.text[1] + diff.text[1]],
+            hash: self.hash + diff.hash,
+        }
+    }
+}
+
+/// Typedef representing the petgraph::Graph type used in dialogue trees. The nodes are made up of
 /// Sections, which define slices of a text buffer. The edges are Choice structs, which define a
 /// Section as well as data regarding different action types a player may perform
-pub type Tree = petgraph::graph::Graph<Dialogue, Choice>;
+pub type Tree = petgraph::stable_graph::StableGraph<Dialogue, Choice>;
 
-/// typedef representing the hashmap type used to store names in dialogue trees. These may be
+/// Typedef representing the hashmap type used to store names in dialogue trees. These may be
 /// substituted into the text before displaying, or updated by choices in the tree.
 pub type NameTable = HashMap<KeyString, NameString, BuildHasherDefault<seahash::SeaHasher>>;
 
-/// typedef representing the hashmap type used to store values in dialogue trees. These are used as
+/// Typedef representing the hashmap type used to store values in dialogue trees. These are used as
 /// requirements or effects from player choices.
 pub type ValTable = HashMap<KeyString, u32, BuildHasherDefault<seahash::SeaHasher>>;
 
@@ -175,13 +184,40 @@ impl DialogueTreeData {
     pub fn default() -> Self {
         DialogueTreeData {
             uid: cmd::util::gen_uid(),
-            tree: graph::DiGraph::<Dialogue, Choice>::with_capacity(512, 2048),
+            tree: Tree::with_capacity(512, 2048),
             text: String::with_capacity(8192),
             name_table: HashMap::default(),
             val_table: HashMap::default(),
             name: String::new(),
         }
     }
+}
+
+/// Trait for diffing the before and after state of a struct, used for undo/redo
+///
+/// This trait generally should only be implemented for Plain-old-data types without references or
+/// external dependencies.
+pub trait Diff {
+    /// Diff type, defined by implementor, contains any data needed for the diff
+    type Diff;
+    /// Perform a diff between two structs.
+    ///
+    /// The diff is applied starting *from* 'old' *to* self. For example, if struct
+    /// A is modified to A', then A'.diff(A) should yield the transformation A -> A'. This must
+    /// be consistent for implementors in order for 'undo' and 'redo' to function correctly.
+    fn diff(&self, old: &Self) -> Self::Diff;
+
+    /// uses a diff to undo changes to a struct.
+    ///
+    /// This undo must be applied in order, ie the passed diff must represent the most recent
+    /// change to the implementing struct in order to output expected results
+    fn undo(&self, diff: &Self::Diff) -> Self;
+
+    /// uses a diff to redo previously undone changes.
+    ///
+    /// The redo must be applied immediately after the undo with no other edits. If any edits
+    /// are made, the redo may be considered invalid and should be discarded.
+    fn redo(&self, diff: &Self::Diff) -> Self;
 }
 
 /// State information for an editor instance. Includes two copies of the dialogue tree (one active
@@ -191,6 +227,10 @@ pub struct EditorState {
     pub act: DialogueTreeData,
     pub backup: DialogueTreeData,
     pub scratchpad: String,
+    // TODO: FIXME: This is a very rough prototype of how to represent history. This is very memory
+    // and performance inefficient
+    #[serde(skip)]
+    pub history: VecDeque<Event>,
 }
 
 impl EditorState {
@@ -203,6 +243,7 @@ impl EditorState {
             act: data.clone(),
             backup: data,
             scratchpad: String::with_capacity(1000),
+            history: VecDeque::new(),
         }
     }
 
@@ -213,28 +254,84 @@ impl EditorState {
 }
 
 /// Struct storing the information for a player choice. Stored in the edges of a dialogue tree
-#[derive(new, Serialize, Deserialize, SerdeDiff, Clone)]
+#[derive(new, Serialize, Deserialize, Clone)]
 pub struct Choice {
     pub section: Section,
-    #[serde_diff(opaque)]
     pub requirement: ReqKind,
-    #[serde_diff(opaque)]
     pub effect: EffectKind,
+}
+
+pub struct ChoiceDiff {
+    section: Section,
+    requirement: ReqDiff,
+    effect: EffectDiff,
+}
+
+impl Diff for Choice {
+    type Diff = ChoiceDiff;
+
+    fn diff(&self, old: &Self) -> Self::Diff {
+        Self::Diff {
+            section: self.section.diff(&old.section),
+            requirement: self.requirement.diff(&old.requirement),
+            effect: self.effect.diff(&old.effect),
+        }
+    }
+
+    fn undo(&self, diff: &Self::Diff) -> Self {
+        Self {
+            section: self.section.undo(&diff.section),
+            requirement: self.requirement.undo(&diff.requirement),
+            effect: self.effect.undo(&diff.effect),
+        }
+    }
+
+    fn redo(&self, diff: &Self::Diff) -> Self {
+        Self {
+            section: self.section.redo(&diff.section),
+            requirement: self.requirement.redo(&diff.requirement),
+            effect: self.effect.redo(&diff.effect),
+        }
+    }
 }
 
 /// Struct for storing the information for a line of dialogue. Stored in the nodes of a dialogue
 /// tree
-#[derive(new, Serialize, Deserialize, SerdeDiff, Clone, Copy)]
+#[derive(new, Serialize, Deserialize, Clone, Copy)]
 pub struct Dialogue {
     pub section: Section,
     pub pos: Position,
 }
 
-/// Represents a requirement to access a choice.
+impl Diff for Dialogue {
+    type Diff = Dialogue;
+
+    fn diff(&self, old: &Self) -> Self::Diff {
+        Self::Diff {
+            section: self.section.diff(&old.section),
+            pos: self.pos.diff(&old.pos),
+        }
+    }
+
+    fn undo(&self, diff: &Self::Diff) -> Self {
+        Self {
+            section: self.section.undo(&diff.section),
+            pos: self.pos.undo(&diff.pos),
+        }
+    }
+
+    fn redo(&self, diff: &Self::Diff) -> Self {
+        Self {
+            section: self.section.redo(&diff.section),
+            pos: self.pos.redo(&diff.pos),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum ReqKind {
     /// No requirement
-    No,
+    None,
     /// Must be greater than num
     Greater(KeyString, u32),
     /// Must be less than num
@@ -291,6 +388,31 @@ impl std::str::FromStr for ReqKind {
             "Cmp" => Ok(ReqKind::Cmp(key, val)),
             _ => Err(cmd::Error::Generic.into()),
         }
+    }
+}
+
+/// Struct storing the data required to diff two ReqKind's for undo/redo
+pub struct ReqDiff {
+    old: ReqKind,
+    new: ReqKind,
+}
+
+impl Diff for ReqKind {
+    type Diff = ReqDiff;
+
+    fn diff(&self, old: &Self) -> Self::Diff {
+        Self::Diff {
+            old: old.clone(),
+            new: self.clone(),
+        }
+    }
+
+    fn undo(&self, diff: &Self::Diff) -> Self {
+        diff.old.clone()
+    }
+
+    fn redo(&self, diff: &Self::Diff) -> Self {
+        diff.new.clone()
     }
 }
 
@@ -351,6 +473,49 @@ impl std::str::FromStr for EffectKind {
             _ => Err(cmd::Error::Generic.into()),
         }
     }
+}
+
+/// Struct storing the data required to diff two EffectKind's for undo/redo
+pub struct EffectDiff {
+    old: EffectKind,
+    new: EffectKind,
+}
+
+impl Diff for EffectKind {
+    type Diff = EffectDiff;
+
+    fn diff(&self, old: &Self) -> Self::Diff {
+        Self::Diff {
+            old: old.clone(),
+            new: self.clone(),
+        }
+    }
+
+    fn undo(&self, diff: &Self::Diff) -> Self {
+        diff.old.clone()
+    }
+
+    fn redo(&self, diff: &Self::Diff) -> Self {
+        diff.new.clone()
+    }
+}
+
+/// enum of different event types that may be stored in the Editor history
+// TODO: FIXME: This is a very rough prototype of how to represent events. This is very memory
+// and performance inefficient
+pub enum Event {
+    NewNode(Dialogue),
+    NewEdge(Choice),
+    NewName(KeyString, NameString),
+    NewValue(KeyString, u32),
+    RemoveNode(Dialogue),
+    RemoveEdge(Choice),
+    RemoveName(KeyString, NameString),
+    RemoveValue(KeyString, u32),
+    EditNode(NodeIndex, <Dialogue as Diff>::Diff),
+    EditEdge(EdgeIndex, <Choice as Diff>::Diff),
+    EditName(KeyString, NameString, NameString),
+    EditValue(KeyString, u32, u32),
 }
 
 /// Top level module for all arbor commands. These commands rely heavily on the structopt
@@ -461,7 +626,7 @@ pub mod cmd {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 let new_project = DialogueTreeData::new(
                     util::gen_uid(),
-                    graph::DiGraph::<Dialogue, Choice>::with_capacity(512, 2048),
+                    Tree::with_capacity(512, 2048),
                     String::with_capacity(8192),
                     HashMap::default(),
                     HashMap::default(),
@@ -493,24 +658,36 @@ pub mod cmd {
         impl Executable for Node {
             /// New Node
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
-                // verify the speaker name is valid
+                info!("Creating new node");
+
+                trace!("verify the speaker name is valid");
                 state
                     .act
                     .name_table
                     .get(self.speaker.as_str())
                     .ok_or(cmd::Error::NameNotExists)?;
+
+                trace!("push dialogue to text buffer");
                 let start = state.act.text.len();
                 state.act.text.push_str(&format!(
                     "{}{}{}{}",
                     TOKEN_SEP, self.speaker, TOKEN_SEP, self.dialogue
                 ));
                 let end = state.act.text.len();
-                // Create hash for verifying the text section in the future
+                debug!("start: {}, end: {}", start, end);
+
+                trace!("compute hash from text section");
                 let hash = hash(&state.act.text[start..end].as_bytes());
-                let index = state.act.tree.add_node(Dialogue::new(
-                    Section::new([start, end], hash),
-                    Position::new(0.0, 0.0),
-                ));
+                debug!("hash {}", hash);
+
+                let dialogue =
+                    Dialogue::new(Section::new([start, end], hash), Position::new(0.0, 0.0));
+
+                trace!("add new node to tree");
+                let index = state.act.tree.add_node(dialogue);
+
+                trace!("push event to history queue");
+                state.history.push_front(Event::NewNode(dialogue));
                 Ok(index.index())
             }
         }
@@ -567,16 +744,21 @@ pub mod cmd {
                     )?;
                 }
 
+                let choice = Choice::new(
+                    Section::new([start, end], hash),
+                    self.requirement.clone().unwrap_or(ReqKind::None),
+                    self.effect.clone().unwrap_or(EffectKind::No),
+                );
+
                 trace!("Adding new edge to tree");
                 let edge_index = state.act.tree.add_edge(
                     NodeIndex::from(self.start_index),
                     NodeIndex::from(self.end_index),
-                    Choice::new(
-                        Section::new([start, end], hash),
-                        self.requirement.clone().unwrap_or(ReqKind::No),
-                        self.effect.clone().unwrap_or(EffectKind::No),
-                    ),
+                    choice.clone(),
                 );
+
+                trace!("push event to history queue");
+                state.history.push_front(Event::NewEdge(choice));
                 Ok(edge_index.index())
             }
         }
@@ -597,10 +779,17 @@ pub mod cmd {
         impl Executable for Name {
             /// New Name
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
-                // Check that the key doesn't already exist, since we want new to not overwrite
-                // values. The user can use edit commands for that
+                info!("Create new name");
+
+                trace!("check that key does not already exist");
                 if state.act.name_table.get(self.key.as_str()).is_none() {
+                    trace!("add key and name to table");
                     state.act.name_table.insert(self.key, self.name);
+
+                    trace!("push event to history queue");
+                    state
+                        .history
+                        .push_front(Event::NewName(self.key, self.name));
                     Ok(0)
                 } else {
                     Err(cmd::Error::NameExists.into())
@@ -622,19 +811,19 @@ pub mod cmd {
             value: u32,
         }
         impl Executable for Val {
-            /// New Name
+            /// New Val
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
-                // Check that the key is of a valid length
-                // match required due to lifetime limitations on CapacityError
-                let static_key = match KeyString::from(self.key.as_str()) {
-                    Ok(v) => Ok(v),
-                    Err(e) => Err(e.simplify()),
-                }?;
+                info!("Create new val");
 
-                // Check that the key doesn't already exist, since we want new to not overwrite
-                // values. The user can use edit commands for that
-                if state.act.val_table.get(&static_key).is_none() {
-                    state.act.val_table.insert(static_key, self.value);
+                trace!("check that key does not already exist");
+                if state.act.val_table.get(self.key.as_str()).is_none() {
+                    trace!("add key and val to table");
+                    state.act.val_table.insert(self.key, self.value);
+
+                    trace!("push event to history queue");
+                    state
+                        .history
+                        .push_front(Event::NewValue(self.key, self.value));
                     Ok(self.value as usize)
                 } else {
                     Err(cmd::Error::ValExists.into())
@@ -673,7 +862,11 @@ pub mod cmd {
         impl Executable for Node {
             /// Edit Node
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                info!("Edit node {}", self.node_id);
+
                 let node_index = NodeIndex::new(self.node_id);
+
+                trace!("push new dialogue to text buffer");
                 let start = state.act.text.len();
                 state.act.text.push_str(&format!(
                     "{}{}{}{}",
@@ -681,14 +874,26 @@ pub mod cmd {
                 ));
                 let end = state.act.text.len();
 
-                let node = state
+                trace!("get node weight from tree");
+                let old_node = state
                     .act
                     .tree
                     .node_weight_mut(node_index)
                     .ok_or(cmd::Error::InvalidNodeIndex)?;
-                // Since editing, recalculate hash
+
+                trace!("recalculate hash");
                 let hash = hash(state.act.text[start..end].as_bytes());
-                *node = Dialogue::new(Section::new([start, end], hash), Position::default());
+                debug!("hash {}", hash);
+
+                let new_node = Dialogue::new(Section::new([start, end], hash), old_node.pos);
+
+                trace!("push event to history queue");
+                state
+                    .history
+                    .push_front(Event::EditNode(node_index, new_node.diff(old_node)));
+
+                trace!("update node weight in tree");
+                *old_node = new_node;
                 Ok(node_index.index())
             }
         }
@@ -710,25 +915,26 @@ pub mod cmd {
             /// Effect caused by accessing this edge
             #[structopt(short = "e")]
             effect: Option<EffectKind>,
-            /// dialogue node that this action originates from
-            #[structopt(requires("target_node_id"))]
-            source_node_id: Option<usize>,
-            /// dialogue node that this action will lead to
-            #[structopt(requires("source_node_id"))]
-            target_node_id: Option<usize>,
         }
 
         impl Executable for Edge {
             /// Edit Edge
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                info!("Edit edge {}", self.edge_id);
+
                 // Edge index is mutable in case we delete/add new edge in case of re-targetting
-                let mut edge_index = EdgeIndex::<u32>::new(self.edge_id);
+                let edge_index = EdgeIndex::<u32>::new(self.edge_id);
+
+                trace!("push choice to text buffer");
                 let start = state.act.text.len();
                 state.act.text.push_str(&self.text);
                 let end = state.act.text.len();
-                let hash = hash(state.act.text[start..end].as_bytes());
 
-                // Validate that any requirements/effects reference valid hashmap keys
+                trace!("recalculate hash");
+                let hash = hash(state.act.text[start..end].as_bytes());
+                debug!("hash {}", hash);
+
+                trace!("validate that any requirements/effects reference valid hashmap keys");
                 if self.requirement.is_some() {
                     util::validate_requirement(
                         self.requirement.as_ref().ok_or(cmd::Error::Generic)?,
@@ -744,33 +950,26 @@ pub mod cmd {
                     )?;
                 }
 
+                trace!("get edge weight from tree");
+                let old_weight = state
+                    .act
+                    .tree
+                    .edge_weight_mut(edge_index)
+                    .ok_or(cmd::Error::Generic)?;
+
                 let new_weight = Choice::new(
                     Section::new([start, end], hash),
-                    self.requirement.clone().unwrap_or(ReqKind::No),
+                    self.requirement.clone().unwrap_or(ReqKind::None),
                     self.effect.clone().unwrap_or(EffectKind::No),
                 );
 
-                // Handle deletion/recreation of edge if nodes need to change
-                if self.source_node_id.is_some() && self.target_node_id.is_some() {
-                    let source_node_index =
-                        NodeIndex::new(self.source_node_id.ok_or(cmd::Error::Generic)?);
-                    let target_node_index =
-                        NodeIndex::new(self.target_node_id.ok_or(cmd::Error::Generic)?);
+                trace!("push event to history queue");
+                state
+                    .history
+                    .push_front(Event::EditEdge(edge_index, new_weight.diff(&old_weight)));
 
-                    state.act.tree.remove_edge(edge_index);
-                    edge_index =
-                        state
-                            .act
-                            .tree
-                            .add_edge(source_node_index, target_node_index, new_weight);
-                } else {
-                    let edge_weight = state
-                        .act
-                        .tree
-                        .edge_weight_mut(edge_index)
-                        .ok_or(cmd::Error::Generic)?;
-                    *edge_weight = new_weight;
-                }
+                trace!("update edge weight in tree");
+                *old_weight = new_weight;
 
                 Ok(edge_index.index())
             }
@@ -936,10 +1135,10 @@ pub mod cmd {
                 }
 
                 // Check if the key is referenced in any requirements or effects
-                for edge in state.act.tree.raw_edges() {
+                for edge in state.act.tree.edges(NodeIndex::new(0)) {
                     // this match will stop compiling any time a new reqKind is added
-                    match &edge.weight.requirement {
-                        ReqKind::No => Ok(()),
+                    match &edge.weight().requirement {
+                        ReqKind::None => Ok(()),
                         ReqKind::Greater(_, _) => Ok(()),
                         ReqKind::Less(_, _) => Ok(()),
                         ReqKind::Equal(_, _) => Ok(()),
@@ -951,7 +1150,7 @@ pub mod cmd {
                             }
                         }
                     }?;
-                    match &edge.weight.effect {
+                    match &edge.weight().effect {
                         EffectKind::No => Ok(()),
                         EffectKind::Add(_, _) => Ok(()),
                         EffectKind::Sub(_, _) => Ok(()),
@@ -986,10 +1185,10 @@ pub mod cmd {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 // Check if the key is referenced in any requirements or effects
                 // Check if the key is referenced in any requirements or effects
-                for edge in state.act.tree.raw_edges() {
+                for edge in state.act.tree.edges(NodeIndex::new(0)) {
                     // this match will stop compiling any time a new reqKind is added
-                    match &edge.weight.requirement {
-                        ReqKind::No => Ok(()),
+                    match &edge.weight().requirement {
+                        ReqKind::None => Ok(()),
                         ReqKind::Greater(key, _) => {
                             if key.eq(self.key.as_str()) {
                                 Err(cmd::Error::NameInUse)
@@ -1013,7 +1212,7 @@ pub mod cmd {
                         }
                         ReqKind::Cmp(_, _) => Ok(()),
                     }?;
-                    match &edge.weight.effect {
+                    match &edge.weight().effect {
                         EffectKind::No => Ok(()),
                         EffectKind::Add(key, _) => {
                             if key.eq(self.key.as_str()) {
@@ -1366,7 +1565,7 @@ pub mod cmd {
             // be updated to point to the proper sections of the next text buffer
             *new_tree = tree.clone();
 
-            let root_index = graph::node_index(0);
+            let root_index = stable_graph::node_index(0);
             let mut dfs = Dfs::new(&tree, root_index);
             while let Some(node_index) = dfs.next(&tree) {
                 // Rebuild node
@@ -1423,7 +1622,7 @@ pub mod cmd {
         ) -> Result<()> {
             // this match will stop compiling any time a new reqKind is added
             match req {
-                ReqKind::No => {}
+                ReqKind::None => {}
                 ReqKind::Greater(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
@@ -1476,16 +1675,16 @@ pub mod cmd {
         ///
         /// Returns a result with the error type if the tree was invalid, returns Ok(()) if valid
         pub fn validate_tree(data: &DialogueTreeData) -> Result<()> {
-            // check nodes first
-            let nodes_iter = data.tree.raw_nodes().par_iter();
-            nodes_iter.try_for_each(|node: &petgraph::graph::Node<Dialogue>| -> Result<()> {
+            // check nodes first, use parallel iterator in case of very large graph
+            let nodes_iter = data.tree.node_references().par_bridge();
+            nodes_iter.try_for_each(|(_index, node)| -> Result<()> {
                 // try to grab the text section as a slice, and return an error if the get() failed
                 let slice = data.text[..]
-                    .get(node.weight.section[0]..node.weight.section[1])
+                    .get(node.section[0]..node.section[1])
                     .ok_or(cmd::Error::InvalidSection)?;
                 // if the slice was successful, check its hash
                 anyhow::ensure!(
-                    seahash::hash(slice.as_bytes()) == node.weight.section.hash,
+                    seahash::hash(slice.as_bytes()) == node.section.hash,
                     cmd::Error::InvalidHash
                 );
                 // Check that the section of text parses successfully (all names present in the
@@ -1495,22 +1694,26 @@ pub mod cmd {
             })?;
 
             // check edges, will check that they point to nodes that exist, and validate the actionenums
-            let edges_iter = data.tree.raw_edges().par_iter();
-            edges_iter.try_for_each(|edge: &petgraph::graph::Edge<Choice>| -> Result<()> {
+            let mut edges_iter = data.tree.edges(NodeIndex::new(0));
+            edges_iter.try_for_each(|edge| -> Result<()> {
                 // try to grab the text section as a slice, and return an error if the get() failed
                 let slice = data.text[..]
-                    .get(edge.weight.section[0]..edge.weight.section[1])
+                    .get(edge.weight().section[0]..edge.weight().section[1])
                     .ok_or(cmd::Error::InvalidSection)?;
                 // if the slice was successful, check its hash
                 anyhow::ensure!(
-                    seahash::hash(slice.as_bytes()) == edge.weight.section.hash,
+                    seahash::hash(slice.as_bytes()) == edge.weight().section.hash,
                     cmd::Error::InvalidHash
                 );
                 // Check that the section of text parses successfully (all names present in the
                 // name_table)
                 validate_edge(slice, &data.name_table)?;
-                validate_requirement(&edge.weight.requirement, &data.name_table, &data.val_table)?;
-                validate_effect(&edge.weight.effect, &data.name_table, &data.val_table)?;
+                validate_requirement(
+                    &edge.weight().requirement,
+                    &data.name_table,
+                    &data.val_table,
+                )?;
+                validate_effect(&edge.weight().effect, &data.name_table, &data.val_table)?;
                 Ok(())
             })?;
             Ok(())
@@ -1681,29 +1884,37 @@ mod tests {
         cmd::util::parse_node(text, &name_table, &mut name_buf, &mut buf).unwrap();
     }
 
+    /// Sanity check that the index on stablegraph nodes and indices are preserved across removes
+    /// and adds. This is not guaranteed by stable_graph docs
     #[test]
-    fn serde_diff_minimal() {
-        use serde_diff::{Apply, Diff};
-        let dia = Dialogue::new(Section::new([0, 10], 1230489712), Position::new(0.0, 0.0));
+    fn stable_graph_remove_add() {
+        let dia = Dialogue::new(Section::new([0, 10], 0), Position::new(0.0, 0.0));
 
         // create dummy graph with a bunch of nodes
-        let mut old_graph = Tree::new();
-        for _ in 0..100 {
-            old_graph.add_node(dia.clone());
+        let mut tree = Tree::new();
+        for i in 0..100 {
+            let mut node = dia.clone();
+            node.section.hash = i;
+            tree.add_node(node);
         }
 
-        let test_vec: Vec<Dialogue> = vec![dia.clone(), dia.clone()];
+        // confirm that all indices equal the hash for added nodes before doing any removals
+        for index in tree.node_indices() {
+            assert_eq!(
+                index.index() as u64,
+                tree.node_weight(index).unwrap().section.hash
+            );
+        }
 
-        let mut test_vec_new = test_vec.clone();
-        test_vec_new[0].section.hash += 1;
+        // remove some random nodes
+        let weight_0 = tree.remove_node(NodeIndex::new(0)).unwrap();
+        let weight_57 = tree.remove_node(NodeIndex::new(57)).unwrap();
+        let weight_26 = tree.remove_node(NodeIndex::new(26)).unwrap();
 
-        let undo_diff = bincode::serialize(&Diff::serializable(&test_vec_new, &test_vec)).unwrap();
-        let redo_diff = bincode::serialize(&Diff::serializable(&test_vec, &test_vec_new)).unwrap();
-
-        bincode::config()
-            .deserialize_seed(Apply::deserializable(&mut test_vec_new), &undo_diff)
-            .unwrap();
-
-        assert_eq!(test_vec_new[0].section.hash, test_vec[0].section.hash);
+        // re-add some nodes in reverse order that they were removed
+        // check that the indices are as expected
+        assert_eq!(tree.add_node(weight_26), NodeIndex::new(26));
+        assert_eq!(tree.add_node(weight_57), NodeIndex::new(57));
+        assert_eq!(tree.add_node(weight_0), NodeIndex::new(0));
     }
 }
