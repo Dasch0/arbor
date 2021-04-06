@@ -90,11 +90,11 @@ dependencies = [
  "enum_from_str",
  "enum_from_str_derive",
  "log",
- "petgraph",
  "rand",
  "rayon",
  "seahash",
  "serde",
+ "serde-diff",
  "shellwords",
  "simple_logger",
  "structopt",
@@ -1609,8 +1609,6 @@ checksum = "467d164a6de56270bd7c4d070df81d07beace25012d5103ced4e9ff08d6afdb7"
 dependencies = [
  "fixedbitset",
  "indexmap",
- "serde",
- "serde_derive",
 ]
 
 [[package]]

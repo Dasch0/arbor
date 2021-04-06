@@ -120,7 +120,7 @@ impl epi::App for ArborUi {
             ui.heading("Dialogue Tree");
             self.painting.ui_control(ui);
             egui::Frame::dark_canvas(ui.style()).show(ui, |ui| {
-                self.painting.ui_content(&mut self.state.act, ui);
+                self.painting.ui_content(&mut self.state.active, ui);
             });
         });
 
@@ -193,7 +193,7 @@ impl LoadWindow {
                     // if ok, close the load project window
                     self.open = false;
                     // Check if tree has many default positions, if so, give the user a warning
-                    let zeroed_count = state.act.tree.node_weights_mut().fold(0, |sum, n| {
+                    let zeroed_count = state.active.tree.node_weights_mut().fold(0, |sum, n| {
                         sum + (n.pos.x == 0.0 && n.pos.y == 0.0) as usize
                     });
                     // NOTE: Right now show the warning if more than 1 node is at zero, maybe
@@ -427,7 +427,7 @@ impl NodeEditor {
             egui::combo_box_with_label(
                 ui,
                 state // display the selected key's name value
-                    .act
+                    .active
                     .name_table
                     .get(self.name_buf.as_str())
                     .unwrap_or(&arbor_core::NameString::new())
@@ -435,7 +435,7 @@ impl NodeEditor {
                 self.name_buf.clone(),
                 |ui| {
                     // Name must be in key form when selecting,
-                    for name in state.act.name_table.keys() {
+                    for name in state.active.name_table.keys() {
                         ui.selectable_value(&mut self.name_buf, name.to_string(), name.as_str());
                     }
                 },
@@ -458,7 +458,7 @@ impl NodeEditor {
                 .execute(state);
                 match res {
                     Ok(node_index) => {
-                        state.act.tree[NodeIndex::new(node_index)].pos =
+                        state.active.tree[NodeIndex::new(node_index)].pos =
                             arbor_core::Position::new(0.3, 0.3)
                     }
                     Err(e) => println!("{}", e),

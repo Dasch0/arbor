@@ -8,7 +8,7 @@ fn main() {
     loop {
         // print default header
         println!("------------");
-        println!("project: {}", state.act.name);
+        println!("project: {}", state.active.name);
         println!("------------");
 
         cmd::util::prompt_input(&mut cmd_buf);
