@@ -2,20 +2,20 @@ pub use anyhow::Result;
 pub use cmd::Executable;
 use derive_new::*;
 use enum_dispatch::*;
+use fixedbitset::FixedBitSet;
 use log::{debug, info, trace};
 use rayon::prelude::*;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
 use serde_diff::SerdeDiff;
 pub use std::collections::{HashMap, VecDeque};
-use std::hash::BuildHasherDefault;
 use std::io;
 use std::io::Write;
 pub use std::ops::Range;
 use structopt::clap::AppSettings;
 pub use structopt::StructOpt;
 use thiserror::Error;
-use tree::Tree;
+use tree::{Dfs, Tree};
 
 // TODO: Future plans
 // 1. Replace petgraph with lower level graph implementation (petgraph limits us on diffing,
@@ -99,6 +99,24 @@ impl std::ops::IndexMut<usize> for Section {
 pub mod tree {
     use super::*;
 
+    /// Type definitions for Node and Edge indices resolved to usize, mainly used for improved
+    /// readability on whether a value should be used for edge or node access
+    pub type NodeIndex = usize;
+    pub type EdgeIndex = usize;
+
+    /// This trait implements an "end" value that may be used to signal an invalid value for
+    /// an element in the tree, such as a linked list. This should be used in places where Option
+    /// would result in extra memory usage (such as uint types)
+    pub trait End {
+        fn end() -> Self;
+    }
+
+    impl End for usize {
+        fn end() -> Self {
+            NodeIndex::MAX
+        }
+    }
+
     /// Error types for tree operations
     ///
     /// Uses thiserror to generate messages for common situations. This does not
@@ -110,38 +128,74 @@ pub mod tree {
         InvalidNodeIndex,
         #[error("Attempted to access an edge that is not present in the tree")]
         InvalidEdgeIndex,
+        #[error("Modification cannot be made to node as it is currently in use in the tree")]
+        NodeInUse,
+        #[error("More edge links were found than there may be edges in the tree")]
+        InvalidEdgeLinks,
+        #[error("Nodes list full, node list cannot be larger than usize::MAX - 1")]
+        NodesFull,
     }
 
-    #[derive(new, Serialize, Deserialize, SerdeDiff, Clone)]
-    pub struct Node {
-        pub dialogue: Dialogue,
-        #[serde_diff(opaque)]
-        pub edge_range: Range<u32>,
+    /// Iterator over the outgoing edge indices of a node
+    pub struct OutgoingEdges<'a> {
+        edge_links: &'a [EdgeIndex],
+        next: EdgeIndex,
     }
 
-    /// Stores linking information between nodes and edges for a given dialogue tree
-    #[derive(new, Serialize, Deserialize, SerdeDiff, Clone)]
-    pub struct Link {
-        pub source_index: usize,
-        pub target_index: usize,
-        pub edge_index: usize,
+    impl<'a> Iterator for OutgoingEdges<'a> {
+        type Item = EdgeIndex;
+        fn next(&mut self) -> Option<Self::Item> {
+            // save self.next as the current index to return
+            if self.next == EdgeIndex::end() {
+                None
+            } else {
+                let current = self.next;
+                self.next = self.edge_links[self.next];
+                Some(current)
+            }
+        }
     }
 
     #[derive(new, Serialize, Deserialize, SerdeDiff, Clone)]
     pub struct Tree {
-        /// Range defines the section of 'links' that contains outgoing edges for this node
-        nodes: Vec<Node>,
+        // TODO: Make Node type generic if needed
+        nodes: Vec<Dialogue>,
         edges: Vec<Choice>,
-        links: Vec<Link>,
+        /// Node links implement a linked list to the outgoing edges of a given node. The
+        /// node index may be used to index into this array to get the first outgoing edge for that
+        /// node. This will be None if there are no outgoing edges
+        node_links: Vec<EdgeIndex>,
+        /// Edge links implement a linked lists to rest of the outgoing edges of a given node. The
+        /// edge index from the previous node_links or edge_links value may be used to index into
+        /// this array to get the next outgoing edge for a given node. This will be None if it is
+        /// the
+        edge_links: Vec<EdgeIndex>,
+        /// List of the targets of an edge. Access via an edge index to get the target node index
+        /// for that edge.
+        ///
+        /// Stored separately to avoid wrapping the node type in the array.
+        edge_targets: Vec<NodeIndex>,
     }
 
     impl Tree {
+        /// Create a tree with allocation for a given number of nodes and edges
         pub fn with_capacity(node_capacity: usize, edge_capacity: usize) -> Self {
             Self {
                 nodes: Vec::with_capacity(node_capacity as usize),
                 edges: Vec::with_capacity(edge_capacity as usize),
-                links: Vec::with_capacity(edge_capacity as usize),
+                node_links: Vec::with_capacity(node_capacity as usize),
+                edge_links: Vec::with_capacity(edge_capacity as usize),
+                edge_targets: Vec::with_capacity(edge_capacity as usize),
             }
+        }
+
+        /// Clear the contents of a tree, reset all internal data
+        #[inline]
+        pub fn clear(&mut self) {
+            self.nodes.clear();
+            self.edges.clear();
+            self.node_links.clear();
+            self.edge_links.clear();
         }
 
         /// Get the contents of a node
@@ -150,37 +204,56 @@ pub mod tree {
         ///
         /// Error if node index is invalid
         #[inline]
-        pub fn get_node(&self, node_index: usize) -> Result<Dialogue> {
+        pub fn get_node(&self, node_index: usize) -> Result<&Dialogue> {
             let node = self
                 .nodes
                 .get(node_index)
                 .ok_or(tree::Error::InvalidNodeIndex)?;
 
-            Ok(node.dialogue)
+            Ok(&node)
+        }
+
+        /// Get the mutable contents of a node
+        ///
+        /// # Errors
+        ///
+        /// Error if node index is invalid
+        #[inline]
+        pub fn get_node_mut(&mut self, node_index: usize) -> Result<&mut Dialogue> {
+            self.nodes
+                .get_mut(node_index)
+                .ok_or_else(|| tree::Error::InvalidNodeIndex.into())
         }
 
         /// Push a new node onto the tree, and return the index of the added node
+        ///
+        /// # Errors
+        /// Error if the nodes list is full (more than usize::MAX - 1 nodes)
         #[inline]
-        pub fn add_node(&mut self, dialogue: Dialogue) -> usize {
-            // default range is 0..0
-            self.nodes.push(Node::new(dialogue, Range::default()));
-            self.nodes.len()
+        pub fn add_node(&mut self, node: Dialogue) -> Result<usize> {
+            anyhow::ensure!(
+                self.nodes.len() < NodeIndex::end() - 1,
+                tree::Error::NodesFull
+            );
+            self.nodes.push(node);
+            self.node_links.push(EdgeIndex::end());
+            Ok(self.nodes.len() - 1)
         }
 
-        /// Edit the dialogue in an existing node and return the old dialogue
+        /// Edit the contents in an existing node and return the old contents.
         ///
         /// # Errors
         ///
         /// If the index is invalid, a corresponding error will be returned with no modification to
         /// the tree.
         #[inline]
-        pub fn edit_node(&mut self, index: usize, new_dialogue: Dialogue) -> Result<Dialogue> {
+        pub fn edit_node(&mut self, index: NodeIndex, new_node: Dialogue) -> Result<Dialogue> {
             trace!("attempt to get mutable weight from node index");
-            let weight = self.nodes.get_mut(index).ok_or(Error::InvalidNodeIndex)?;
-            let old_dialogue = weight.dialogue;
+            let node = self.nodes.get_mut(index).ok_or(Error::InvalidNodeIndex)?;
+            let old_node_value = *node;
 
-            weight.dialogue = new_dialogue;
-            Ok(old_dialogue)
+            *node = new_node;
+            Ok(old_node_value)
         }
 
         /// Remove a node if no edges use it as the source or target. Returns the weight of the
@@ -191,18 +264,38 @@ pub mod tree {
         /// If the index is invalid, or if an edge currently uses the node as a source or target,
         /// an error is returned with no modification to the tree
         #[inline]
-        pub fn remove_node(&mut self, index: usize) -> Result<Dialogue> {
+        pub fn remove_node(&mut self, index: NodeIndex) -> Result<Dialogue> {
             trace!("check that node index is valid");
             self.nodes.get(index).ok_or(tree::Error::InvalidNodeIndex)?;
 
-            trace!("check that node is not in use in any edges");
             let mut node_in_use = false;
-            for link in self.links {
-                node_in_use |= link.source_index == index || link.target_index == index;
-            }
+            trace!("check that node has no outgoing edges");
+            node_in_use |= self.node_links[index] != NodeIndex::end();
+            trace!("check that node is not the target of any edges");
+            node_in_use |= self.edge_targets.contains(&index);
+            if node_in_use {
+                Err(tree::Error::NodeInUse.into())
+            } else {
+                // capture the index of the node that is going to be swapped in (always the last
+                // node index of the list)
+                let swapped_index = self.nodes.len() - 1;
 
-            let removed_node = self.nodes.swap_remove(index);
-            Ok(removed_node.dialogue)
+                trace!("swap remove node from nodes list and node_links");
+                let removed_node = self.nodes.swap_remove(index);
+                self.node_links.swap_remove(index);
+
+                trace!("re-point edge_targets to the newly swapped node");
+                for target in self.edge_targets.as_mut_slice() {
+                    let _ = std::mem::replace(target, swapped_index);
+                }
+                Ok(removed_node)
+            }
+        }
+
+        /// Get an immutable slice of the nodes in the tree
+        #[inline]
+        pub fn nodes(&self) -> &[Dialogue] {
+            self.nodes.as_slice()
         }
 
         /// Get the contents of an edge
@@ -211,23 +304,31 @@ pub mod tree {
         ///
         /// Error if edge index is invalid
         #[inline]
-        pub fn get_edge(&self, edge_index: usize) -> Result<Choice> {
-            let choice = self
-                .edges
+        pub fn get_edge(&self, edge_index: usize) -> Result<&Choice> {
+            self.edges
                 .get(edge_index)
-                .ok_or(tree::Error::InvalidEdgeIndex)?;
-
-            Ok(*choice)
+                .ok_or_else(|| tree::Error::InvalidEdgeIndex.into())
         }
 
-        /// Get the (source, target) node indices of an edge
+        /// Get the mutable contents of an edge
+        ///
+        /// # Errors
+        ///
+        /// Error if edge index is invalid
         #[inline]
-        pub fn edge_endpoints(&self, edge_index: usize) -> Result<(usize, usize)> {
-            let link = self
-                .links
+        pub fn get_edge_mut(&mut self, edge_index: usize) -> Result<&mut Choice> {
+            self.edges
+                .get_mut(edge_index)
+                .ok_or_else(|| tree::Error::InvalidEdgeIndex.into())
+        }
+
+        /// Get the target node index of an edge
+        #[inline]
+        pub fn target_of(&self, edge_index: EdgeIndex) -> Result<NodeIndex> {
+            self.edge_targets
                 .get(edge_index)
-                .ok_or(tree::Error::InvalidEdgeIndex)?;
-            Ok((link.source_index, link.target_index))
+                .copied()
+                .ok_or_else(|| tree::Error::InvalidEdgeIndex.into())
         }
 
         /// Create a new edge from a source node to a target node, return the index of the added edge
@@ -236,8 +337,18 @@ pub mod tree {
         ///
         /// If either the source or target node is invalid, a corresponding error will be returned
         /// with no modification to the tree.
+        ///
+        /// # Panic
+        ///
+        /// Panics if a cycle is found in the edge_links list for this node. This means that the
+        /// graph is corrupted and likely can't be recovered
         #[inline]
-        pub fn add_edge(&mut self, source: usize, target: usize, choice: Choice) -> Result<usize> {
+        pub fn add_edge(
+            &mut self,
+            source: NodeIndex,
+            target: NodeIndex,
+            choice: Choice,
+        ) -> Result<EdgeIndex> {
             trace!("check validity of source and target node");
             self.nodes
                 .get(source)
@@ -246,14 +357,50 @@ pub mod tree {
                 .get(target)
                 .ok_or(tree::Error::InvalidNodeIndex)?;
 
+            trace!("push new edge to the edges, edge_links, and edge_targets list");
             self.edges.push(choice);
-            self.links.push(Link::new(source, target, self.edges.len()));
+            self.edge_targets.push(target);
+            self.edge_links.push(EdgeIndex::end());
 
-            Ok(self.edges.len())
+            let new_edge_index = self.edges.len() - 1;
+
+            trace!("update outgoing edges list for source node");
+            if self.node_links[source] == EdgeIndex::end() {
+                // this is the first outgoing edge for this node, so it is stored in the node_links
+                // array
+                self.node_links[source] = new_edge_index;
+            } else {
+                // this node already has outgoing edges, follow links until the last outgoing edge
+                // is found. There cannot be cycles here as the previously added outgoing edge had
+                // its edge_link set to end(), and that cannot be updated without calling this
+                // method again
+                let mut current_edge_link = self.node_links[source];
+                // Canary value will check if loop is stuck. If canary reaches usize::end we have
+                // traversed more edge links than are possible to store in the tree
+                trace!("traversing edge links");
+                let mut canary: usize = 0;
+                // Look ahead by one link and check if it that is the last node, if not, store the
+                // next link as the current link and loop till the end is found
+                while self.edge_links[current_edge_link] != NodeIndex::end()
+                    || canary == usize::end()
+                {
+                    current_edge_link = self.edge_links[current_edge_link];
+                    canary += 1;
+                }
+                // edge link is now set to the last node of the tree, assuming canary value didn't
+                // trip
+                anyhow::ensure!(canary < usize::end(), tree::Error::InvalidEdgeIndex);
+                debug!("end link is: {}", current_edge_link);
+
+                trace!("store edge at end of link list");
+                self.edge_links[current_edge_link] = new_edge_index;
+            }
+
+            Ok(new_edge_index)
         }
 
         /// Edit the choice in an existing edge. The source or target node cannot be modified, the
-        /// edge will have to be deleted and rebuilt
+        /// edge will have to be deleted and readded
         ///
         /// # Errors
         ///
@@ -267,7 +414,7 @@ pub mod tree {
                 .get_mut(index as usize)
                 .ok_or(tree::Error::InvalidEdgeIndex)?;
 
-            let old_choice = choice.clone();
+            let old_choice = *choice;
             *choice = new_choice;
             Ok(old_choice)
         }
@@ -286,14 +433,153 @@ pub mod tree {
                 .get(index as usize)
                 .ok_or(tree::Error::InvalidEdgeIndex)?;
 
-            trace!("remove from links, then edges list");
-            self.links.swap_remove(index);
+            trace!("redirect any node or edge links pointing to the edge about to be removed");
+            // TODO: Could this safely be combined with the for loop through the list that happens
+            // after the removal?
+            for link in self.node_links.as_mut_slice() {
+                if *link == index {
+                    // link should point to whatever the to-be-deleted link currently points to
+                    *link = self.edge_links[index];
+                }
+            }
+            for link_index in 0..self.edge_links.len() {
+                if self.edge_links[link_index] == index {
+                    // link should point to whatever the to-be-deleted link currently points to
+                    self.edge_links[link_index] = self.edge_links[index];
+                }
+            }
+
+            // capture the index of the edge that is going to be swapped in (always the last
+            // node index of the list). This edge need to be updated in the node_links and
+            // edge_links after swap-removing the edge
+            let swapped_index = self.nodes.len() - 1;
+
+            trace!("swap remove from edges, edge_links, and edge_targets");
+            self.edges.swap_remove(index);
+            self.edge_links.swap_remove(index);
+            self.edge_targets.swap_remove(index);
+
+            trace!(
+                "update indices in node_links and edge_links for last edge index that was swapped"
+            );
+            for link in self.node_links.as_mut_slice() {
+                if *link == swapped_index {
+                    // link should point to the index that the edge was swapped into
+                    *link = index;
+                }
+            }
+            for link in self.edge_links.as_mut_slice() {
+                if *link == index {
+                    // link should point to the index that the edge was swapped into
+                    *link = index;
+                }
+            }
+
             Ok(self.edges.swap_remove(index))
         }
 
         /// Get an immutable view of the edges in the tree
         pub fn edges(&self) -> &[Choice] {
             self.edges.as_slice()
+        }
+
+        /// Get the outgoing edges from a node by index
+        ///
+        /// # Errors
+        ///
+        /// Error if index is invalid
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// # use arbor_core::*;
+        /// # use arbor_core::tree::*;
+        /// # let dialogue = Dialogue::new(Section::new([0, 0], 0), Position::new(0.0, 0.0));
+        /// # let choice = Choice::new(Section::new([0,0],0), ReqKind::None, EffectKind::None);
+        /// let mut tree = Tree::with_capacity(10, 10);
+        /// // add two nodes with dummy dialogue values
+        /// let first_node_idx: NodeIndex = tree.add_node(dialogue).unwrap();
+        /// let second_node_idx: NodeIndex = tree.add_node(dialogue).unwrap();
+        ///
+        /// // create two edges from first_node with dummy choice value
+        /// let first_edge_idx: EdgeIndex = tree.add_edge(first_node_idx, second_node_idx,
+        /// choice).unwrap();
+        /// let second_edge_idx: EdgeIndex = tree.add_edge(first_node_idx, second_node_idx,
+        /// choice).unwrap();
+        ///
+        /// let outgoing_edges: Vec<EdgeIndex> = tree.outgoing_from_index(first_node_idx).unwrap().collect();
+        /// assert_eq!(outgoing_edges, vec![0, 1]);
+        /// ```
+        #[inline]
+        pub fn outgoing_from_index(&self, index: NodeIndex) -> Result<OutgoingEdges> {
+            self.nodes.get(index).ok_or(tree::Error::InvalidNodeIndex)?;
+            Ok(OutgoingEdges {
+                edge_links: self.edge_links.as_slice(),
+                next: self.node_links[index],
+            })
+        }
+    }
+
+    /// Modified from https://docs.rs/petgraph/0.5.1/src/petgraph/visit/mod.rs.html#582
+    /// A mapping for storing the visited status for NodeId `N`.
+    pub trait VisitMap<N> {
+        /// Mark `a` as visited.
+        ///
+        /// Return **true** if this is the first visit, false otherwise.
+        fn visit(&mut self, a: N) -> bool;
+
+        /// Return whether `a` has been visited before.
+        fn is_visited(&self, a: &N) -> bool;
+    }
+
+    impl VisitMap<usize> for FixedBitSet {
+        fn visit(&mut self, x: usize) -> bool {
+            !self.put(x)
+        }
+        fn is_visited(&self, x: &usize) -> bool {
+            self.contains(*x)
+        }
+    }
+
+    /// Depth first search tree walker
+    /// Adapted from https://docs.rs/petgraph/0.5.1/src/petgraph/visit/traversal.rs.html#37
+    pub struct Dfs {
+        /// stack of nodes to visit
+        pub stack: Vec<NodeIndex>,
+        /// Mapping of visited nodes
+        pub discovered: FixedBitSet,
+    }
+
+    impl Dfs {
+        #[inline]
+        pub fn new(tree: &Tree, start: NodeIndex) -> Self {
+            let mut dfs = Self {
+                stack: Vec::with_capacity(tree.nodes.len()),
+                discovered: FixedBitSet::with_capacity(tree.nodes.len()),
+            };
+            dfs.stack.push(start);
+            dfs
+        }
+
+        /// Return the next node in the dfs. Returns None if the the traversal is done
+        ///
+        /// # Errors
+        ///
+        /// Error if any node index is invalid, this would be unexpected if root node is valid and
+        /// tree isn't corrupted
+        pub fn next(&mut self, tree: &Tree) -> Result<Option<NodeIndex>> {
+            while let Some(node_index) = self.stack.pop() {
+                if self.discovered.visit(node_index) {
+                    for edge_index in tree.outgoing_from_index(node_index)? {
+                        let target_node_index = tree.target_of(edge_index)?;
+                        if !self.discovered.is_visited(&target_node_index) {
+                            self.stack.push(target_node_index);
+                        }
+                    }
+                    return Ok(Some(node_index));
+                }
+            }
+            Ok(None)
         }
     }
 }
@@ -438,26 +724,10 @@ impl std::str::FromStr for ReqKind {
             "Greater" => Ok(ReqKind::Greater(key, val.parse::<u32>()?)),
             "Less" => Ok(ReqKind::Less(key, val.parse::<u32>()?)),
             "Equal" => Ok(ReqKind::Equal(key, val.parse::<u32>()?)),
-            "Cmp" => {
-                // check name can be pulled from value
-                // match required due to lifetime limitations on CapacityError
-                let name = match NameString::from(val) {
-                    Ok(v) => Ok(v),
-                    Err(e) => Err(e.simplify()),
-                }?;
-                Ok(ReqKind::Cmp(key, name))
-            }
+            "Cmp" => Ok(ReqKind::Cmp(key, val)),
             _ => Err(cmd::Error::Generic.into()),
         }
     }
-}
-
-/// Struct storing the data required to diff two ReqKind's for undo/redo
-#[derive(Clone, Copy)]
-#[serde_diff(opaque)]
-pub struct ReqDiff {
-    old: ReqKind,
-    new: ReqKind,
 }
 
 /// Represents an effect that occurs when a choice is made.
@@ -466,9 +736,10 @@ pub struct ReqDiff {
 /// that would bloat enum size by 32 bytes, when Cmp will rarely be used compared to val based
 /// requirements
 #[derive(Debug, Serialize, Deserialize, SerdeDiff, PartialEq, Clone, Copy)]
+#[serde_diff(opaque)]
 pub enum EffectKind {
     /// No effect
-    No,
+    None,
     Add(KeyString, u32),
     Sub(KeyString, u32),
     Set(KeyString, u32),
@@ -524,13 +795,6 @@ impl std::str::FromStr for EffectKind {
             _ => Err(cmd::Error::Generic.into()),
         }
     }
-}
-
-/// Struct storing the data required to diff two EffectKind's for undo/redo
-#[derive(Clone, Copy)]
-pub struct EffectDiff {
-    old: EffectKind,
-    new: EffectKind,
 }
 
 /// Top level module for all arbor commands. These commands rely heavily on the structopt
@@ -703,7 +967,7 @@ pub mod cmd {
                     Dialogue::new(Section::new([start, end], hash), Position::new(0.0, 0.0));
 
                 trace!("add new node to tree");
-                let index = state.active.tree.add_node(dialogue);
+                let index = state.active.tree.add_node(dialogue)?;
 
                 Ok(index)
             }
@@ -764,15 +1028,14 @@ pub mod cmd {
                 let choice = Choice::new(
                     Section::new([start, end], hash),
                     self.requirement.clone().unwrap_or(ReqKind::None),
-                    self.effect.clone().unwrap_or(EffectKind::No),
+                    self.effect.clone().unwrap_or(EffectKind::None),
                 );
 
                 trace!("Adding new edge to tree");
-                let edge_index =
-                    state
-                        .active
-                        .tree
-                        .add_edge(self.source, self.target, choice.clone())?;
+                let edge_index = state
+                    .active
+                    .tree
+                    .add_edge(self.source, self.target, choice)?;
                 Ok(edge_index)
             }
         }
@@ -941,17 +1204,13 @@ pub mod cmd {
                     )?;
                 }
 
-                trace!("get edge weight from tree");
-                let old_weight = state.active.tree.get_edge(self.edge_index)?;
-
+                trace!("update edge weight in tree");
                 let new_weight = Choice::new(
                     Section::new([start, end], hash),
                     self.requirement.clone().unwrap_or(ReqKind::None),
-                    self.effect.clone().unwrap_or(EffectKind::No),
+                    self.effect.clone().unwrap_or(EffectKind::None),
                 );
-
-                trace!("update edge weight in tree");
-                state.active.tree.edit_edge(self.edge_index, new_weight);
+                state.active.tree.edit_edge(self.edge_index, new_weight)?;
 
                 Ok(self.edge_index)
             }
@@ -1076,9 +1335,6 @@ pub mod cmd {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 info!("Remove Edge {}", self.edge_index);
 
-                trace!("fetch source and target not for event history");
-                let (source, target) = state.active.tree.edge_endpoints(self.edge_index)?;
-
                 trace!("remove edge from tree");
                 let removed_weight = state.active.tree.remove_edge(self.edge_index)?;
                 let hash = removed_weight.section.hash;
@@ -1125,7 +1381,7 @@ pub mod cmd {
                         }
                     }?;
                     match &choice.effect {
-                        EffectKind::No => Ok(()),
+                        EffectKind::None => Ok(()),
                         EffectKind::Add(_, _) => Ok(()),
                         EffectKind::Sub(_, _) => Ok(()),
                         EffectKind::Set(_, _) => Ok(()),
@@ -1140,7 +1396,7 @@ pub mod cmd {
                 }
 
                 trace!("remove key-value pair from name table");
-                let removed_name = state
+                state
                     .active
                     .name_table
                     .remove(self.key.as_str())
@@ -1189,7 +1445,7 @@ pub mod cmd {
                         ReqKind::Cmp(_, _) => Ok(()),
                     }?;
                     match &choice.effect {
-                        EffectKind::No => Ok(()),
+                        EffectKind::None => Ok(()),
                         EffectKind::Add(key, _) => {
                             if key.eq(self.key.as_str()) {
                                 Err(cmd::Error::NameInUse)
@@ -1216,7 +1472,7 @@ pub mod cmd {
                 }
 
                 trace!("remove key-value pair from value table");
-                let removed_value = state
+                state
                     .active
                     .val_table
                     .remove(self.key.as_str())
@@ -1236,7 +1492,7 @@ pub mod cmd {
     pub struct Undo {}
 
     impl Executable for Undo {
-        fn execute(&self, state: &mut EditorState) -> Result<usize> {
+        fn execute(&self, _state: &mut EditorState) -> Result<usize> {
             info!("Undo");
 
             Ok(0)
@@ -1252,7 +1508,7 @@ pub mod cmd {
     pub struct Redo {}
 
     impl Executable for Redo {
-        fn execute(&self, state: &mut EditorState) -> Result<usize> {
+        fn execute(&self, _state: &mut EditorState) -> Result<usize> {
             info!("Redo");
 
             Ok(0)
@@ -1357,6 +1613,9 @@ pub mod cmd {
     /// traversing the dialogue tree). Under each node definiton, a list of the outgoing edges from
     /// that node will be listed. This will show the path to the next dialogue option from any
     /// node, and the choice/action text associated with that edge.
+    ///
+    /// Note that edge and node indices will not remain stable if nodes/edges are removed from the
+    /// graph.
     #[derive(new, StructOpt, Debug)]
     #[structopt(setting = AppSettings::NoBinaryName)]
     pub struct List {}
@@ -1365,23 +1624,18 @@ pub mod cmd {
         fn execute(&self, state: &mut EditorState) -> Result<usize> {
             let mut name_buf = String::with_capacity(64);
             let mut text_buf = String::with_capacity(256);
-            let node_iter = state.active.tree.node_references();
+            let node_iter = state.active.tree.nodes().iter().enumerate();
 
-            for (idx, n) in node_iter {
-                let text = &state.active.text[n.section[0]..n.section[1]];
+            for (idx, node) in node_iter {
+                let text = &state.active.text[node.section[0]..node.section[1]];
                 util::parse_node(text, &state.active.name_table, &mut name_buf, &mut text_buf)?;
                 state.scratchpad.push_str(&format!(
                     "node {}: {} says \"{}\"\r\n",
-                    idx.index(),
-                    name_buf,
-                    text_buf
+                    idx, name_buf, text_buf
                 ));
-                for e in state
-                    .active
-                    .tree
-                    .edges_directed(idx, petgraph::Direction::Outgoing)
-                {
-                    let choice = e.weight();
+                let outgoing_edges_iter = state.active.tree.outgoing_from_index(idx)?;
+                for edge_index in outgoing_edges_iter {
+                    let choice = state.active.tree.get_edge(edge_index)?;
                     util::parse_edge(
                         &state.active.text[choice.section[0]..choice.section[1]],
                         &state.active.name_table,
@@ -1389,8 +1643,8 @@ pub mod cmd {
                     )?;
                     state.scratchpad.push_str(&format!(
                         "--> edge {} to node {}: \"{}\"\r\n    requirements: {:?}, effects: {:?}\r\n",
-                        e.id().index(),
-                        e.target().index(),
+                        edge_index,
+                        state.active.tree.target_of(edge_index)?,
                         text_buf,
                         choice.requirement,
                         choice.effect,
@@ -1406,18 +1660,6 @@ pub mod cmd {
     /// from the command line, but are useful for working with dialogue_trees in other programs
     pub mod util {
         use super::*;
-
-        /// Push even to the event history, and clear the event futures queue.
-        ///
-        /// When a new event is pushed to the undo history through this method, it indicates that
-        /// new edits are being made on top of the existing history, and this means any redo
-        /// attempts are no longer valid
-        #[inline]
-        pub fn push_event(event: Event, state: &mut EditorState) {
-            trace!("push event to history queue");
-            state.future.clear();
-            state.history.push_front(event);
-        }
 
         /// Generate UID.
         ///
@@ -1588,46 +1830,39 @@ pub mod cmd {
             // be updated to point to the proper sections of the next text buffer
             *new_tree = tree.clone();
 
-            let root_index = stable_graph::node_index(0);
+            let root_index: usize = 0;
             let mut dfs = Dfs::new(&tree, root_index);
-            while let Some(node_index) = dfs.next(&tree) {
+            while let Some(node_index) = dfs.next(&tree)? {
                 // Rebuild node
-                let node = tree[node_index];
-                let slice: &str = &text[node.section[0]..node.section[1]];
+                let dialogue = tree.get_node(node_index)?;
+                let slice: &str = &text[dialogue.section[0]..dialogue.section[1]];
                 let start = new_text.len();
                 new_text.push_str(slice);
                 let end = new_text.len();
-                let new_node = new_tree
-                    .node_weight_mut(node_index)
-                    .ok_or(cmd::Error::InvalidNodeIndex)?;
+                let new_dialogue = new_tree.get_node_mut(node_index)?;
                 // verify new and old hash match
                 let new_hash = hash(new_text[start..end].as_bytes());
-                assert!(node.section.hash == new_hash);
-                *new_node = Dialogue::new(Section::new([start, end], new_hash), node.pos);
+                assert!(dialogue.section.hash == new_hash);
+                *new_dialogue = Dialogue::new(Section::new([start, end], new_hash), dialogue.pos);
 
                 // Rebuild all edges sourced from this node
-                let edge_iter = tree.edges_directed(node_index, petgraph::Direction::Outgoing);
-                for edge_ref in edge_iter {
-                    let edge = edge_ref.weight();
+                let edge_iter = tree.outgoing_from_index(node_index)?;
+                for edge_index in edge_iter {
+                    let edge = tree.get_edge(edge_index)?;
                     let slice: &str = &text[edge.section[0]..edge.section[1]];
 
                     // Verify that edge and new_edge match, they should be identical since we
                     // started by cloning the tree to new_tree
-                    assert!(
-                        tree.edge_endpoints(edge_ref.id())
-                            == new_tree.edge_endpoints(edge_ref.id())
-                    );
+                    assert!(tree.target_of(edge_index)? == new_tree.target_of(edge_index)?);
 
                     let start = new_text.len();
                     new_text.push_str(slice);
                     let end = new_text.len();
-                    let mut new_edge = new_tree
-                        .edge_weight_mut(edge_ref.id())
-                        .ok_or(cmd::Error::InvalidEdgeIndex)?;
                     // verify new and old hash match
                     let new_hash = hash(new_text[start..end].as_bytes());
                     assert!(edge.section.hash == new_hash);
-                    new_edge.section = Section::new([start, end], new_hash);
+                    let new_choice = new_tree.get_edge_mut(edge_index)?;
+                    new_choice.section = Section::new([start, end], new_hash);
                 }
             }
 
@@ -1675,7 +1910,7 @@ pub mod cmd {
             // NOTE: remember, if val is a u32, check the val_table, if val is a String, check the
             // name table
             match effect {
-                EffectKind::No => {}
+                EffectKind::None => {}
                 EffectKind::Add(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
@@ -1699,8 +1934,8 @@ pub mod cmd {
         /// Returns a result with the error type if the tree was invalid, returns Ok(()) if valid
         pub fn validate_tree(data: &DialogueTreeData) -> Result<()> {
             // check nodes first, use parallel iterator in case of very large graph
-            let nodes_iter = data.tree.node_references().par_bridge();
-            nodes_iter.try_for_each(|(_index, node)| -> Result<()> {
+            let nodes_iter = data.tree.nodes().par_iter();
+            nodes_iter.try_for_each(|node| -> Result<()> {
                 // try to grab the text section as a slice, and return an error if the get() failed
                 let slice = data.text[..]
                     .get(node.section[0]..node.section[1])
@@ -1717,251 +1952,25 @@ pub mod cmd {
             })?;
 
             // check edges, will check that they point to nodes that exist, and validate the actionenums
-            let mut edges_iter = data.tree.edges(NodeIndex::new(0));
+            let edges_iter = data.tree.edges().par_iter();
             edges_iter.try_for_each(|edge| -> Result<()> {
                 // try to grab the text section as a slice, and return an error if the get() failed
                 let slice = data.text[..]
-                    .get(edge.weight().section[0]..edge.weight().section[1])
+                    .get(edge.section[0]..edge.section[1])
                     .ok_or(cmd::Error::InvalidSection)?;
                 // if the slice was successful, check its hash
                 anyhow::ensure!(
-                    seahash::hash(slice.as_bytes()) == edge.weight().section.hash,
+                    seahash::hash(slice.as_bytes()) == edge.section.hash,
                     cmd::Error::InvalidHash
                 );
                 // Check that the section of text parses successfully (all names present in the
                 // name_table)
                 validate_edge(slice, &data.name_table)?;
-                validate_requirement(
-                    &edge.weight().requirement,
-                    &data.name_table,
-                    &data.val_table,
-                )?;
-                validate_effect(&edge.weight().effect, &data.name_table, &data.val_table)?;
+                validate_requirement(&edge.requirement, &data.name_table, &data.val_table)?;
+                validate_effect(&edge.effect, &data.name_table, &data.val_table)?;
                 Ok(())
             })?;
             Ok(())
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[allow(dead_code)]
-    fn setup_logger() {
-        simple_logger::SimpleLogger::new().init().unwrap();
-    }
-
-    /// helper function to parse cmd_bufs in the same way the editor does
-    #[inline(always)]
-    #[allow(dead_code)]
-    fn run_cmd(cmd_buf: &str, state: &mut EditorState) -> Result<usize> {
-        let cmds = shellwords::split(&cmd_buf).unwrap();
-        let res = cmd::Parse::from_iter_safe(cmds);
-        let v = res.unwrap();
-        v.execute(state)
-    }
-
-    #[test]
-    /// Test basic use case of the editor, new project, add a few nodes and names, list the output,
-    /// save the project, reload, list the output again
-    fn simple() {
-        setup_logger();
-        let mut cmd_buf = String::with_capacity(1000);
-        let mut state = EditorState::new(DialogueTreeData::default());
-        cmd_buf.push_str("new project \"simple_test\" -s");
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-        assert_eq!(state.active.name, "simple_test");
-
-        cmd_buf.push_str("new name cat Behemoth");
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-        assert_eq!(state.active.name_table.get("cat").unwrap(), "Behemoth");
-
-        cmd_buf.push_str("new val rus_lit 50");
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-        assert_eq!(*state.active.val_table.get("rus_lit").unwrap(), 50);
-
-        cmd_buf.push_str("new node cat \"Well, who knows, who knows\"");
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-        cmd_buf.push_str(
-            "new node cat \"'I protest!' ::cat:: exclaimed hotly. 'Dostoevsky is immortal'\"",
-        );
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-        cmd_buf
-            .push_str("new edge -r Less(rus_lit,51) -e Sub(rus_lit,1) 0 1 \"Dostoevsky's dead\"");
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-
-        cmd_buf.push_str("list");
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-
-        let expected_list = concat!(
-            "node 0: Behemoth says \"Well, who knows, who knows\"\r\n",
-            "--> edge 0 to node 1: \"Dostoevsky's dead\"\r\n",
-            "    requirements: Less(\"rus_lit\", 51), effects: Sub(\"rus_lit\", 1)\r\n",
-            "node 1: Behemoth says \"'I protest!' Behemoth exclaimed hotly. 'Dostoevsky is immortal'\"\r\n",
-        );
-        assert_eq!(state.scratchpad, expected_list);
-        state.scratchpad.clear();
-
-        cmd_buf.push_str("save");
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-
-        cmd_buf.push_str("load simple_test");
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-
-        cmd_buf.push_str("rebuild");
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-
-        cmd_buf.push_str("list");
-        run_cmd(&cmd_buf, &mut state).unwrap();
-        cmd_buf.clear();
-
-        assert_eq!(state.scratchpad, expected_list);
-        state.scratchpad.clear();
-
-        std::fs::remove_file("simple_test.tree").unwrap();
-        std::fs::remove_file("simple_test.tree.bkp").unwrap();
-    }
-
-    #[test]
-    // TODO: move to criterion
-    /// Benchmark node parsing worst case, many substitutions and improperly sized buffer
-    fn stress_parse_node() {
-        let mut name_table = NameTable::default();
-        name_table.insert(
-            KeyString::from("Elle").unwrap(),
-            NameString::from("Amberson").unwrap(),
-        );
-        name_table.insert(
-            KeyString::from("Patrick").unwrap(),
-            NameString::from("Breakforest").unwrap(),
-        );
-        name_table.insert(
-            KeyString::from("Anna").unwrap(),
-            NameString::from("Catmire").unwrap(),
-        );
-        name_table.insert(
-            KeyString::from("Laura").unwrap(),
-            NameString::from("Dagson").unwrap(),
-        );
-        name_table.insert(
-            KeyString::from("John").unwrap(),
-            NameString::from("Elliot").unwrap(),
-        );
-
-        let text = "::Elle::xzunz::Anna::lxn ::Elle::cn::Patrick::o::Laura::sokxt::Patrick::eowln
-        ::Patrick::::John::c::Patrick::iw qyyhr.jxhccpyvchze::Anna::ox hi::Laura::nlv::John::peh
-        swvnismjs::John::p::Laura::::John::slu.hlqzkei jhrskiswe::John::::John::m.rx::Patrick::pk
-        te::Elle::h::John::m,z,.jwtol::Elle::h rwvnpuqw::John::::John::::Elle::tnz::Elle::.kv.
-        ::Laura::xyxml jrsei::John::jlsl nysn::Patrick::mvvu.up::Laura::jh,t,,jnwheu npnxqcowev
-        ::Anna::,::Elle::.emiv::John::ezoqy::Elle::cppyxtos,miqphi::Elle::.q c::Patrick::nzms
-        skno::Laura:: mkzn.::Patrick::x::John::s jhl::John::ow::John::nj hsk::Elle::ihwpens rx
-        ::Patrick::nn..iurtxcou::Laura::hypkqoyqyz.iihu::Elle::umcpvl::Patrick::::Anna::.cjh,cn
-        phey::Patrick::hxorixcyr::Anna::u::Anna::  heuneszejtwrkewiymmq::John::ynjvh::Laura::lvvtunm
-        ::Laura::i.rk::Patrick::hk::Elle::knvmml::John::j::Anna::::Anna::pslllnmtcyjzesls moj ttm
-        ::Elle::jrr,mh,::Anna:: pyl::Anna::owunpjve::John::::Laura:: ::Anna::xci::Patrick::p::Laura::
-        l.iwn::Elle::lnjx::Laura::oyo::Anna::eq,n::Elle::ej.::Laura::hh";
-
-        // bench part
-        let mut name_buf = String::with_capacity(1);
-        let mut buf = String::with_capacity(1);
-        cmd::util::parse_node(text, &name_table, &mut name_buf, &mut buf).unwrap();
-    }
-
-    #[test]
-    /// Benchmark standard node parsing case, few substitutions and pre-allocated buffer
-    fn quick_parse_node() {
-        let mut name_table = NameTable::default();
-        name_table.insert(
-            KeyString::from("vamp").unwrap(),
-            NameString::from("Dracula").unwrap(),
-        );
-        name_table.insert(
-            KeyString::from("king").unwrap(),
-            NameString::from("King Laugh").unwrap(),
-        );
-
-        let text = "::vamp::It is a strange world, a sad world, a world full of miseries, and woes, and 
-        troubles. And yet when ::king:: come, he make them all dance to the tune he play. Bleeding hearts, 
-        and dry bones of the churchyard, and tears that burn as they fall, all dance together to the music
-        that he make with that smileless mouth of him. Ah, we men and women are like ropes drawn tight with
-        strain that pull us different ways. Then tears come, and like the rain on the ropes, they brace us 
-        up, until perhaps the strain become too great, and we break. But ::king:: he come like the
-        sunshine, and he ease off the strain again, and we bear to go on with our labor, what it may be.";
-
-        let mut name_buf = String::with_capacity(20);
-        let mut buf = String::with_capacity(text.len() + 50);
-
-        // bench part
-        cmd::util::parse_node(text, &name_table, &mut name_buf, &mut buf).unwrap();
-    }
-
-    /// Sanity check that the index on stablegraph nodes and indices are preserved across removes
-    /// and adds. This is not guaranteed by stable_graph docs
-    #[test]
-    fn stable_graph_remove_add() {
-        let dia = Dialogue::new(Section::new([0, 10], 0), Position::new(0.0, 0.0));
-
-        // create dummy graph with a bunch of nodes
-        let mut tree = Tree::new();
-        for i in 0..100 {
-            let mut node = dia.clone();
-            node.section.hash = i;
-            tree.add_node(node);
-        }
-
-        // confirm that all indices equal the hash for added nodes before doing any removals
-        for index in tree.node_indices() {
-            assert_eq!(
-                index.index() as u64,
-                tree.node_weight(index).unwrap().section.hash
-            );
-        }
-
-        // remove some random nodes
-        let weight_0 = tree.remove_node(NodeIndex::new(0)).unwrap();
-        let weight_57 = tree.remove_node(NodeIndex::new(57)).unwrap();
-        let weight_26 = tree.remove_node(NodeIndex::new(26)).unwrap();
-
-        // re-add some nodes in reverse order that they were removed
-        // check that the indices are as expected
-        assert_eq!(tree.add_node(weight_26), NodeIndex::new(26));
-        assert_eq!(tree.add_node(weight_57), NodeIndex::new(57));
-        assert_eq!(tree.add_node(weight_0), NodeIndex::new(0));
-    }
-
-    #[test]
-    fn undo_redo() {
-        setup_logger();
-        let mut state = EditorState::new(DialogueTreeData::default());
-        // create dummy project and speaker name
-        cmd::new::Project::new("undo_redo".to_string(), true)
-            .execute(&mut state)
-            .unwrap();
-        let speaker = KeyString::from("test").unwrap();
-        cmd::new::Name::new(speaker, NameString::from("undo_redo").unwrap())
-            .execute(&mut state)
-            .unwrap();
-
-        // create dummy nodes and edges
-        for i in 0..100 {
-            cmd::new::Node::new(speaker.to_string(), format!("test dialogue {}", i));
-        }
-        for i in 0..99 {
-            cmd::new::Edge::new(i, i + 1, format!("test choice {}", i), None, None);
-        }
-
-        // undo every other node
     }
 }

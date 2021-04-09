@@ -22,6 +22,7 @@ enum_from_str_derive = "0.1.0"
 seahash = "4.1.0"
 thiserror = "1.0"
 anyhow = "1.0"
+fixedbitset = "0.4"
 
 [dev-dependencies]
 shellwords = "1.1.0"

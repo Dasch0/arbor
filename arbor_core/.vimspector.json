@@ -1,0 +1,11 @@
+{
+  "configurations": {
+    "launch": {
+      "adapter": "CodeLLDB",
+      "configuration": {
+        "request": "launch",
+        "program": "${workspaceRoot}/../target/debug/deps/tests-ac842eb0788c8410"
+      }
+    }
+  }
+}
