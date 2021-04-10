@@ -1,4 +1,5 @@
 pub use anyhow::Result;
+use bincode::Options;
 pub use cmd::Executable;
 use derive_new::*;
 use enum_dispatch::*;
@@ -7,7 +8,6 @@ use log::{debug, info, trace};
 use rayon::prelude::*;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
-use serde_diff::SerdeDiff;
 pub use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::io::Write;
@@ -54,7 +54,7 @@ pub type KeyString = arrayvec::ArrayString<KEY_MAX_LEN>;
 pub type NameString = arrayvec::ArrayString<NAME_MAX_LEN>;
 
 /// Struct for storing the 2d position of a node. Used for graph visualization
-#[derive(new, Serialize, Deserialize, SerdeDiff, Clone, Copy)]
+#[derive(new, Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
@@ -70,7 +70,7 @@ impl Default for Position {
 /// stored in an array. The first element should always be smaller than the second. Additionally
 /// the hash of that text section is stored in order to validate that the section is valid
 //TODO: Is hash necessary for actually running the dialogue tree?
-#[derive(new, Serialize, Deserialize, SerdeDiff, Clone, Copy)]
+#[derive(new, Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct Section {
     /// A start and end index to some section of text
     pub text: [usize; 2],
@@ -156,7 +156,7 @@ pub mod tree {
         }
     }
 
-    #[derive(new, Serialize, Deserialize, SerdeDiff, Clone)]
+    #[derive(new, Debug, Serialize, Deserialize, Clone)]
     pub struct Tree {
         // TODO: Make Node type generic if needed
         nodes: Vec<Dialogue>,
@@ -597,10 +597,11 @@ pub type ValTable = HashMap<KeyString, u32>;
 /// This struct contains the tree representing the dialogue nodes and player actions connecting
 /// them, the buffer which stores all text in a tightly packed manner, and hashtables for storing
 /// variables such as player names, conditionals, etc.
-#[derive(new, Serialize, Deserialize, SerdeDiff, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DialogueTreeData {
     pub uid: usize,
     pub tree: Tree,
+    #[serde_diff(skip)]
     pub text: String,
     #[serde_diff(opaque)]
     pub name_table: NameTable,
@@ -620,15 +621,27 @@ impl DialogueTreeData {
             name: String::new(),
         }
     }
+    pub fn new(name: &str) -> Self {
+        DialogueTreeData {
+            uid: cmd::util::gen_uid(),
+            tree: Tree::with_capacity(512, 2048),
+            text: String::with_capacity(8192),
+            name_table: HashMap::default(),
+            val_table: HashMap::default(),
+            name: String::from(name),
+        }
+    }
 }
 
 /// State information for an editor instance. Includes two copies of the dialogue tree (one active
 /// and one backup) as well as other state information
-#[derive(Serialize, Deserialize, SerdeDiff)]
+#[derive(Serialize, Deserialize)]
 pub struct EditorState {
     pub active: DialogueTreeData,
     pub backup: DialogueTreeData,
     pub scratchpad: String,
+    pub history: Vec<usize>,
+    pub stack: Vec<u8>,
 }
 
 impl EditorState {
@@ -641,6 +654,8 @@ impl EditorState {
             active: data.clone(),
             backup: data,
             scratchpad: String::with_capacity(1000),
+            history: Vec::with_capacity(128),
+            stack: Vec::with_capacity(8192),
         }
     }
 
@@ -651,7 +666,7 @@ impl EditorState {
 }
 
 /// Struct storing the information for a player choice. Stored in the edges of a dialogue tree
-#[derive(new, Serialize, Deserialize, SerdeDiff, Clone, Copy)]
+#[derive(new, Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct Choice {
     pub section: Section,
     pub requirement: ReqKind,
@@ -660,17 +675,17 @@ pub struct Choice {
 
 /// Struct for storing the information for a line of dialogue. Stored in the nodes of a dialogue
 /// tree
-#[derive(new, Serialize, Deserialize, SerdeDiff, Clone, Copy)]
+#[derive(new, Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct Dialogue {
     pub section: Section,
     pub pos: Position,
 }
 
-#[derive(Debug, Serialize, Deserialize, SerdeDiff, PartialEq, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde_diff(opaque)]
 pub enum ReqKind {
     /// No requirement
-    None,
+    No,
     /// Must be greater than num
     Greater(KeyString, u32),
     /// Must be less than num
@@ -735,11 +750,10 @@ impl std::str::FromStr for ReqKind {
 /// Name length strings are stored as a heap allocated String rather than a static NameString as
 /// that would bloat enum size by 32 bytes, when Cmp will rarely be used compared to val based
 /// requirements
-#[derive(Debug, Serialize, Deserialize, SerdeDiff, PartialEq, Clone, Copy)]
-#[serde_diff(opaque)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 pub enum EffectKind {
     /// No effect
-    None,
+    No,
     Add(KeyString, u32),
     Sub(KeyString, u32),
     Set(KeyString, u32),
@@ -907,14 +921,7 @@ pub mod cmd {
         impl Executable for Project {
             /// New Project
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
-                let new_project = DialogueTreeData::new(
-                    util::gen_uid(),
-                    Tree::with_capacity(512, 2048),
-                    String::with_capacity(8192),
-                    HashMap::default(),
-                    HashMap::default(),
-                    self.name.clone(),
-                );
+                let new_project = DialogueTreeData::new(self.name.as_str());
 
                 let encoded = bincode::serialize(&new_project)?;
                 std::fs::write(self.name.clone() + TREE_EXT, encoded)?;
@@ -1027,8 +1034,8 @@ pub mod cmd {
 
                 let choice = Choice::new(
                     Section::new([start, end], hash),
-                    self.requirement.clone().unwrap_or(ReqKind::None),
-                    self.effect.clone().unwrap_or(EffectKind::None),
+                    self.requirement.clone().unwrap_or(ReqKind::No),
+                    self.effect.clone().unwrap_or(EffectKind::No),
                 );
 
                 trace!("Adding new edge to tree");
@@ -1207,8 +1214,8 @@ pub mod cmd {
                 trace!("update edge weight in tree");
                 let new_weight = Choice::new(
                     Section::new([start, end], hash),
-                    self.requirement.clone().unwrap_or(ReqKind::None),
-                    self.effect.clone().unwrap_or(EffectKind::None),
+                    self.requirement.clone().unwrap_or(ReqKind::No),
+                    self.effect.clone().unwrap_or(EffectKind::No),
                 );
                 state.active.tree.edit_edge(self.edge_index, new_weight)?;
 
@@ -1288,7 +1295,7 @@ pub mod cmd {
         }
     }
 
-    mod remove {
+    pub mod remove {
         use super::*;
 
         /// Remove existing things
@@ -1368,7 +1375,7 @@ pub mod cmd {
                 for choice in state.active.tree.edges() {
                     // this match will stop compiling any time a new reqKind is added
                     match &choice.requirement {
-                        ReqKind::None => Ok(()),
+                        ReqKind::No => Ok(()),
                         ReqKind::Greater(_, _) => Ok(()),
                         ReqKind::Less(_, _) => Ok(()),
                         ReqKind::Equal(_, _) => Ok(()),
@@ -1381,7 +1388,7 @@ pub mod cmd {
                         }
                     }?;
                     match &choice.effect {
-                        EffectKind::None => Ok(()),
+                        EffectKind::No => Ok(()),
                         EffectKind::Add(_, _) => Ok(()),
                         EffectKind::Sub(_, _) => Ok(()),
                         EffectKind::Set(_, _) => Ok(()),
@@ -1420,7 +1427,7 @@ pub mod cmd {
                 for choice in state.active.tree.edges() {
                     // this match will stop compiling any time a new reqKind is added
                     match &choice.requirement {
-                        ReqKind::None => Ok(()),
+                        ReqKind::No => Ok(()),
                         ReqKind::Greater(key, _) => {
                             if key.eq(self.key.as_str()) {
                                 Err(cmd::Error::NameInUse)
@@ -1445,7 +1452,7 @@ pub mod cmd {
                         ReqKind::Cmp(_, _) => Ok(()),
                     }?;
                     match &choice.effect {
-                        EffectKind::None => Ok(()),
+                        EffectKind::No => Ok(()),
                         EffectKind::Add(key, _) => {
                             if key.eq(self.key.as_str()) {
                                 Err(cmd::Error::NameInUse)
@@ -1661,6 +1668,36 @@ pub mod cmd {
     pub mod util {
         use super::*;
 
+        /// Create a serialized serde_diff from struct a to b, push that diff onto a provided
+        /// stack of serialized diffs, and add the start and end of that serialized diff in the
+        /// stack to the history list
+        pub fn push_diff(
+            a: &DialogueTreeData,
+            b: &DialogueTreeData,
+            history: &mut Vec<usize>,
+            stack: &mut Vec<u8>,
+        ) -> Result<()> {
+            let start = stack.len();
+            stack.append(&mut bincode::serialize(&Diff::serializable(a, b))?);
+            let end = stack.len();
+            history.push(end - start);
+            Ok(())
+        }
+
+        /// Pop the last diff off the history/stack and apply it to the struct
+        pub fn pop_diff(
+            a: &mut DialogueTreeData,
+            history: &mut Vec<usize>,
+            stack: &mut Vec<u8>,
+        ) -> Result<()> {
+            let num_bytes = history.pop().ok_or(cmd::Error::UndoFailed)?;
+            let start = stack.len() - num_bytes;
+            let end = stack.len();
+            bincode::config()
+                .deserialize_seed(serde_diff::Apply::deserializable(a), &stack[start..end])?;
+            Ok(())
+        }
+
         /// Generate UID.
         ///
         /// UID is a 64 bit unique identifier for the project. This is stored in the dialogue
@@ -1707,7 +1744,6 @@ pub mod cmd {
             name_buf.push_str(speaker_name);
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
                 if (i & 0x1) == 1 {
-                    println!("{}:{}", i, n);
                     // token is a name (index 1, 3, 5 ...)
                     let value = name_table.get(n).ok_or(cmd::Error::NodeParse)?;
                     text_buf.push_str(value);
@@ -1758,14 +1794,11 @@ pub mod cmd {
             text_buf.clear();
             let mut text_iter = text.split(TOKEN_SEP).enumerate();
             text_iter.try_for_each(|(i, n)| -> std::result::Result<(), cmd::Error> {
-                println!("{}:{}", i, n);
                 if (i & 0x1) == 0 {
                     // token cannot be a name
                     text_buf.push_str(n);
                     Ok(())
                 } else {
-                    // token is a name
-                    println!("{}", n);
                     let value = name_table.get(n).ok_or(cmd::Error::EdgeParse)?;
                     text_buf.push_str(value);
                     Ok(())
@@ -1880,7 +1913,7 @@ pub mod cmd {
         ) -> Result<()> {
             // this match will stop compiling any time a new reqKind is added
             match req {
-                ReqKind::None => {}
+                ReqKind::No => {}
                 ReqKind::Greater(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
@@ -1910,7 +1943,7 @@ pub mod cmd {
             // NOTE: remember, if val is a u32, check the val_table, if val is a String, check the
             // name table
             match effect {
-                EffectKind::None => {}
+                EffectKind::No => {}
                 EffectKind::Add(key, _val) => {
                     val_table.get(key).ok_or(cmd::Error::ValNotExists)?;
                 }
