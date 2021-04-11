@@ -97,6 +97,8 @@ impl std::ops::IndexMut<usize> for Section {
 //pub type Tree = petgraph::stable_graph::StableGraph<Dialogue, Choice>;
 
 pub mod tree {
+    use std::thread::current;
+
     use super::*;
 
     /// Type definitions for Node and Edge indices resolved to usize, mainly used for improved
@@ -137,6 +139,7 @@ pub mod tree {
     }
 
     /// Iterator over the outgoing edge indices of a node
+    #[derive(new, Clone, Copy)]
     pub struct OutgoingEdges<'a> {
         edge_links: &'a [EdgeIndex],
         next: EdgeIndex,
@@ -153,6 +156,59 @@ pub mod tree {
                 self.next = self.edge_links[self.next];
                 Some(current)
             }
+        }
+    }
+
+    /// Walker for mutable references to the outgoing edges of a node
+    #[derive(Clone, Copy)]
+    pub struct OutgoingEdgeWalker {
+        len: usize,
+        source: NodeIndex,
+        current: EdgeIndex,
+        next: EdgeIndex,
+    }
+
+    impl OutgoingEdgeWalker {
+        /// create a new outgoing edge walker object for a given source node
+        ///
+        /// # Errors
+        /// Error if node index is invalid
+        pub fn new(tree: &Tree, source: NodeIndex) -> Result<Self> {
+            tree.get_node(source)?;
+            Ok(Self {
+                len: 0,
+                source,
+                current: EdgeIndex::end(),
+                next: tree.node_links[source],
+            })
+        }
+
+        /// get a mutable reference to the next link in the outgoing edges list
+        ///
+        /// # Errors
+        /// Error if the edge index link is invalid
+        pub fn next<'a> (&mut self, tree: &'a Tree) -> Result<&'a mut EdgeIndex> {
+            self.len += 1;
+            self.current = self.next;
+            self.next = *tree.edge_links.get(self.next).ok_or(tree::Error::InvalidEdgeLinks)?;
+            // first edge is from node_links, rest are from edge_links
+            if self.len == 0 {
+                Ok(tree.node_links.get_mut(self.source).ok_or(tree::Error::InvalidEdgeLinks)?)
+            } else {
+                Ok(tree.edge_links.get_mut(self.current).ok_or(tree::Error::InvalidEdgeLinks)?)
+            }
+        }
+
+        /// skip n links, and return the next one
+        ///
+        /// # Errors
+        ///
+        /// Error if the edge index is invalid
+        pub fn skip<'a>(&mut self, tree: &'a Tree, n: usize) -> Result<&'a mut EdgeIndex> {
+            for _ in 0..n {
+                self.next(tree)?;
+            }
+            self.next(tree)
         }
     }
 
@@ -476,6 +532,119 @@ pub mod tree {
             }
 
             Ok(self.edges.swap_remove(index))
+        }
+
+        /// Edit the link order of an edge. This modifies where an edge appears in the linked list
+        /// of outgoing edges from its source node. This is useful if a given edge needs to appear
+        /// in a specific ordering when accessing the outgoing edges of a node
+        ///
+        /// returns the new placement of the edge 
+        /// Desired placement should be considered the index of the node links. 0 is the first
+        /// placement. If the desired_placement given is larger than the number of outgoing edges,
+        /// the edge is placed at the end of the linked list 
+        ///
+        /// # Errors
+        ///
+        /// Error if the node index is invalid, or if the edge index is not an outgoing edge of
+        /// source
+        pub fn edit_link_order(&mut self, source: NodeIndex, edge_index: EdgeIndex, desired_placement: usize) -> Result<usize> {
+            // get the node_link that starts the linked list
+            let mut outgoing_edges = OutgoingEdges::new(&self.edge_links, source);
+
+            // go through the linked list and capture information needed to perform the edit 
+            let placement = 0;
+            let len = 0;
+            for (i, edge) in outgoing_edges.clone().enumerate() {
+                if edge == edge_index {
+                    placement = i;
+                }
+                len = i;
+            }
+
+            // clamp desired placement to length of linked_list 
+            let desired_placement = std::cmp::min(len, desired_placement);
+
+            // special cases to handle
+            //  1. placement is already as desired
+            //  2. either the current placement or desired placement is in node_links instead of
+            //     edge links
+            //  3. The link before the placement or desired placement is in node_links instead of
+            //     edge links
+            //
+            //
+            // case 2 is handled automatically by OutgoingEdgeWalker
+            if placement == desired_placement {
+                Ok(placement)
+            } else if desired_placement == 0 {
+                // example visualization:
+                // where placement = 2, desired = 0 
+                // from:
+                //  node_link -> 0 -> 1 -> 2 -> 3 -> end
+                //      before _________|    |
+                //          at ______________| 
+                // to:
+                //  node_link -> 2 -> 0 -> 1 -> 3 -> end
+                //      before ____|_________|
+                //          at ____|
+                //
+                // total changes:
+                //  1. 'at' is pointing at node_link 
+                //  2. 'before' is pointing to 'at'
+                //  3. node_link now points at 'placement'
+                let placement_walker = OutgoingEdgeWalker::new(&self, source)?;
+                let link_before_placement = placement_walker.skip(&self, placement - 1)?;
+                let link_at_placement = placement_walker.next(&self)?;
+                let link_at_desired = self.node_links.get_mut(source).ok_or(tree::Error::InvalidEdgeLinks)?;
+
+                *link_before_placement = *link_at_placement;
+                *link_at_placement = *link_at_desired;
+                *link_at_desired = edge_index;
+                Ok(placement)
+                
+            } else if placement == 0 {
+                // example visualization:
+                // where placement = 0, desired = 2
+                // from:
+                //  node_link -> 0 -> 1 -> 2 -> 3 -> end
+                //   before___|    |    |    |
+                //      at_________|    |    |
+                //          before_des__|    |
+                //              at_des_______|
+                // to:
+                //  node_link -> 2 -> 1 -> 0 -> 3 -> end
+                //   before___|    |    |    |
+                //      at ________|____|____|
+                //          before_des__|
+                //   at_des________|
+                // total changes:
+                //  1. 'at' is pointing at node_link 
+                //  2. 'before' is pointing to 'at'
+                //  3. node_link now points at 'placement'
+                let placement_walker = OutgoingEdgeWalker::new(&self, source)?;
+                let link_before_placement = placement_walker.skip(&self, placement - 1)?;
+                let link_at_placement = placement_walker.next(&self)?;
+                let link_at_desired = self.node_links.get_mut(source).ok_or(tree::Error::InvalidEdgeLinks)?;
+
+                *link_before_placement = *link_at_placement;
+                *link_at_placement = *link_at_desired;
+                *link_at_desired = edge_index;
+                Ok(placement)
+            } else {
+                // get mutable reference to the links to swap near current placement
+                let placement_walker = OutgoingEdgeWalker::new(&self, source)?;
+                let link_before_placement = placement_walker.skip(&self, placement - 1)?;
+                let link_at_placement = placement_walker.next(&self)?;
+
+                // get mutable reference to the links to swap near current placement
+                let desired_walker = OutgoingEdgeWalker::new(&self, source)?;
+                let link_before_desired = desired_walker.skip(&self, desired_placement - 1)?;
+                let link_at_desired = desired_walker.next(&self)?;
+
+                //swap links_before_* and links_at_*
+                std::mem::swap(link_before_placement, link_before_desired);
+                std::mem::swap(link_at_placement, link_at_desired);
+                Ok(placement)
+            }
         }
 
         /// Get an immutable view of the edges in the tree
