@@ -1,5 +1,4 @@
 pub use anyhow::Result;
-use bincode::Options;
 pub use cmd::Executable;
 use derive_new::*;
 use enum_dispatch::*;
@@ -97,8 +96,6 @@ impl std::ops::IndexMut<usize> for Section {
 //pub type Tree = petgraph::stable_graph::StableGraph<Dialogue, Choice>;
 
 pub mod tree {
-    use std::thread::current;
-
     use super::*;
 
     /// Type definitions for Node and Edge indices resolved to usize, mainly used for improved
@@ -187,15 +184,24 @@ pub mod tree {
         ///
         /// # Errors
         /// Error if the edge index link is invalid
-        pub fn next<'a> (&mut self, tree: &'a Tree) -> Result<&'a mut EdgeIndex> {
+        pub fn next<'a>(&mut self, tree: &'a mut Tree) -> Result<&'a mut EdgeIndex> {
             self.len += 1;
             self.current = self.next;
-            self.next = *tree.edge_links.get(self.next).ok_or(tree::Error::InvalidEdgeLinks)?;
+            self.next = *tree
+                .edge_links
+                .get(self.next)
+                .ok_or(tree::Error::InvalidEdgeLinks)?;
             // first edge is from node_links, rest are from edge_links
             if self.len == 0 {
-                Ok(tree.node_links.get_mut(self.source).ok_or(tree::Error::InvalidEdgeLinks)?)
+                Ok(tree
+                    .node_links
+                    .get_mut(self.source)
+                    .ok_or(tree::Error::InvalidEdgeLinks)?)
             } else {
-                Ok(tree.edge_links.get_mut(self.current).ok_or(tree::Error::InvalidEdgeLinks)?)
+                Ok(tree
+                    .edge_links
+                    .get_mut(self.current)
+                    .ok_or(tree::Error::InvalidEdgeLinks)?)
             }
         }
 
@@ -204,7 +210,7 @@ pub mod tree {
         /// # Errors
         ///
         /// Error if the edge index is invalid
-        pub fn skip<'a>(&mut self, tree: &'a Tree, n: usize) -> Result<&'a mut EdgeIndex> {
+        pub fn skip<'a>(&mut self, tree: &'a mut Tree, n: usize) -> Result<&'a mut EdgeIndex> {
             for _ in 0..n {
                 self.next(tree)?;
             }
@@ -219,12 +225,11 @@ pub mod tree {
         edges: Vec<Choice>,
         /// Node links implement a linked list to the outgoing edges of a given node. The
         /// node index may be used to index into this array to get the first outgoing edge for that
-        /// node. This will be None if there are no outgoing edges
+        /// node.
         node_links: Vec<EdgeIndex>,
         /// Edge links implement a linked lists to rest of the outgoing edges of a given node. The
         /// edge index from the previous node_links or edge_links value may be used to index into
-        /// this array to get the next outgoing edge for a given node. This will be None if it is
-        /// the
+        /// this array to get the next outgoing edge for a given node.
         edge_links: Vec<EdgeIndex>,
         /// List of the targets of an edge. Access via an edge index to get the target node index
         /// for that edge.
@@ -286,7 +291,7 @@ pub mod tree {
         /// # Errors
         /// Error if the nodes list is full (more than usize::MAX - 1 nodes)
         #[inline]
-        pub fn add_node(&mut self, node: Dialogue) -> Result<usize> {
+        pub fn add_node(&mut self, node: Dialogue) -> Result<NodeIndex> {
             anyhow::ensure!(
                 self.nodes.len() < NodeIndex::end() - 1,
                 tree::Error::NodesFull
@@ -319,8 +324,9 @@ pub mod tree {
         ///
         /// If the index is invalid, or if an edge currently uses the node as a source or target,
         /// an error is returned with no modification to the tree
-        #[inline]
         pub fn remove_node(&mut self, index: NodeIndex) -> Result<Dialogue> {
+            info!("Remove node {}", index);
+
             trace!("check that node index is valid");
             self.nodes.get(index).ok_or(tree::Error::InvalidNodeIndex)?;
 
@@ -346,6 +352,40 @@ pub mod tree {
                 }
                 Ok(removed_node)
             }
+        }
+
+        /// Insert a node in a specific location. Generally used to 'undo' a node removal
+        /// operation. If the requested index is longer than the nodes list, it is placed at the
+        /// end of the list. Returns the node_index where the node was inserted
+        ///
+        /// # Error
+        ///
+        /// Error if the node index is invalid or if the insertion fails
+        pub fn insert_node(
+            &mut self,
+            node: Dialogue,
+            desired_index: NodeIndex,
+        ) -> Result<NodeIndex> {
+            info!("Insert node at {}", desired_index);
+
+            // clamp index by nodes list length
+            let clamped_desired = std::cmp::min(desired_index, self.nodes.len());
+            debug!("clamped index {} to {}", desired_index, clamped_desired);
+
+            trace!("add node to end of nodes list");
+            let swap_index = self.add_node(node)?;
+
+            info!("swap added node with node at the clamped desired index");
+            self.nodes.swap(swap_index, clamped_desired);
+
+            info!("resolve any edge targets that have changed due to the swap");
+            for target in self.edge_targets.as_mut_slice() {
+                if *target == swap_index {
+                    *target = clamped_desired
+                }
+            }
+
+            Ok(clamped_desired)
         }
 
         /// Get an immutable slice of the nodes in the tree
@@ -398,7 +438,6 @@ pub mod tree {
         ///
         /// Panics if a cycle is found in the edge_links list for this node. This means that the
         /// graph is corrupted and likely can't be recovered
-        #[inline]
         pub fn add_edge(
             &mut self,
             source: NodeIndex,
@@ -462,7 +501,6 @@ pub mod tree {
         ///
         /// If the index is invalid, a corresponding error will be returned
         /// with no modification to the tree.
-        #[inline]
         pub fn edit_edge(&mut self, index: usize, new_choice: Choice) -> Result<Choice> {
             trace!("check validity of edge index");
             let choice = self
@@ -482,7 +520,6 @@ pub mod tree {
         /// # Errors
         ///
         /// If the index is invalid, an error will be returned without modifying the tree
-        #[inline]
         pub fn remove_edge(&mut self, index: usize) -> Result<Choice> {
             trace!("check validity of edge index");
             self.edges
@@ -534,117 +571,164 @@ pub mod tree {
             Ok(self.edges.swap_remove(index))
         }
 
+        /// Insert an in a specific location in the edge list and with a specific placement in a
+        /// given linked list of outgoing edges from a node. Generally used to 'undo' a edge
+        /// removal operation. If the requested index is longer than the edges list, it is placed
+        /// at the end of the list. Returns the edge_index where the edge was inserted and the
+        /// placement of the edge in the linked list of its source node
+        ///
+        /// # Error
+        ///
+        /// Error if any indexes are invalid or if the insertion fails
+        pub fn insert_edge(
+            &mut self,
+            source: NodeIndex,
+            target: NodeIndex,
+            choice: Choice,
+            desired_index: EdgeIndex,
+            desired_placement: usize,
+        ) -> Result<(EdgeIndex, usize)> {
+            info!(
+                "Insert edge from {} to {} at index {} and placement {}",
+                source, target, desired_index, desired_placement
+            );
+
+            // clamp index by nodes list length
+            let clamped_desired_index = std::cmp::min(desired_index, self.nodes.len());
+            debug!(
+                "clamped index {} to {}",
+                desired_index, clamped_desired_index
+            );
+
+            trace!("add edge manually to edges and targets list and swap it into desired position");
+            // not adding to linked list yet, will do that after swapping
+            self.edges.push(choice);
+            self.edge_targets.push(target);
+            // index of added edge is length of edge list - 1
+            let swap_index = self.edges.len() - 1;
+            self.edges.swap(swap_index, clamped_desired_index);
+            self.edge_targets.swap(swap_index, clamped_desired_index);
+
+            info!("resolve any node/edge links that have changed due to the swap");
+            for link in self.node_links.as_mut_slice() {
+                if *link == swap_index {
+                    *link = clamped_desired_index;
+                }
+            }
+            for link in self.edge_links.as_mut_slice() {
+                if *link == swap_index {
+                    *link = clamped_desired_index;
+                }
+            }
+
+            let placement = self.insert_link(source, clamped_desired_index, desired_placement)?;
+            Ok((clamped_desired_index, placement))
+        }
+
         /// Edit the link order of an edge. This modifies where an edge appears in the linked list
         /// of outgoing edges from its source node. This is useful if a given edge needs to appear
         /// in a specific ordering when accessing the outgoing edges of a node
         ///
-        /// returns the new placement of the edge 
+        /// returns the new placement of the edge
         /// Desired placement should be considered the index of the node links. 0 is the first
         /// placement. If the desired_placement given is larger than the number of outgoing edges,
-        /// the edge is placed at the end of the linked list 
+        /// the edge is placed at the end of the linked list
         ///
         /// # Errors
         ///
         /// Error if the node index is invalid, or if the edge index is not an outgoing edge of
         /// source
-        pub fn edit_link_order(&mut self, source: NodeIndex, edge_index: EdgeIndex, desired_placement: usize) -> Result<usize> {
-            // get the node_link that starts the linked list
-            let mut outgoing_edges = OutgoingEdges::new(&self.edge_links, source);
+        pub fn edit_link_order(
+            &mut self,
+            source: NodeIndex,
+            edge_index: EdgeIndex,
+            desired_placement: usize,
+        ) -> Result<usize> {
+            info!(
+                "Edit link order for edge {} to {}",
+                edge_index, desired_placement
+            );
 
-            // go through the linked list and capture information needed to perform the edit 
-            let placement = 0;
-            let len = 0;
-            for (i, edge) in outgoing_edges.clone().enumerate() {
-                if edge == edge_index {
-                    placement = i;
+            trace!("remove link from list first");
+            // Check node_links first then edge_links
+            for link in self.node_links.as_mut_slice() {
+                if *link == edge_index {
+                    // link should point to whatever the to-be-deleted link currently points to
+                    *link = self.edge_links[edge_index];
                 }
-                len = i;
+            }
+            for link_index in 0..self.edge_links.len() {
+                if self.edge_links[link_index] == edge_index {
+                    // link should point to whatever the to-be-deleted link currently points to
+                    self.edge_links[link_index] = self.edge_links[edge_index];
+                }
             }
 
-            // clamp desired placement to length of linked_list 
-            let desired_placement = std::cmp::min(len, desired_placement);
+            self.insert_link(source, edge_index, desired_placement)
+        }
 
-            // special cases to handle
-            //  1. placement is already as desired
-            //  2. either the current placement or desired placement is in node_links instead of
-            //     edge links
-            //  3. The link before the placement or desired placement is in node_links instead of
-            //     edge links
-            //
-            //
-            // case 2 is handled automatically by OutgoingEdgeWalker
-            if placement == desired_placement {
-                Ok(placement)
-            } else if desired_placement == 0 {
-                // example visualization:
-                // where placement = 2, desired = 0 
-                // from:
-                //  node_link -> 0 -> 1 -> 2 -> 3 -> end
-                //      before _________|    |
-                //          at ______________| 
-                // to:
-                //  node_link -> 2 -> 0 -> 1 -> 3 -> end
-                //      before ____|_________|
-                //          at ____|
-                //
-                // total changes:
-                //  1. 'at' is pointing at node_link 
-                //  2. 'before' is pointing to 'at'
-                //  3. node_link now points at 'placement'
-                let placement_walker = OutgoingEdgeWalker::new(&self, source)?;
-                let link_before_placement = placement_walker.skip(&self, placement - 1)?;
-                let link_at_placement = placement_walker.next(&self)?;
-                let link_at_desired = self.node_links.get_mut(source).ok_or(tree::Error::InvalidEdgeLinks)?;
+        /// Private helper function that inserts an existing edge into the desired placement of a
+        /// source node's outgoing edges linked list. Returns the placement of the edge in the
+        /// linked list
+        ///
+        ///
+        /// Implementation notes:
+        ///  uses placement walker to resolve node_links and edge links lists, if placement is 0
+        ///  then its the node_links that needs to change not the edge_links.
+        ///
+        ///  placement walker skips desired_placement number of links, then returns a mutable
+        ///  reference to the next link.
+        ///
+        ///  example visualization:
+        ///   we want to insert edge 2 in desired_placement=2:
+        ///
+        ///  ```text
+        ///      source -> 0 -> 1 -> 3 -> end
+        ///       N = 0_|    |    |
+        ///           1______|    |
+        ///           2___________|
+        ///  ```
+        ///  where N is the placement of a link in the linked list order
+        ///  so if desired_placement = 2, edge should be inserted after edge 1, which is the
+        ///  same as skipping 2 links and then pointing link at placement (N=2) at the
+        ///  edge_index.
+        ///
+        ///  The edge_links[edge_index] should now point to whatever link N=2 was previously,
+        ///  resulting in:
+        ///  ```text
+        ///      source -> 0 -> 1 -> 2 -> 3 -> end
+        ///       N = 0_|    |    |
+        ///           1______|    |
+        ///           2___________|
+        ///  ```
+        ///  where only link at placement (N=2) and link[edge_index] were modified
+        fn insert_link(
+            &mut self,
+            source: NodeIndex,
+            edge_index: EdgeIndex,
+            desired_placement: usize,
+        ) -> Result<usize> {
+            info!(
+                "insert edge {} into linked list of {} at placement {}",
+                edge_index, source, desired_placement
+            );
+            // get length of edge_links list, also checks that source is valid
+            let len = self.outgoing_from_index(source)?.count();
 
-                *link_before_placement = *link_at_placement;
-                *link_at_placement = *link_at_desired;
-                *link_at_desired = edge_index;
-                Ok(placement)
-                
-            } else if placement == 0 {
-                // example visualization:
-                // where placement = 0, desired = 2
-                // from:
-                //  node_link -> 0 -> 1 -> 2 -> 3 -> end
-                //   before___|    |    |    |
-                //      at_________|    |    |
-                //          before_des__|    |
-                //              at_des_______|
-                // to:
-                //  node_link -> 2 -> 1 -> 0 -> 3 -> end
-                //   before___|    |    |    |
-                //      at ________|____|____|
-                //          before_des__|
-                //   at_des________|
-                // total changes:
-                //  1. 'at' is pointing at node_link 
-                //  2. 'before' is pointing to 'at'
-                //  3. node_link now points at 'placement'
-                let placement_walker = OutgoingEdgeWalker::new(&self, source)?;
-                let link_before_placement = placement_walker.skip(&self, placement - 1)?;
-                let link_at_placement = placement_walker.next(&self)?;
-                let link_at_desired = self.node_links.get_mut(source).ok_or(tree::Error::InvalidEdgeLinks)?;
+            // clamp desired placement to length of linked_list
+            let clamped_desired = std::cmp::min(len, desired_placement);
+            debug!(
+                "clamped desired placement from {} to {}",
+                desired_placement, clamped_desired
+            );
 
-                *link_before_placement = *link_at_placement;
-                *link_at_placement = *link_at_desired;
-                *link_at_desired = edge_index;
-                Ok(placement)
-            } else {
-                // get mutable reference to the links to swap near current placement
-                let placement_walker = OutgoingEdgeWalker::new(&self, source)?;
-                let link_before_placement = placement_walker.skip(&self, placement - 1)?;
-                let link_at_placement = placement_walker.next(&self)?;
-
-                // get mutable reference to the links to swap near current placement
-                let desired_walker = OutgoingEdgeWalker::new(&self, source)?;
-                let link_before_desired = desired_walker.skip(&self, desired_placement - 1)?;
-                let link_at_desired = desired_walker.next(&self)?;
-
-                //swap links_before_* and links_at_*
-                std::mem::swap(link_before_placement, link_before_desired);
-                std::mem::swap(link_at_placement, link_at_desired);
-                Ok(placement)
-            }
+            trace!("insert the link at clamped desired location");
+            let mut placement_walker = OutgoingEdgeWalker::new(&self, source)?;
+            let link_at_placement: &mut EdgeIndex = placement_walker.skip(self, clamped_desired)?;
+            let val_at_placement = *link_at_placement;
+            *link_at_placement = edge_index;
+            self.edge_links[edge_index] = val_at_placement;
+            Ok(clamped_desired)
         }
 
         /// Get an immutable view of the edges in the tree
@@ -664,7 +748,7 @@ pub mod tree {
         /// # use arbor_core::*;
         /// # use arbor_core::tree::*;
         /// # let dialogue = Dialogue::new(Section::new([0, 0], 0), Position::new(0.0, 0.0));
-        /// # let choice = Choice::new(Section::new([0,0],0), ReqKind::None, EffectKind::None);
+        /// # let choice = Choice::new(Section::new([0,0],0), ReqKind::No, EffectKind::No);
         /// let mut tree = Tree::with_capacity(10, 10);
         /// // add two nodes with dummy dialogue values
         /// let first_node_idx: NodeIndex = tree.add_node(dialogue).unwrap();
@@ -770,11 +854,8 @@ pub type ValTable = HashMap<KeyString, u32>;
 pub struct DialogueTreeData {
     pub uid: usize,
     pub tree: Tree,
-    #[serde_diff(skip)]
     pub text: String,
-    #[serde_diff(opaque)]
     pub name_table: NameTable,
-    #[serde_diff(opaque)]
     pub val_table: ValTable,
     pub name: String,
 }
@@ -851,7 +932,6 @@ pub struct Dialogue {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
-#[serde_diff(opaque)]
 pub enum ReqKind {
     /// No requirement
     No,
@@ -1836,36 +1916,6 @@ pub mod cmd {
     /// from the command line, but are useful for working with dialogue_trees in other programs
     pub mod util {
         use super::*;
-
-        /// Create a serialized serde_diff from struct a to b, push that diff onto a provided
-        /// stack of serialized diffs, and add the start and end of that serialized diff in the
-        /// stack to the history list
-        pub fn push_diff(
-            a: &DialogueTreeData,
-            b: &DialogueTreeData,
-            history: &mut Vec<usize>,
-            stack: &mut Vec<u8>,
-        ) -> Result<()> {
-            let start = stack.len();
-            stack.append(&mut bincode::serialize(&Diff::serializable(a, b))?);
-            let end = stack.len();
-            history.push(end - start);
-            Ok(())
-        }
-
-        /// Pop the last diff off the history/stack and apply it to the struct
-        pub fn pop_diff(
-            a: &mut DialogueTreeData,
-            history: &mut Vec<usize>,
-            stack: &mut Vec<u8>,
-        ) -> Result<()> {
-            let num_bytes = history.pop().ok_or(cmd::Error::UndoFailed)?;
-            let start = stack.len() - num_bytes;
-            let end = stack.len();
-            bincode::config()
-                .deserialize_seed(serde_diff::Apply::deserializable(a), &stack[start..end])?;
-            Ok(())
-        }
 
         /// Generate UID.
         ///

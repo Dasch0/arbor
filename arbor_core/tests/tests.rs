@@ -92,7 +92,7 @@ mod tree_tests {
         let mut tree = tree::Tree::with_capacity(10, 10);
         //dummy dialogue for creating nodes
         let dia = Dialogue::new(Section::new([0, 0], 0), Position::default());
-        let choice = Choice::new(Section::new([0, 0], 0), ReqKind::NoEffectKind::None);
+        let choice = Choice::new(Section::new([0, 0], 0), ReqKind::No, EffectKind::No);
 
         for _ in 0..10 {
             tree.add_node(dia).unwrap();
