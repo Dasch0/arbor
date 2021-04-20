@@ -4,7 +4,7 @@
       "adapter": "CodeLLDB",
       "configuration": {
         "request": "launch",
-        "program": "${workspaceRoot}/../target/debug/deps/tests-ac842eb0788c8410"
+        "program": "${workspaceRoot}/../target/debug/deps/tests-71fdf007db950bfa"
       }
     }
   }

@@ -129,7 +129,7 @@ pub mod tree {
         InvalidEdgeIndex,
         #[error("Modification cannot be made to node as it is currently in use in the tree")]
         NodeInUse,
-        #[error("More edge links were found than there may be edges in the tree")]
+        #[error("Attempted to access an invalid edge in an outgoing edges linked list")]
         InvalidEdgeLinks,
         #[error("Nodes list full, node list cannot be larger than usize::MAX - 1")]
         NodesFull,
@@ -159,10 +159,9 @@ pub mod tree {
     /// Walker for mutable references to the outgoing edges of a node
     #[derive(Clone, Copy)]
     pub struct OutgoingEdgeWalker {
-        len: usize,
+        first: bool,
         source: NodeIndex,
-        current: EdgeIndex,
-        next: EdgeIndex,
+        next: Option<EdgeIndex>,
     }
 
     impl OutgoingEdgeWalker {
@@ -173,35 +172,34 @@ pub mod tree {
         pub fn new(tree: &Tree, source: NodeIndex) -> Result<Self> {
             tree.get_node(source)?;
             Ok(Self {
-                len: 0,
+                first: true,
                 source,
-                current: EdgeIndex::end(),
-                next: tree.node_links[source],
+                next: tree.node_links.get(source).copied(),
             })
         }
 
-        /// get a mutable reference to the next link in the outgoing edges list
-        ///
-        /// # Errors
-        /// Error if the edge index link is invalid
-        pub fn next<'a>(&mut self, tree: &'a mut Tree) -> Result<&'a mut EdgeIndex> {
-            self.len += 1;
-            self.current = self.next;
-            self.next = *tree
+        /// get a mutable reference to the next link in the outgoing edges list. Returns None if
+        /// there is no next link.
+        pub fn next<'a>(&mut self, tree: &'a mut Tree) -> Option<&'a mut EdgeIndex> {
+            // capture and clear the 'first' status always
+            let first = self.first;
+            self.first = false;
+            // get node and edge link each time, decide which to return based on 'first'
+            let node_link = tree.node_links.get_mut(self.source);
+            let edge_link = tree
                 .edge_links
-                .get(self.next)
-                .ok_or(tree::Error::InvalidEdgeLinks)?;
-            // first edge is from node_links, rest are from edge_links
-            if self.len == 0 {
-                Ok(tree
-                    .node_links
-                    .get_mut(self.source)
-                    .ok_or(tree::Error::InvalidEdgeLinks)?)
+                .get_mut(self.next.unwrap_or_else(EdgeIndex::end));
+
+            // conditional mov on return value
+            if first {
+                node_link
             } else {
-                Ok(tree
-                    .edge_links
-                    .get_mut(self.current)
-                    .ok_or(tree::Error::InvalidEdgeLinks)?)
+                // match on edge link to avoid moving edge_link when assigning value to next
+                match &edge_link {
+                    Some(v) => self.next = Some(**v),
+                    None => self.next = None,
+                };
+                edge_link
             }
         }
 
@@ -210,9 +208,9 @@ pub mod tree {
         /// # Errors
         ///
         /// Error if the edge index is invalid
-        pub fn skip<'a>(&mut self, tree: &'a mut Tree, n: usize) -> Result<&'a mut EdgeIndex> {
-            for _ in 0..n {
-                self.next(tree)?;
+        pub fn skip<'a>(&mut self, tree: &'a mut Tree, n: usize) -> Option<&'a mut EdgeIndex> {
+            for _i in 0..n {
+                self.next(tree);
             }
             self.next(tree)
         }
@@ -221,21 +219,26 @@ pub mod tree {
     #[derive(new, Debug, Serialize, Deserialize, Clone)]
     pub struct Tree {
         // TODO: Make Node type generic if needed
-        nodes: Vec<Dialogue>,
-        edges: Vec<Choice>,
+        pub nodes: Vec<Dialogue>,
+        pub edges: Vec<Choice>,
         /// Node links implement a linked list to the outgoing edges of a given node. The
         /// node index may be used to index into this array to get the first outgoing edge for that
         /// node.
-        node_links: Vec<EdgeIndex>,
+        pub node_links: Vec<EdgeIndex>,
         /// Edge links implement a linked lists to rest of the outgoing edges of a given node. The
         /// edge index from the previous node_links or edge_links value may be used to index into
         /// this array to get the next outgoing edge for a given node.
-        edge_links: Vec<EdgeIndex>,
+        pub edge_links: Vec<EdgeIndex>,
+        /// List of the sources of an edge. Access via an edge index to get the target node index
+        /// for that edge.
+        ///
+        /// Stored separately to avoid wrapping the node type in the array.
+        pub edge_sources: Vec<NodeIndex>,
         /// List of the targets of an edge. Access via an edge index to get the target node index
         /// for that edge.
         ///
         /// Stored separately to avoid wrapping the node type in the array.
-        edge_targets: Vec<NodeIndex>,
+        pub edge_targets: Vec<NodeIndex>,
     }
 
     impl Tree {
@@ -246,6 +249,7 @@ pub mod tree {
                 edges: Vec::with_capacity(edge_capacity as usize),
                 node_links: Vec::with_capacity(node_capacity as usize),
                 edge_links: Vec::with_capacity(edge_capacity as usize),
+                edge_sources: Vec::with_capacity(edge_capacity as usize),
                 edge_targets: Vec::with_capacity(edge_capacity as usize),
             }
         }
@@ -257,6 +261,8 @@ pub mod tree {
             self.edges.clear();
             self.node_links.clear();
             self.edge_links.clear();
+            self.edge_sources.clear();
+            self.edge_targets.clear();
         }
 
         /// Get the contents of a node
@@ -270,7 +276,6 @@ pub mod tree {
                 .nodes
                 .get(node_index)
                 .ok_or(tree::Error::InvalidNodeIndex)?;
-
             Ok(&node)
         }
 
@@ -332,6 +337,7 @@ pub mod tree {
 
             let mut node_in_use = false;
             trace!("check that node has no outgoing edges");
+            // faster than searching edge_sources
             node_in_use |= self.node_links[index] != NodeIndex::end();
             trace!("check that node is not the target of any edges");
             node_in_use |= self.edge_targets.contains(&index);
@@ -346,10 +352,19 @@ pub mod tree {
                 let removed_node = self.nodes.swap_remove(index);
                 self.node_links.swap_remove(index);
 
-                trace!("re-point edge_targets to the newly swapped node");
-                for target in self.edge_targets.as_mut_slice() {
-                    let _ = std::mem::replace(target, swapped_index);
+                trace!("re-point edge sources and targets to the newly swapped node");
+                for source in self.edge_sources.as_mut_slice() {
+                    if *source == swapped_index {
+                        *source = index;
+                    }
                 }
+
+                for target in self.edge_targets.as_mut_slice() {
+                    if *target == swapped_index {
+                        *target = index;
+                    }
+                }
+
                 Ok(removed_node)
             }
         }
@@ -418,6 +433,15 @@ pub mod tree {
                 .ok_or_else(|| tree::Error::InvalidEdgeIndex.into())
         }
 
+        /// Get the source node index of an edge
+        #[inline]
+        pub fn source_of(&self, edge_index: EdgeIndex) -> Result<NodeIndex> {
+            self.edge_sources
+                .get(edge_index)
+                .copied()
+                .ok_or_else(|| tree::Error::InvalidEdgeIndex.into())
+        }
+
         /// Get the target node index of an edge
         #[inline]
         pub fn target_of(&self, edge_index: EdgeIndex) -> Result<NodeIndex> {
@@ -425,6 +449,20 @@ pub mod tree {
                 .get(edge_index)
                 .copied()
                 .ok_or_else(|| tree::Error::InvalidEdgeIndex.into())
+        }
+
+        /// Get the placement of an edge in the outgoing_edges linked list of a source node
+        ///
+        /// # Errors
+        /// Error if indices are invalid or if edge is not ougoing from source
+        #[inline]
+        pub fn placement_of(&self, source: NodeIndex, edge_index: EdgeIndex) -> Result<usize> {
+            let (placement, _edge) = self
+                .outgoing_from_index(source)?
+                .enumerate()
+                .find(|(_i, e)| *e == edge_index)
+                .ok_or(tree::Error::InvalidEdgeLinks)?;
+            Ok(placement)
         }
 
         /// Create a new edge from a source node to a target node, return the index of the added edge
@@ -454,6 +492,7 @@ pub mod tree {
 
             trace!("push new edge to the edges, edge_links, and edge_targets list");
             self.edges.push(choice);
+            self.edge_sources.push(source);
             self.edge_targets.push(target);
             self.edge_links.push(EdgeIndex::end());
 
@@ -513,19 +552,29 @@ pub mod tree {
             Ok(old_choice)
         }
 
-        /// Remove an existing edge from the tree and return the removed choice.
+        /// Remove an existing edge from the tree and return a tuple of the source node, target node,
+        /// Choice, and placement within the outgoing_edges linked list
         ///
         /// Removing edges invalidates edge indices
         ///
         /// # Errors
         ///
         /// If the index is invalid, an error will be returned without modifying the tree
-        pub fn remove_edge(&mut self, index: usize) -> Result<Choice> {
+        pub fn remove_edge(
+            &mut self,
+            index: EdgeIndex,
+        ) -> Result<(NodeIndex, NodeIndex, Choice, usize)> {
             trace!("check validity of edge index");
             self.edges
                 .get(index as usize)
                 .ok_or(tree::Error::InvalidEdgeIndex)?;
 
+            // get source and target of edge to return at end of fn
+            let source = self.source_of(index)?;
+            let target = self.target_of(index)?;
+
+            // get placement in the ougoing edges linked_list to return at end of fn
+            let placement = self.placement_of(source, index)?;
             trace!("redirect any node or edge links pointing to the edge about to be removed");
             // TODO: Could this safely be combined with the for loop through the list that happens
             // after the removal?
@@ -545,11 +594,12 @@ pub mod tree {
             // capture the index of the edge that is going to be swapped in (always the last
             // node index of the list). This edge need to be updated in the node_links and
             // edge_links after swap-removing the edge
-            let swapped_index = self.nodes.len() - 1;
+            let swapped_index = self.edges.len() - 1;
 
             trace!("swap remove from edges, edge_links, and edge_targets");
-            self.edges.swap_remove(index);
+            let removed_edge = self.edges.swap_remove(index);
             self.edge_links.swap_remove(index);
+            self.edge_sources.swap_remove(index);
             self.edge_targets.swap_remove(index);
 
             trace!(
@@ -562,13 +612,12 @@ pub mod tree {
                 }
             }
             for link in self.edge_links.as_mut_slice() {
-                if *link == index {
+                if *link == swapped_index {
                     // link should point to the index that the edge was swapped into
                     *link = index;
                 }
             }
-
-            Ok(self.edges.swap_remove(index))
+            Ok((source, target, removed_edge, placement))
         }
 
         /// Insert an in a specific location in the edge list and with a specific placement in a
@@ -600,28 +649,34 @@ pub mod tree {
                 desired_index, clamped_desired_index
             );
 
-            trace!("add edge manually to edges and targets list and swap it into desired position");
-            // not adding to linked list yet, will do that after swapping
-            self.edges.push(choice);
-            self.edge_targets.push(target);
-            // index of added edge is length of edge list - 1
-            let swap_index = self.edges.len() - 1;
+            trace!("add edge to end of lists");
+            let swap_index = self.add_edge(source, target, choice)?;
+
+            trace!("swap edge to desired index");
             self.edges.swap(swap_index, clamped_desired_index);
+            self.edge_sources.swap(swap_index, clamped_desired_index);
+            self.edge_links.swap(swap_index, clamped_desired_index);
             self.edge_targets.swap(swap_index, clamped_desired_index);
 
-            info!("resolve any node/edge links that have changed due to the swap");
+            trace!("resolve any node/edge links that have changed due to the swap");
             for link in self.node_links.as_mut_slice() {
                 if *link == swap_index {
                     *link = clamped_desired_index;
+                } else if *link == clamped_desired_index {
+                    *link = swap_index;
                 }
             }
             for link in self.edge_links.as_mut_slice() {
                 if *link == swap_index {
                     *link = clamped_desired_index;
+                } else if *link == clamped_desired_index {
+                    *link = swap_index;
                 }
             }
 
-            let placement = self.insert_link(source, clamped_desired_index, desired_placement)?;
+            trace!("change the placement of the edge in the source nodes' outgoing edges list");
+            let placement =
+                self.edit_link_order(source, clamped_desired_index, desired_placement)?;
             Ok((clamped_desired_index, placement))
         }
 
@@ -650,17 +705,19 @@ pub mod tree {
             );
 
             trace!("remove link from list first");
+            let current_edge_link = self.edge_links[edge_index];
             // Check node_links first then edge_links
             for link in self.node_links.as_mut_slice() {
                 if *link == edge_index {
                     // link should point to whatever the to-be-deleted link currently points to
-                    *link = self.edge_links[edge_index];
+                    *link = current_edge_link;
                 }
             }
-            for link_index in 0..self.edge_links.len() {
-                if self.edge_links[link_index] == edge_index {
+
+            for link in self.edge_links.as_mut_slice() {
+                if *link == edge_index {
                     // link should point to whatever the to-be-deleted link currently points to
-                    self.edge_links[link_index] = self.edge_links[edge_index];
+                    *link = current_edge_link;
                 }
             }
 
@@ -724,7 +781,9 @@ pub mod tree {
 
             trace!("insert the link at clamped desired location");
             let mut placement_walker = OutgoingEdgeWalker::new(&self, source)?;
-            let link_at_placement: &mut EdgeIndex = placement_walker.skip(self, clamped_desired)?;
+            let link_at_placement: &mut EdgeIndex = placement_walker
+                .skip(self, clamped_desired)
+                .ok_or(tree::Error::InvalidEdgeLinks)?;
             let val_at_placement = *link_at_placement;
             *link_at_placement = edge_index;
             self.edge_links[edge_index] = val_at_placement;
@@ -1592,7 +1651,8 @@ pub mod cmd {
                 info!("Remove Edge {}", self.edge_index);
 
                 trace!("remove edge from tree");
-                let removed_weight = state.active.tree.remove_edge(self.edge_index)?;
+                let (_source, _target, removed_weight, _placement) =
+                    state.active.tree.remove_edge(self.edge_index)?;
                 let hash = removed_weight.section.hash;
 
                 Ok(hash as usize)
