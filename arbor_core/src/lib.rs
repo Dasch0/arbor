@@ -135,7 +135,54 @@ pub mod tree {
         NodesFull,
     }
 
+    /// Modifying events that occur in the tree. These are returned by methods that cause the given
+    /// event. Event structs store the data needed to reconstruct the event after the fact
+    pub mod event {
+        use super::{Dialogue, Choice, NodeIndex, EdgeIndex};
+
+        /// Information about a node insertion (either an addition or removal) such that the event can
+        /// be reconstructed
+        ///
+        /// This structure is returned by methods in the tree module that perform an equivalent event
+        pub struct NodeInsert {
+            pub index: NodeIndex,
+            pub node: Dialogue,
+        }
+
+        /// Information about a node edit such that the event can be reconstructed
+        ///
+        /// This structure is returned by methods in the tree module that perform an equivalent event
+        pub struct NodeEdit {
+            pub index: NodeIndex,
+            pub from: Dialogue,
+            pub to: Dialogue,
+        }
+
+        /// Information about a edge insertion (either an addition or removal) such that the event can
+        /// be reconstructed
+        ///
+        /// This structure is returned by methods in the tree module that perform an equivalent event
+        pub struct EdgeInsert {
+            pub source: NodeIndex,
+            pub target: NodeIndex,
+            pub index: EdgeIndex,
+            pub placement: usize,
+            pub edge: Choice,
+        }
+
+        /// Information about a edge edit such that the event can be reconstructed
+        ///
+        /// This structure is returned by methods in the tree module that perform an equivalent event
+        pub struct EdgeEdit {
+            pub index: EdgeIndex,
+            pub from: Choice,
+            pub to: Choice,
+        }
+    }
+
     /// Iterator over the outgoing edge indices of a node
+    ///
+    /// This structure is returned by methods in the tree module that perform an equivalent event
     #[derive(new, Clone, Copy)]
     pub struct OutgoingEdges<'a> {
         edge_links: &'a [EdgeIndex],
@@ -296,7 +343,7 @@ pub mod tree {
         /// # Errors
         /// Error if the nodes list is full (more than usize::MAX - 1 nodes)
         #[inline]
-        pub fn add_node(&mut self, node: Dialogue) -> Result<NodeIndex> {
+        pub fn add_node(&mut self, node: Dialogue) -> Result<event::NodeInsert> {
             anyhow::ensure!(
                 self.nodes.len() < NodeIndex::end() - 1,
                 tree::Error::NodesFull
@@ -313,7 +360,7 @@ pub mod tree {
         /// If the index is invalid, a corresponding error will be returned with no modification to
         /// the tree.
         #[inline]
-        pub fn edit_node(&mut self, index: NodeIndex, new_node: Dialogue) -> Result<Dialogue> {
+        pub fn edit_node(&mut self, index: NodeIndex, new_node: Dialogue) -> Result<event::NodeEdit> {
             trace!("attempt to get mutable weight from node index");
             let node = self.nodes.get_mut(index).ok_or(Error::InvalidNodeIndex)?;
             let old_node_value = *node;
@@ -329,7 +376,7 @@ pub mod tree {
         ///
         /// If the index is invalid, or if an edge currently uses the node as a source or target,
         /// an error is returned with no modification to the tree
-        pub fn remove_node(&mut self, index: NodeIndex) -> Result<Dialogue> {
+        pub fn remove_node(&mut self, index: NodeIndex) -> Result<event::NodeInsert> {
             info!("Remove node {}", index);
 
             trace!("check that node index is valid");
@@ -380,7 +427,7 @@ pub mod tree {
             &mut self,
             node: Dialogue,
             desired_index: NodeIndex,
-        ) -> Result<NodeIndex> {
+        ) -> Result<event::NodeInsert> {
             info!("Insert node at {}", desired_index);
 
             // clamp index by nodes list length
@@ -481,7 +528,7 @@ pub mod tree {
             source: NodeIndex,
             target: NodeIndex,
             choice: Choice,
-        ) -> Result<EdgeIndex> {
+        ) -> Result<event::EdgeInsert> {
             trace!("check validity of source and target node");
             self.nodes
                 .get(source)
@@ -540,7 +587,7 @@ pub mod tree {
         ///
         /// If the index is invalid, a corresponding error will be returned
         /// with no modification to the tree.
-        pub fn edit_edge(&mut self, index: usize, new_choice: Choice) -> Result<Choice> {
+        pub fn edit_edge(&mut self, index: usize, new_choice: Choice) -> Result<event::EdgeEdit> {
             trace!("check validity of edge index");
             let choice = self
                 .edges
@@ -563,7 +610,7 @@ pub mod tree {
         pub fn remove_edge(
             &mut self,
             index: EdgeIndex,
-        ) -> Result<(NodeIndex, NodeIndex, Choice, usize)> {
+        ) -> Result<event::EdgeInsert> {
             trace!("check validity of edge index");
             self.edges
                 .get(index as usize)
@@ -636,7 +683,7 @@ pub mod tree {
             choice: Choice,
             desired_index: EdgeIndex,
             desired_placement: usize,
-        ) -> Result<(EdgeIndex, usize)> {
+        ) -> Result<event::EdgeInsert> {
             info!(
                 "Insert edge from {} to {} at index {} and placement {}",
                 source, target, desired_index, desired_placement
@@ -650,7 +697,8 @@ pub mod tree {
             );
 
             trace!("add edge to end of lists");
-            let swap_index = self.add_edge(source, target, choice)?;
+            let new_edge_data = self.add_edge(source, target, choice)?;
+            let swap_index = new_edge_data.index;
 
             trace!("swap edge to desired index");
             self.edges.swap(swap_index, clamped_desired_index);
@@ -940,6 +988,27 @@ impl DialogueTreeData {
             name: String::from(name),
         }
     }
+}
+
+#[enum_dispatch]
+pub trait Event {
+    fn undo(&self, target: &mut DialogueTreeData);
+    fn redo(&self, target: &mut DialogueTreeData);
+}
+
+/// Enum of different types of events that modify a DialogueTree. These variants store the
+/// information required to reconstruct the event, and implements the Event trait along with 
+/// enum_dispatch to support undoing/redoing the event, and allow a unified call to undo() or
+/// redo() to propogate to the inner event type.
+///
+/// The Enum is flattened such that all events are granular changes, and there are no nested enum
+/// types of events. This is done to avoid extra padding/discriminant words being added to the size
+/// of DialogueTreeEvent
+pub enum DialogueTreeEvent {
+    NodeInsert(tree::event::NodeInsert),
+    NodeEdit(tree::event::NodeEdit),
+    EdgeInsert(tree::event::EdgeInsert),
+    EdgeEdit(tree::EdgeEdit),
 }
 
 /// State information for an editor instance. Includes two copies of the dialogue tree (one active
