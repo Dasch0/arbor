@@ -473,6 +473,7 @@ pub mod tree {
                 index: self.nodes.len() - 1,
                 node,
             };
+
             Ok(event)
         }
 
@@ -1157,7 +1158,7 @@ pub type ValTable = HashMap<KeyString, u32>;
 /// ValTable
 pub struct ValTableInsert {
     pub key: KeyString,
-    pub val: u32,
+    pub value: u32,
 }
 
 /// Information about a removal from the ValTable such that the event can be reconstructed later
@@ -1217,6 +1218,60 @@ impl DialogueTreeData {
     }
 }
 
+/// Struct storing a record of DialogueTreeEvent. Allows for simple linear undo/redo history
+pub struct DialogueTreeHistory {
+    /// Record of events
+    pub record: Vec<DialogueTreeEvent>,
+    /// Current position in the record
+    pub position: usize,
+}
+
+impl Default for DialogueTreeHistory {
+    fn default() -> Self {
+        Self {
+            record: Vec::with_capacity(1000),
+            position: 0,
+        }
+    }
+}
+
+impl DialogueTreeHistory {
+    /// Push a new event onto the history. This will remove record of all 'undone' changes.
+    fn push(&mut self, event: DialogueTreeEvent) {
+        // drain any undone events before pushing
+        self.record.drain(self.position..);
+        self.record.push(event);
+    }
+
+    /// Undo the most recent event in the history.
+    ///
+    /// # Errors
+    /// Fails and returns an error if the current position is 0, indicating there are no events to
+    /// undo
+    fn undo(&mut self, tree: &mut DialogueTreeData) -> Result<()> {
+        // Cannot undo if position is 0, return an error
+        anyhow::ensure!(self.position > 0);
+
+        self.position -= 1;
+        self.record[self.position].undo(tree)
+    }
+
+    /// Redo the most recently undone event in the history.
+    ///
+    /// # Errors
+    /// Fails and returns an error if there are no undone events to redo
+    fn redo(&mut self, tree: &mut DialogueTreeData) -> Result<()> {
+        // Cannot undo if position is 0, return an error
+        anyhow::ensure!(self.position < self.record.len());
+
+        let res = self.record[self.position].redo(tree);
+        self.position += 1;
+        res
+    }
+}
+
+/// Trait representing an event. Types implementing event should store enough data to completely
+/// undo or redo all state changes performed by the event
 #[enum_dispatch]
 pub trait Event {
     fn undo(&self, target: &mut DialogueTreeData) -> Result<()>;
@@ -1231,7 +1286,6 @@ pub trait Event {
 /// The Enum is flattened such that all events are granular changes to an underlying datastructure,
 /// and there are no nested enum types of events. This is done to avoid extra padding/discriminant
 /// words increasing the size of DialogueTreeEvent
-
 #[enum_dispatch(Event)]
 pub enum DialogueTreeEvent {
     NodeInsert,
@@ -1248,6 +1302,8 @@ pub enum DialogueTreeEvent {
     ValTableRemove,
     ValTableEdit,
 }
+
+/// Event implementations for all Event enum types
 
 impl Event for NodeInsert {
     fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
@@ -1392,7 +1448,7 @@ impl Event for ValTableInsert {
     }
 
     fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
-        target.val_table.insert(self.key, self.val);
+        target.val_table.insert(self.key, self.value);
         Ok(())
     }
 }
@@ -1428,6 +1484,8 @@ pub struct EditorState {
     pub active: DialogueTreeData,
     pub backup: DialogueTreeData,
     pub scratchpad: String,
+    #[serde(skip)]
+    pub history: DialogueTreeHistory,
 }
 
 impl EditorState {
@@ -1440,6 +1498,7 @@ impl EditorState {
             active: data.clone(),
             backup: data,
             scratchpad: String::with_capacity(1000),
+            history: Default::default(),
         }
     }
 
@@ -1758,8 +1817,10 @@ pub mod cmd {
 
                 trace!("add new node to tree");
                 let event = state.active.tree.add_node(dialogue)?;
+                let idx = event.index;
+                state.history.push(event.into());
 
-                Ok(event.index)
+                Ok(idx)
             }
         }
 
@@ -1826,7 +1887,10 @@ pub mod cmd {
                     .active
                     .tree
                     .add_edge(self.source, self.target, choice)?;
-                Ok(event.index)
+                let idx = event.index;
+
+                state.history.push(event.into());
+                Ok(idx)
             }
         }
 
@@ -1852,6 +1916,15 @@ pub mod cmd {
                 if state.active.name_table.get(self.key.as_str()).is_none() {
                     trace!("add key and name to table");
                     state.active.name_table.insert(self.key, self.name);
+
+                    state.history.push(
+                        NameTableInsert {
+                            key: self.key,
+                            name: self.name,
+                        }
+                        .into(),
+                    );
+
                     Ok(0)
                 } else {
                     Err(cmd::Error::NameExists.into())
@@ -1881,6 +1954,15 @@ pub mod cmd {
                 if state.active.val_table.get(self.key.as_str()).is_none() {
                     trace!("add key and val to table");
                     state.active.val_table.insert(self.key, self.value);
+
+                    state.history.push(
+                        ValTableInsert {
+                            key: self.key,
+                            value: self.value,
+                        }
+                        .into(),
+                    );
+
                     Ok(self.value as usize)
                 } else {
                     Err(cmd::Error::ValExists.into())
@@ -1939,7 +2021,8 @@ pub mod cmd {
                 let new_node = Dialogue::new(Section::new([start, end], hash), old_node.pos);
 
                 trace!("update node weight in tree");
-                state.active.tree.edit_node(self.node_index, new_node)?;
+                let event = state.active.tree.edit_node(self.node_index, new_node)?;
+                state.history.push(event.into());
 
                 Ok(self.node_index)
             }
@@ -2000,8 +2083,9 @@ pub mod cmd {
                     self.requirement.clone().unwrap_or(ReqKind::No),
                     self.effect.clone().unwrap_or(EffectKind::No),
                 );
-                state.active.tree.edit_edge(self.edge_index, new_weight)?;
+                let event = state.active.tree.edit_edge(self.edge_index, new_weight)?;
 
+                state.history.push(event.into());
                 Ok(self.edge_index)
             }
         }
@@ -2030,10 +2114,21 @@ pub mod cmd {
                         .name_table
                         .get_mut(&self.key)
                         .ok_or(cmd::Error::Generic)?;
-                    debug!("old name: {}, new name: {}", name, self.name);
+                    let old_name = *name;
+                    debug!("old name: {}, new name: {}", old_name, self.name);
 
                     trace!("update key-value in name table");
                     *name = self.name;
+
+                    state.history.push(
+                        NameTableEdit {
+                            key: self.key,
+                            from: old_name,
+                            to: self.name,
+                        }
+                        .into(),
+                    );
+
                     Ok(0)
                 } else {
                     Err(cmd::Error::NameNotExists.into())
@@ -2060,15 +2155,25 @@ pub mod cmd {
 
                 trace!("check that key exists before editing");
                 if state.active.name_table.get(&self.key).is_some() {
-                    let old_value = state
+                    let value = state
                         .active
                         .val_table
                         .get_mut(&self.key)
                         .ok_or(cmd::Error::Generic)?;
+                    let old_value = *value;
                     debug!("old val: {}, new val: {}", old_value, self.value);
 
                     trace!("update key-value in value table");
-                    *old_value = self.value;
+                    *value = self.value;
+
+                    state.history.push(
+                        ValTableEdit {
+                            key: self.key,
+                            from: old_value,
+                            to: self.value,
+                        }
+                        .into(),
+                    );
 
                     Ok(self.value as usize)
                 } else {
@@ -2107,6 +2212,8 @@ pub mod cmd {
 
                 let event = state.active.tree.remove_node(self.node_index)?;
                 let hash = event.node.section.hash;
+
+                state.history.push(event.into());
                 Ok(hash as usize)
             }
         }
@@ -2129,6 +2236,7 @@ pub mod cmd {
                 let event = state.active.tree.remove_edge(self.edge_index)?;
                 let hash = event.edge.section.hash;
 
+                state.history.push(event.into());
                 Ok(hash as usize)
             }
         }
@@ -2144,6 +2252,12 @@ pub mod cmd {
         impl Executable for Name {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 info!("Remove Name {}", self.key);
+
+                let name = *state
+                    .active
+                    .name_table
+                    .get(&self.key)
+                    .ok_or(cmd::Error::NameNotExists)?;
 
                 trace!("check if the key is referenced anywhere in the text");
                 if let Some(_found) = state
@@ -2192,6 +2306,14 @@ pub mod cmd {
                     .remove(self.key.as_str())
                     .ok_or(cmd::Error::NameNotExists)?;
 
+                state.history.push(
+                    NameTableRemove {
+                        key: self.key,
+                        name,
+                    }
+                    .into(),
+                );
+
                 Ok(0)
             }
         }
@@ -2206,6 +2328,14 @@ pub mod cmd {
 
         impl Executable for Val {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
+                info!("remove value {}", self.key);
+
+                let value = *state
+                    .active
+                    .val_table
+                    .get(&self.key)
+                    .ok_or(cmd::Error::ValNotExists)?;
+
                 trace!("check if the key is referenced in any requirements or effects");
                 for choice in state.active.tree.edges() {
                     // this match will stop compiling any time a new reqKind is added
@@ -2268,6 +2398,14 @@ pub mod cmd {
                     .remove(self.key.as_str())
                     .ok_or(cmd::Error::NameNotExists)?;
 
+                state.history.push(
+                    ValTableRemove {
+                        key: self.key,
+                        val: value,
+                    }
+                    .into(),
+                );
+
                 Ok(0)
             }
         }
@@ -2282,9 +2420,9 @@ pub mod cmd {
     pub struct Undo {}
 
     impl Executable for Undo {
-        fn execute(&self, _state: &mut EditorState) -> Result<usize> {
+        fn execute(&self, state: &mut EditorState) -> Result<usize> {
             info!("Undo");
-
+            state.history.undo(&mut state.active)?;
             Ok(0)
         }
     }
@@ -2298,9 +2436,9 @@ pub mod cmd {
     pub struct Redo {}
 
     impl Executable for Redo {
-        fn execute(&self, _state: &mut EditorState) -> Result<usize> {
+        fn execute(&self, state: &mut EditorState) -> Result<usize> {
             info!("Redo");
-
+            state.history.undo(&mut state.active)?;
             Ok(0)
         }
     }
