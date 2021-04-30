@@ -122,16 +122,18 @@ mod tree_tests {
 
         let tree_full = tree.clone();
 
-        let removed_node = tree.remove_node(5).unwrap();
-        tree.insert_node(removed_node, 5).unwrap();
+        let event = tree.remove_node(5).unwrap();
+        tree.insert_node(event.node, event.index).unwrap();
         assert_eq!(format!("{:?}", tree), format!("{:?}", tree_full));
 
-        let removed_node = tree.remove_node(9).unwrap();
-        tree.insert_node(removed_node, 9).unwrap();
+        let event = tree.remove_node(9).unwrap();
+        let event = tree.insert_node(event.node, event.index).unwrap();
+        let event = tree.remove_node(event.index).unwrap();
+        let _event = tree.insert_node(event.node, event.index).unwrap();
         assert_eq!(format!("{:?}", tree), format!("{:?}", tree_full));
 
-        let removed_node = tree.remove_node(0).unwrap();
-        tree.insert_node(removed_node, 0).unwrap();
+        let event = tree.remove_node(0).unwrap();
+        tree.insert_node(event.node, event.index).unwrap();
         assert_eq!(format!("{:?}", tree), format!("{:?}", tree_full));
     }
 
@@ -153,32 +155,69 @@ mod tree_tests {
         }
         let tree_full = tree.clone();
 
-        let (source, target, removed_edge, placement) = tree.remove_edge(5).unwrap();
+        let event = tree.remove_edge(5).unwrap();
 
-        tree.insert_edge(source, target, removed_edge, 5, placement)
-            .unwrap();
+        tree.insert_edge(
+            event.source,
+            event.target,
+            event.edge,
+            event.index,
+            event.placement,
+        )
+        .unwrap();
         assert_eq!(format!("{:#?}", tree), format!("{:#?}", tree_full),);
 
-        let (source, target, removed_edge, placement) = tree.remove_edge(0).unwrap();
-        tree.insert_edge(source, target, removed_edge, 0, placement)
-            .unwrap();
+        let event = tree.remove_edge(0).unwrap();
+        tree.insert_edge(
+            event.source,
+            event.target,
+            event.edge,
+            event.index,
+            event.placement,
+        )
+        .unwrap();
         assert_eq!(format!("{:?}", tree), format!("{:?}", tree_full));
 
-        let (source, target, removed_edge, placement) = tree.remove_edge(9).unwrap();
-        tree.insert_edge(source, target, removed_edge, 9, placement)
-            .unwrap();
+        let event = tree.remove_edge(9).unwrap();
+        tree.insert_edge(
+            event.source,
+            event.target,
+            event.edge,
+            event.index,
+            event.placement,
+        )
+        .unwrap();
         assert_eq!(format!("{:?}", tree), format!("{:?}", tree_full));
 
-        let (source5, target5, removed_edge5, placement5) = tree.remove_edge(5).unwrap();
-        let (source0, target0, removed_edge0, placement0) = tree.remove_edge(0).unwrap();
+        let event_a = tree.remove_edge(5).unwrap();
+        let event_b = tree.remove_edge(0).unwrap();
         // index shifted by 2 because of prior removals
-        let (source9, target9, removed_edge9, placement9) = tree.remove_edge(7).unwrap();
-        tree.insert_edge(source9, target9, removed_edge9, 7, placement9)
-            .unwrap();
-        tree.insert_edge(source0, target0, removed_edge0, 0, placement0)
-            .unwrap();
-        tree.insert_edge(source5, target5, removed_edge5, 5, placement5)
-            .unwrap();
+        let event_c = tree.remove_edge(7).unwrap();
+        // restore state in reverse order of events
+        tree.insert_edge(
+            event_c.source,
+            event_c.target,
+            event_c.edge,
+            event_c.index,
+            event_c.placement,
+        )
+        .unwrap();
+        tree.insert_edge(
+            event_b.source,
+            event_b.target,
+            event_b.edge,
+            event_b.index,
+            event_b.placement,
+        )
+        .unwrap();
+        tree.insert_edge(
+            event_a.source,
+            event_a.target,
+            event_a.edge,
+            event_a.index,
+            event_a.placement,
+        )
+        .unwrap();
         assert_eq!(format!("{:?}", tree), format!("{:?}", tree_full));
     }
 }

@@ -14,7 +14,12 @@ pub use std::ops::Range;
 use structopt::clap::AppSettings;
 pub use structopt::StructOpt;
 use thiserror::Error;
-use tree::{Dfs, Tree};
+use tree::{
+    // events are fully typed to allow for use with enum_dispatch
+    event::{EdgeEdit, EdgeInsert, EdgeRemove, LinkMove, NodeEdit, NodeInsert, NodeRemove},
+    Dfs,
+    Tree,
+};
 
 // TODO: Future plans
 // 1. Replace petgraph with lower level graph implementation (petgraph limits us on diffing,
@@ -98,10 +103,11 @@ impl std::ops::IndexMut<usize> for Section {
 pub mod tree {
     use super::*;
 
-    /// Type definitions for Node and Edge indices resolved to usize, mainly used for improved
-    /// readability on whether a value should be used for edge or node access
+    /// Type definitions for Node, Edge, and placement indices resolved to usize, mainly used for
+    /// improved readability on whether a value should be used for edge or node access
     pub type NodeIndex = usize;
     pub type EdgeIndex = usize;
+    pub type PlacementIndex = usize;
 
     /// This trait implements an "end" value that may be used to signal an invalid value for
     /// an element in the tree, such as a linked list. This should be used in places where Option
@@ -138,13 +144,20 @@ pub mod tree {
     /// Modifying events that occur in the tree. These are returned by methods that cause the given
     /// event. Event structs store the data needed to reconstruct the event after the fact
     pub mod event {
-        use super::{Dialogue, Choice, NodeIndex, EdgeIndex};
+        use super::{Choice, Dialogue, EdgeIndex, NodeIndex, PlacementIndex};
 
-        /// Information about a node insertion (either an addition or removal) such that the event can
-        /// be reconstructed
+        /// Information about a node insertion such that the event can be reconstructed
         ///
         /// This structure is returned by methods in the tree module that perform an equivalent event
         pub struct NodeInsert {
+            pub index: NodeIndex,
+            pub node: Dialogue,
+        }
+
+        /// Information about a node removal such that the event can be reconstructed
+        ///
+        /// This structure is returned by methods in the tree module that perform an equivalent event
+        pub struct NodeRemove {
             pub index: NodeIndex,
             pub node: Dialogue,
         }
@@ -158,15 +171,25 @@ pub mod tree {
             pub to: Dialogue,
         }
 
-        /// Information about a edge insertion (either an addition or removal) such that the event can
-        /// be reconstructed
+        /// Information about an edge insertion such that the event can be reconstructed
         ///
         /// This structure is returned by methods in the tree module that perform an equivalent event
         pub struct EdgeInsert {
             pub source: NodeIndex,
             pub target: NodeIndex,
             pub index: EdgeIndex,
-            pub placement: usize,
+            pub placement: PlacementIndex,
+            pub edge: Choice,
+        }
+
+        /// Information about an edge removal such that the event can be reconstructed
+        ///
+        /// This structure is returned by methods in the tree module that perform an equivalent event
+        pub struct EdgeRemove {
+            pub source: NodeIndex,
+            pub target: NodeIndex,
+            pub index: EdgeIndex,
+            pub placement: PlacementIndex,
             pub edge: Choice,
         }
 
@@ -177,6 +200,17 @@ pub mod tree {
             pub index: EdgeIndex,
             pub from: Choice,
             pub to: Choice,
+        }
+
+        /// Information about a move of an edge from one placement in the outgoing edges linked
+        /// list to another
+        ///
+        /// This structure is returned by methods in the tree module that perform an equivalent event
+        pub struct LinkMove {
+            pub source: NodeIndex,
+            pub index: EdgeIndex,
+            pub from: PlacementIndex,
+            pub to: PlacementIndex,
         }
     }
 
@@ -203,12 +237,28 @@ pub mod tree {
         }
     }
 
-    /// Walker for mutable references to the outgoing edges of a node
+    /// Walker for mutable references to the outgoing edges of a node. This takes a mutable
+    /// reference to the tree only on each call to a member method, and so allows for traversal and
+    /// modification of the tree simultaneously.
+    ///
+    /// There is no guarantee that the walker will be valid if the graph is modified while the
+    /// EdgeWalker is alive. Do not modify the graph while an EdgeWalker is active
     #[derive(Clone, Copy)]
     pub struct OutgoingEdgeWalker {
+        /// Special condition for the first state of the walker, where it should return a reference
+        /// to node_links rather than edge_links
         first: bool,
+        /// Source node for outgoing edges. This allows the walker to capture the first reference
+        /// to node_links
         source: NodeIndex,
+        /// The current index into edge_links of the walker. This is ignored in the 'first' state
+        /// of the walker.
+        pub current: EdgeIndex,
+        /// The next index in the edge_links of the walker. Will be None if the walker is at the
+        /// end of the linked list
         next: Option<EdgeIndex>,
+        /// current placement of walker in linked list
+        pub placement: PlacementIndex,
     }
 
     impl OutgoingEdgeWalker {
@@ -217,49 +267,119 @@ pub mod tree {
         /// # Errors
         /// Error if node index is invalid
         pub fn new(tree: &Tree, source: NodeIndex) -> Result<Self> {
-            tree.get_node(source)?;
+            // current starts out as 0 as it is unused when 'first' is true in the initial
+            // state. After the first call to next(), current will be loaded with a valid EdgeIndex
+            let current = 0;
+
+            // Get next link from node_links, if the node is invalid error out, if the node_link is
+            // end() then set next to None so the walker will terminate immediately with
+            // placment == 0
+            let mut next = Some(
+                *tree
+                    .node_links
+                    .get(source)
+                    .ok_or(tree::Error::InvalidNodeIndex)?,
+            );
+
+            if next.unwrap() == NodeIndex::end() {
+                next = None;
+            }
+
             Ok(Self {
                 first: true,
                 source,
-                next: tree.node_links.get(source).copied(),
+                current,
+                next,
+                placement: 0,
             })
         }
 
-        /// get a mutable reference to the next link in the outgoing edges list. Returns None if
-        /// there is no next link.
-        pub fn next<'a>(&mut self, tree: &'a mut Tree) -> Option<&'a mut EdgeIndex> {
-            // capture and clear the 'first' status always
-            let first = self.first;
-            self.first = false;
-            // get node and edge link each time, decide which to return based on 'first'
-            let node_link = tree.node_links.get_mut(self.source);
-            let edge_link = tree
+        /// Move the EdgeWalker to the next position in the outgoing edges list.
+        ///
+        /// Returns a tuple of a mutable reference to the current node_links or edge_links entry
+        /// and a boolean indicating if the walker has reached the end of the linked list. Calling
+        /// next repeatedly after the walker has reached the end of the list will return the same
+        /// mutable reference to the last entry, and boolean = true.
+        ///
+        // NOTE: The goal is to implement next without any branches if possible. My initial attempt
+        // to do this uses exclusively conditional assignment operations to handle differing
+        // behavior between situations where the current position is in the node_links array vs
+        // the edge_links array
+        pub fn next<'a>(&mut self, tree: &'a mut Tree) -> Result<(&'a mut EdgeIndex, bool)> {
+            // get node and edge link as well as possible next values each time, decide which to
+            // return based on 'first'
+            // this is done via matched assigns to ensure conditional movs rather than branches
+            let next_from_edge = tree
                 .edge_links
-                .get_mut(self.next.unwrap_or_else(EdgeIndex::end));
+                .get(self.next.unwrap_or(EdgeIndex::MAX))
+                .copied()
+                .unwrap_or(EdgeIndex::MAX);
+            let node_link = tree
+                .node_links
+                .get_mut(self.source)
+                .ok_or(tree::Error::InvalidNodeIndex)?;
+            let next_from_node = Some(*node_link);
+            let edge_link = tree.edge_links.get_mut(self.current).unwrap();
 
-            // conditional mov on return value
-            if first {
-                node_link
-            } else {
-                // match on edge link to avoid moving edge_link when assigning value to next
-                match &edge_link {
-                    Some(v) => self.next = Some(**v),
-                    None => self.next = None,
-                };
-                edge_link
-            }
+            let current_link = match self.first {
+                true => node_link,
+                false => edge_link,
+            };
+
+            // Walk tree based on whether self.next is valid
+            //
+            // get a boolean corresponding to whether we are at the end of the list
+            let at_end = self.next.is_none();
+            // conditionally clear 'first' state if we are not at the end of the list
+            // If first has already been cleared by a prior iteration, it will remain false
+            self.first &= at_end;
+            // go to next position in the linked list, stop if we are at the end already
+            self.current = match self.next {
+                Some(v) => v,
+                None => self.current,
+            };
+            // increment placement walker if we aren't at the end of the linked list
+            self.placement += match self.next {
+                Some(_) => 1,
+                None => 0,
+            };
+
+            // convert from EdgeIndex::end() to None for potential next indices
+            let next_option_from_edge = match next_from_edge {
+                EdgeIndex::MAX => None,
+                _ => Some(next_from_edge),
+            };
+
+            // update self.next, should end up being None if the list is over
+            // uses the potential next indices that we captured at the beginning of the method
+            // prior to mutably borrowing any links
+            self.next = match self.first {
+                true => next_from_node,
+                false => next_option_from_edge,
+            };
+
+            Ok((current_link, at_end))
         }
 
-        /// skip n links, and return the next one
-        ///
-        /// # Errors
-        ///
-        /// Error if the edge index is invalid
-        pub fn skip<'a>(&mut self, tree: &'a mut Tree, n: usize) -> Option<&'a mut EdgeIndex> {
+        /// skip n links, and return the next one. If the skip goes past the end of the list the
+        /// last link will be returned
+        pub fn skip<'a>(
+            &mut self,
+            tree: &'a mut Tree,
+            n: PlacementIndex,
+        ) -> Result<&'a mut EdgeIndex> {
             for _i in 0..n {
-                self.next(tree);
+                self.next(tree)?;
             }
-            self.next(tree)
+            let (link_reference, _) = self.next(tree)?;
+            Ok(link_reference)
+        }
+
+        /// Go to the last link in the outgoing edges and return a mutable pointer to it.
+        pub fn last<'a>(&mut self, tree: &'a mut Tree) -> Result<&'a mut EdgeIndex> {
+            while !self.next(tree)?.1 {}
+            let (link_reference, _) = self.next(tree)?;
+            Ok(link_reference)
         }
     }
 
@@ -318,11 +438,8 @@ pub mod tree {
         ///
         /// Error if node index is invalid
         #[inline]
-        pub fn get_node(&self, node_index: usize) -> Result<&Dialogue> {
-            let node = self
-                .nodes
-                .get(node_index)
-                .ok_or(tree::Error::InvalidNodeIndex)?;
+        pub fn get_node(&self, index: NodeIndex) -> Result<&Dialogue> {
+            let node = self.nodes.get(index).ok_or(tree::Error::InvalidNodeIndex)?;
             Ok(&node)
         }
 
@@ -332,9 +449,9 @@ pub mod tree {
         ///
         /// Error if node index is invalid
         #[inline]
-        pub fn get_node_mut(&mut self, node_index: usize) -> Result<&mut Dialogue> {
+        pub fn get_node_mut(&mut self, index: NodeIndex) -> Result<&mut Dialogue> {
             self.nodes
-                .get_mut(node_index)
+                .get_mut(index)
                 .ok_or_else(|| tree::Error::InvalidNodeIndex.into())
         }
 
@@ -350,7 +467,13 @@ pub mod tree {
             );
             self.nodes.push(node);
             self.node_links.push(EdgeIndex::end());
-            Ok(self.nodes.len() - 1)
+
+            // Create and return event information
+            let event = event::NodeInsert {
+                index: self.nodes.len() - 1,
+                node,
+            };
+            Ok(event)
         }
 
         /// Edit the contents in an existing node and return the old contents.
@@ -360,13 +483,24 @@ pub mod tree {
         /// If the index is invalid, a corresponding error will be returned with no modification to
         /// the tree.
         #[inline]
-        pub fn edit_node(&mut self, index: NodeIndex, new_node: Dialogue) -> Result<event::NodeEdit> {
+        pub fn edit_node(
+            &mut self,
+            index: NodeIndex,
+            new_node: Dialogue,
+        ) -> Result<event::NodeEdit> {
             trace!("attempt to get mutable weight from node index");
             let node = self.nodes.get_mut(index).ok_or(Error::InvalidNodeIndex)?;
             let old_node_value = *node;
 
             *node = new_node;
-            Ok(old_node_value)
+
+            // Create and return event information
+            let event = event::NodeEdit {
+                index,
+                from: old_node_value,
+                to: *node,
+            };
+            Ok(event)
         }
 
         /// Remove a node if no edges use it as the source or target. Returns the weight of the
@@ -411,8 +545,12 @@ pub mod tree {
                         *target = index;
                     }
                 }
-
-                Ok(removed_node)
+                // Create and return event information
+                let event = event::NodeInsert {
+                    index,
+                    node: removed_node,
+                };
+                Ok(event)
             }
         }
 
@@ -435,19 +573,30 @@ pub mod tree {
             debug!("clamped index {} to {}", desired_index, clamped_desired);
 
             trace!("add node to end of nodes list");
-            let swap_index = self.add_node(node)?;
+            let new_node_data = self.add_node(node)?;
+            let swap_index = new_node_data.index;
 
             info!("swap added node with node at the clamped desired index");
             self.nodes.swap(swap_index, clamped_desired);
 
-            info!("resolve any edge targets that have changed due to the swap");
+            info!("resolve any edge sources/targets that have changed due to the swap");
+
+            for source in self.edge_sources.as_mut_slice() {
+                if *source == swap_index {
+                    *source = clamped_desired
+                }
+            }
             for target in self.edge_targets.as_mut_slice() {
                 if *target == swap_index {
                     *target = clamped_desired
                 }
             }
 
-            Ok(clamped_desired)
+            let event = event::NodeInsert {
+                index: clamped_desired,
+                node: new_node_data.node,
+            };
+            Ok(event)
         }
 
         /// Get an immutable slice of the nodes in the tree
@@ -462,9 +611,9 @@ pub mod tree {
         ///
         /// Error if edge index is invalid
         #[inline]
-        pub fn get_edge(&self, edge_index: usize) -> Result<&Choice> {
+        pub fn get_edge(&self, index: EdgeIndex) -> Result<&Choice> {
             self.edges
-                .get(edge_index)
+                .get(index)
                 .ok_or_else(|| tree::Error::InvalidEdgeIndex.into())
         }
 
@@ -474,9 +623,9 @@ pub mod tree {
         ///
         /// Error if edge index is invalid
         #[inline]
-        pub fn get_edge_mut(&mut self, edge_index: usize) -> Result<&mut Choice> {
+        pub fn get_edge_mut(&mut self, index: EdgeIndex) -> Result<&mut Choice> {
             self.edges
-                .get_mut(edge_index)
+                .get_mut(index)
                 .ok_or_else(|| tree::Error::InvalidEdgeIndex.into())
         }
 
@@ -503,11 +652,11 @@ pub mod tree {
         /// # Errors
         /// Error if indices are invalid or if edge is not ougoing from source
         #[inline]
-        pub fn placement_of(&self, source: NodeIndex, edge_index: EdgeIndex) -> Result<usize> {
+        pub fn placement_of(&self, source: NodeIndex, index: EdgeIndex) -> Result<PlacementIndex> {
             let (placement, _edge) = self
                 .outgoing_from_index(source)?
                 .enumerate()
-                .find(|(_i, e)| *e == edge_index)
+                .find(|(_i, e)| *e == index)
                 .ok_or(tree::Error::InvalidEdgeLinks)?;
             Ok(placement)
         }
@@ -527,7 +676,7 @@ pub mod tree {
             &mut self,
             source: NodeIndex,
             target: NodeIndex,
-            choice: Choice,
+            edge: Choice,
         ) -> Result<event::EdgeInsert> {
             trace!("check validity of source and target node");
             self.nodes
@@ -538,7 +687,7 @@ pub mod tree {
                 .ok_or(tree::Error::InvalidNodeIndex)?;
 
             trace!("push new edge to the edges, edge_links, and edge_targets list");
-            self.edges.push(choice);
+            self.edges.push(edge);
             self.edge_sources.push(source);
             self.edge_targets.push(target);
             self.edge_links.push(EdgeIndex::end());
@@ -546,38 +695,22 @@ pub mod tree {
             let new_edge_index = self.edges.len() - 1;
 
             trace!("update outgoing edges list for source node");
-            if self.node_links[source] == EdgeIndex::end() {
-                // this is the first outgoing edge for this node, so it is stored in the node_links
-                // array
-                self.node_links[source] = new_edge_index;
-            } else {
-                // this node already has outgoing edges, follow links until the last outgoing edge
-                // is found. There cannot be cycles here as the previously added outgoing edge had
-                // its edge_link set to end(), and that cannot be updated without calling this
-                // method again
-                let mut current_edge_link = self.node_links[source];
-                // Canary value will check if loop is stuck. If canary reaches usize::end we have
-                // traversed more edge links than are possible to store in the tree
-                trace!("traversing edge links");
-                let mut canary: usize = 0;
-                // Look ahead by one link and check if it that is the last node, if not, store the
-                // next link as the current link and loop till the end is found
-                while self.edge_links[current_edge_link] != NodeIndex::end()
-                    || canary == usize::end()
-                {
-                    current_edge_link = self.edge_links[current_edge_link];
-                    canary += 1;
-                }
-                // edge link is now set to the last node of the tree, assuming canary value didn't
-                // trip
-                anyhow::ensure!(canary < usize::end(), tree::Error::InvalidEdgeIndex);
-                debug!("end link is: {}", current_edge_link);
+            // get a mutable reference to the last entry in the linked list
+            let mut walker = OutgoingEdgeWalker::new(self, source)?;
+            let last = walker.last(self)?;
 
-                trace!("store edge at end of link list");
-                self.edge_links[current_edge_link] = new_edge_index;
-            }
+            // double check that this link is actually end of the list
+            debug!("end link value is: {}", *last);
+            *last = new_edge_index;
 
-            Ok(new_edge_index)
+            let event = event::EdgeInsert {
+                source,
+                target,
+                index: new_edge_index,
+                placement: walker.placement,
+                edge,
+            };
+            Ok(event)
         }
 
         /// Edit the choice in an existing edge. The source or target node cannot be modified, the
@@ -587,16 +720,26 @@ pub mod tree {
         ///
         /// If the index is invalid, a corresponding error will be returned
         /// with no modification to the tree.
-        pub fn edit_edge(&mut self, index: usize, new_choice: Choice) -> Result<event::EdgeEdit> {
+        pub fn edit_edge(
+            &mut self,
+            index: EdgeIndex,
+            new_choice: Choice,
+        ) -> Result<event::EdgeEdit> {
             trace!("check validity of edge index");
             let choice = self
                 .edges
-                .get_mut(index as usize)
+                .get_mut(index)
                 .ok_or(tree::Error::InvalidEdgeIndex)?;
 
             let old_choice = *choice;
             *choice = new_choice;
-            Ok(old_choice)
+
+            let event = event::EdgeEdit {
+                index,
+                from: old_choice,
+                to: new_choice,
+            };
+            Ok(event)
         }
 
         /// Remove an existing edge from the tree and return a tuple of the source node, target node,
@@ -607,14 +750,9 @@ pub mod tree {
         /// # Errors
         ///
         /// If the index is invalid, an error will be returned without modifying the tree
-        pub fn remove_edge(
-            &mut self,
-            index: EdgeIndex,
-        ) -> Result<event::EdgeInsert> {
+        pub fn remove_edge(&mut self, index: EdgeIndex) -> Result<event::EdgeInsert> {
             trace!("check validity of edge index");
-            self.edges
-                .get(index as usize)
-                .ok_or(tree::Error::InvalidEdgeIndex)?;
+            self.edges.get(index).ok_or(tree::Error::InvalidEdgeIndex)?;
 
             // get source and target of edge to return at end of fn
             let source = self.source_of(index)?;
@@ -664,7 +802,15 @@ pub mod tree {
                     *link = index;
                 }
             }
-            Ok((source, target, removed_edge, placement))
+
+            let event = event::EdgeInsert {
+                source,
+                target,
+                index,
+                placement,
+                edge: removed_edge,
+            };
+            Ok(event)
         }
 
         /// Insert an in a specific location in the edge list and with a specific placement in a
@@ -682,7 +828,7 @@ pub mod tree {
             target: NodeIndex,
             choice: Choice,
             desired_index: EdgeIndex,
-            desired_placement: usize,
+            desired_placement: PlacementIndex,
         ) -> Result<event::EdgeInsert> {
             info!(
                 "Insert edge from {} to {} at index {} and placement {}",
@@ -698,6 +844,7 @@ pub mod tree {
 
             trace!("add edge to end of lists");
             let new_edge_data = self.add_edge(source, target, choice)?;
+            let new_edge = new_edge_data.edge;
             let swap_index = new_edge_data.index;
 
             trace!("swap edge to desired index");
@@ -723,9 +870,17 @@ pub mod tree {
             }
 
             trace!("change the placement of the edge in the source nodes' outgoing edges list");
-            let placement =
+            let edge_move_event =
                 self.edit_link_order(source, clamped_desired_index, desired_placement)?;
-            Ok((clamped_desired_index, placement))
+
+            let event = event::EdgeInsert {
+                source,
+                target,
+                index: clamped_desired_index,
+                placement: edge_move_event.to,
+                edge: new_edge,
+            };
+            Ok(event)
         }
 
         /// Edit the link order of an edge. This modifies where an edge appears in the linked list
@@ -744,32 +899,41 @@ pub mod tree {
         pub fn edit_link_order(
             &mut self,
             source: NodeIndex,
-            edge_index: EdgeIndex,
-            desired_placement: usize,
-        ) -> Result<usize> {
+            index: EdgeIndex,
+            desired_placement: PlacementIndex,
+        ) -> Result<event::LinkMove> {
+            let current_placement = self.placement_of(source, index)?;
             info!(
-                "Edit link order for edge {} to {}",
-                edge_index, desired_placement
+                "Edit link order for edge {} from {} to {}",
+                index, current_placement, desired_placement,
             );
 
             trace!("remove link from list first");
-            let current_edge_link = self.edge_links[edge_index];
+            let current_edge_link = self.edge_links[index];
             // Check node_links first then edge_links
             for link in self.node_links.as_mut_slice() {
-                if *link == edge_index {
+                if *link == index {
                     // link should point to whatever the to-be-deleted link currently points to
                     *link = current_edge_link;
                 }
             }
 
             for link in self.edge_links.as_mut_slice() {
-                if *link == edge_index {
+                if *link == index {
                     // link should point to whatever the to-be-deleted link currently points to
                     *link = current_edge_link;
                 }
             }
 
-            self.insert_link(source, edge_index, desired_placement)
+            let new_placement = self.insert_link(source, index, desired_placement)?;
+
+            let event = event::LinkMove {
+                index,
+                source,
+                from: current_placement,
+                to: new_placement,
+            };
+            Ok(event)
         }
 
         /// Private helper function that inserts an existing edge into the desired placement of a
@@ -810,12 +974,12 @@ pub mod tree {
         fn insert_link(
             &mut self,
             source: NodeIndex,
-            edge_index: EdgeIndex,
-            desired_placement: usize,
-        ) -> Result<usize> {
+            index: EdgeIndex,
+            desired_placement: PlacementIndex,
+        ) -> Result<PlacementIndex> {
             info!(
                 "insert edge {} into linked list of {} at placement {}",
-                edge_index, source, desired_placement
+                index, source, desired_placement
             );
             // get length of edge_links list, also checks that source is valid
             let len = self.outgoing_from_index(source)?.count();
@@ -829,12 +993,11 @@ pub mod tree {
 
             trace!("insert the link at clamped desired location");
             let mut placement_walker = OutgoingEdgeWalker::new(&self, source)?;
-            let link_at_placement: &mut EdgeIndex = placement_walker
-                .skip(self, clamped_desired)
-                .ok_or(tree::Error::InvalidEdgeLinks)?;
+            let link_at_placement: &mut EdgeIndex = placement_walker.skip(self, clamped_desired)?;
             let val_at_placement = *link_at_placement;
-            *link_at_placement = edge_index;
-            self.edge_links[edge_index] = val_at_placement;
+            *link_at_placement = index;
+            self.edge_links[index] = val_at_placement;
+
             Ok(clamped_desired)
         }
 
@@ -858,16 +1021,23 @@ pub mod tree {
         /// # let choice = Choice::new(Section::new([0,0],0), ReqKind::No, EffectKind::No);
         /// let mut tree = Tree::with_capacity(10, 10);
         /// // add two nodes with dummy dialogue values
-        /// let first_node_idx: NodeIndex = tree.add_node(dialogue).unwrap();
-        /// let second_node_idx: NodeIndex = tree.add_node(dialogue).unwrap();
+        /// let first_node_event: event::NodeInsert = tree.add_node(dialogue).unwrap();
+        /// let second_node_event: event::NodeInsert = tree.add_node(dialogue).unwrap();
         ///
         /// // create two edges from first_node with dummy choice value
-        /// let first_edge_idx: EdgeIndex = tree.add_edge(first_node_idx, second_node_idx,
-        /// choice).unwrap();
-        /// let second_edge_idx: EdgeIndex = tree.add_edge(first_node_idx, second_node_idx,
-        /// choice).unwrap();
+        /// let first_edge_event: event::EdgeInsert = tree.add_edge(
+        ///     first_node_event.index,
+        ///     second_node_event.index,
+        ///     choice).unwrap();
+        /// let second_edge_event: event::EdgeInsert = tree.add_edge(
+        ///     first_node_event.index,
+        ///     second_node_event.index,
+        ///     choice).unwrap();
         ///
-        /// let outgoing_edges: Vec<EdgeIndex> = tree.outgoing_from_index(first_node_idx).unwrap().collect();
+        /// let outgoing_edges: Vec<EdgeIndex> = tree
+        ///     .outgoing_from_index(first_node_event.index)
+        ///     .unwrap()
+        ///     .collect();
         /// assert_eq!(outgoing_edges, vec![0, 1]);
         /// ```
         #[inline]
@@ -948,9 +1118,66 @@ pub mod tree {
 /// substituted into the text before displaying, or updated by choices in the tree.
 pub type NameTable = HashMap<KeyString, NameString>;
 
+/// Information about an insertion to the NameTable such that the event can be reconstructed later
+///
+/// This structure should be returned by methods that perform an equivalent transformation to a
+/// NameTable
+pub struct NameTableInsert {
+    pub key: KeyString,
+    pub name: NameString,
+}
+
+/// Information about a removal from the NameTable such that the event can be reconstructed later
+///
+/// This structure should be returned by methods that perform an equivalent transformation to a
+/// NameTable
+pub struct NameTableRemove {
+    pub key: KeyString,
+    pub name: NameString,
+}
+
+/// Information about an edit to the NameTable such that the event can be reconstructed later
+///
+/// This structure should be returned by methods that perform an equivalent transformation to a
+/// NameTable
+pub struct NameTableEdit {
+    pub key: KeyString,
+    pub from: NameString,
+    pub to: NameString,
+}
+
 /// Typedef representing the hashmap type used to store values in dialogue trees. These are used as
 /// requirements or effects from player choices.
 pub type ValTable = HashMap<KeyString, u32>;
+
+/// Information about an insertion (an addition or removal) to the ValTable such that the event
+/// can be reconstructed later
+///
+/// This structure should be returned by methods that perform an equivalent transformation to a
+/// ValTable
+pub struct ValTableInsert {
+    pub key: KeyString,
+    pub val: u32,
+}
+
+/// Information about a removal from the ValTable such that the event can be reconstructed later
+///
+/// This structure should be returned by methods that perform an equivalent transformation to a
+/// ValTable
+pub struct ValTableRemove {
+    pub key: KeyString,
+    pub val: u32,
+}
+
+/// Information about an edit to the ValTable such that the event can be reconstructed later
+///
+/// This structure should be returned by methods that perform an equivalent transformation to a
+/// ValTable
+pub struct ValTableEdit {
+    pub key: KeyString,
+    pub from: u32,
+    pub to: u32,
+}
 
 /// Top level data structure for storing a dialogue tree
 ///
@@ -992,23 +1219,206 @@ impl DialogueTreeData {
 
 #[enum_dispatch]
 pub trait Event {
-    fn undo(&self, target: &mut DialogueTreeData);
-    fn redo(&self, target: &mut DialogueTreeData);
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()>;
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()>;
 }
 
 /// Enum of different types of events that modify a DialogueTree. These variants store the
-/// information required to reconstruct the event, and implements the Event trait along with 
+/// information required to reconstruct the event, and implements the Event trait along with
 /// enum_dispatch to support undoing/redoing the event, and allow a unified call to undo() or
 /// redo() to propogate to the inner event type.
 ///
-/// The Enum is flattened such that all events are granular changes, and there are no nested enum
-/// types of events. This is done to avoid extra padding/discriminant words being added to the size
-/// of DialogueTreeEvent
+/// The Enum is flattened such that all events are granular changes to an underlying datastructure,
+/// and there are no nested enum types of events. This is done to avoid extra padding/discriminant
+/// words increasing the size of DialogueTreeEvent
+
+#[enum_dispatch(Event)]
 pub enum DialogueTreeEvent {
-    NodeInsert(tree::event::NodeInsert),
-    NodeEdit(tree::event::NodeEdit),
-    EdgeInsert(tree::event::EdgeInsert),
-    EdgeEdit(tree::EdgeEdit),
+    NodeInsert,
+    NodeRemove,
+    NodeEdit,
+    EdgeInsert,
+    EdgeRemove,
+    EdgeEdit,
+    LinkMove,
+    NameTableInsert,
+    NameTableRemove,
+    NameTableEdit,
+    ValTableInsert,
+    ValTableRemove,
+    ValTableEdit,
+}
+
+impl Event for NodeInsert {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.remove_node(self.index)?;
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.insert_node(self.node, self.index)?;
+        Ok(())
+    }
+}
+
+impl Event for NodeRemove {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.remove_node(self.index)?;
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.insert_node(self.node, self.index)?;
+        Ok(())
+    }
+}
+
+impl Event for NodeEdit {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.edit_node(self.index, self.from)?;
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.edit_node(self.index, self.to)?;
+        Ok(())
+    }
+}
+
+impl Event for EdgeInsert {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.remove_edge(self.index)?;
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.insert_edge(
+            self.source,
+            self.target,
+            self.edge,
+            self.index,
+            self.placement,
+        )?;
+        Ok(())
+    }
+}
+
+impl Event for EdgeRemove {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.insert_edge(
+            self.source,
+            self.target,
+            self.edge,
+            self.index,
+            self.placement,
+        )?;
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.remove_edge(self.index)?;
+        Ok(())
+    }
+}
+
+impl Event for EdgeEdit {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.edit_edge(self.index, self.from)?;
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target.tree.edit_edge(self.index, self.to)?;
+        Ok(())
+    }
+}
+
+impl Event for LinkMove {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target
+            .tree
+            .edit_link_order(self.source, self.index, self.from)?;
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        let _new_event = target
+            .tree
+            .edit_link_order(self.source, self.index, self.to)?;
+        Ok(())
+    }
+}
+
+impl Event for NameTableInsert {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.name_table.remove(&self.key);
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.name_table.insert(self.key, self.name);
+        Ok(())
+    }
+}
+
+impl Event for NameTableRemove {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.name_table.insert(self.key, self.name);
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.name_table.remove(&self.key);
+        Ok(())
+    }
+}
+
+impl Event for NameTableEdit {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.name_table.insert(self.key, self.from);
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.name_table.insert(self.key, self.to);
+        Ok(())
+    }
+}
+
+impl Event for ValTableInsert {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.val_table.remove(&self.key);
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.val_table.insert(self.key, self.val);
+        Ok(())
+    }
+}
+
+impl Event for ValTableRemove {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.val_table.insert(self.key, self.val);
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.val_table.remove(&self.key);
+        Ok(())
+    }
+}
+
+impl Event for ValTableEdit {
+    fn undo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.val_table.insert(self.key, self.from);
+        Ok(())
+    }
+
+    fn redo(&self, target: &mut DialogueTreeData) -> Result<()> {
+        target.val_table.insert(self.key, self.to);
+        Ok(())
+    }
 }
 
 /// State information for an editor instance. Includes two copies of the dialogue tree (one active
@@ -1018,8 +1428,6 @@ pub struct EditorState {
     pub active: DialogueTreeData,
     pub backup: DialogueTreeData,
     pub scratchpad: String,
-    pub history: Vec<usize>,
-    pub stack: Vec<u8>,
 }
 
 impl EditorState {
@@ -1032,8 +1440,6 @@ impl EditorState {
             active: data.clone(),
             backup: data,
             scratchpad: String::with_capacity(1000),
-            history: Vec::with_capacity(128),
-            stack: Vec::with_capacity(8192),
         }
     }
 
@@ -1351,9 +1757,9 @@ pub mod cmd {
                     Dialogue::new(Section::new([start, end], hash), Position::new(0.0, 0.0));
 
                 trace!("add new node to tree");
-                let index = state.active.tree.add_node(dialogue)?;
+                let event = state.active.tree.add_node(dialogue)?;
 
-                Ok(index)
+                Ok(event.index)
             }
         }
 
@@ -1416,11 +1822,11 @@ pub mod cmd {
                 );
 
                 trace!("Adding new edge to tree");
-                let edge_index = state
+                let event = state
                     .active
                     .tree
                     .add_edge(self.source, self.target, choice)?;
-                Ok(edge_index)
+                Ok(event.index)
             }
         }
 
@@ -1699,8 +2105,8 @@ pub mod cmd {
             fn execute(&self, state: &mut EditorState) -> Result<usize> {
                 info!("Remove node {}", self.node_index);
 
-                let removed_weight = state.active.tree.remove_node(self.node_index)?;
-                let hash = removed_weight.section.hash;
+                let event = state.active.tree.remove_node(self.node_index)?;
+                let hash = event.node.section.hash;
                 Ok(hash as usize)
             }
         }
@@ -1720,9 +2126,8 @@ pub mod cmd {
                 info!("Remove Edge {}", self.edge_index);
 
                 trace!("remove edge from tree");
-                let (_source, _target, removed_weight, _placement) =
-                    state.active.tree.remove_edge(self.edge_index)?;
-                let hash = removed_weight.section.hash;
+                let event = state.active.tree.remove_edge(self.edge_index)?;
+                let hash = event.edge.section.hash;
 
                 Ok(hash as usize)
             }
