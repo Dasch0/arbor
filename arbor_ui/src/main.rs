@@ -62,7 +62,7 @@ fn main() {
     let _sc_extent = wgpu::Extent3d {
         width: sc_desc.width,
         height: sc_desc.height,
-        depth: 1,
+        depth_or_array_layers: 1,
     };
 
     let repaint_signal = std::sync::Arc::new(ExampleRepaintSignal(std::sync::Mutex::new(
@@ -76,6 +76,12 @@ fn main() {
         scale_factor: window.scale_factor(),
         font_definitions: FontDefinitions::default(),
         style: egui::Style {
+            debug: egui::style::DebugOptions {
+                show_widgets: false,
+                show_expand_width: false,
+                show_expand_height: false,
+                show_resize: false,
+            },
             body_text_style: egui::TextStyle::Body,
             wrap: None,
             spacing: egui::style::Spacing::default(),

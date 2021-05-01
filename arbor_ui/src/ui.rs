@@ -61,6 +61,7 @@ impl epi::App for ArborUi {
             .show(ctx, |ui| {
                 self.new_window.ui_content(&mut self.state, ui);
             });
+        self.new_window.open &= new_window_open;
 
         let mut load_window_open = self.load_window.open;
         egui::Window::new("Load Project")
@@ -111,6 +112,24 @@ impl epi::App for ArborUi {
                     }
                     if ui.button("quit").clicked() {
                         frame.quit();
+                    }
+                });
+
+                egui::menu::menu(ui, "Edit", |ui| {
+                    ui.separator();
+                    if ui.button("undo").clicked() {
+                        let res = cmd::Undo::new().execute(&mut self.state);
+                        match res {
+                            Ok(_) => {}
+                            Err(e) => println!("{}", e),
+                        }
+                    }
+                    if ui.button("redo").clicked() {
+                        let res = cmd::Redo::new().execute(&mut self.state);
+                        match res {
+                            Ok(_) => {}
+                            Err(e) => println!("{}", e),
+                        }
                     }
                 });
             });
@@ -193,7 +212,7 @@ impl LoadWindow {
                     // if ok, close the load project window
                     self.open = false;
                     // Check if tree has many default positions, if so, give the user a warning
-                    let zeroed_count = state.active.tree.node_weights_mut().fold(0, |sum, n| {
+                    let zeroed_count = state.active.tree.nodes().iter().fold(0, |sum, n| {
                         sum + (n.pos.x == 0.0 && n.pos.y == 0.0) as usize
                     });
                     // NOTE: Right now show the warning if more than 1 node is at zero, maybe
@@ -386,10 +405,10 @@ impl ValueEditor {
             );
             ui.separator();
             ui.label("initial value");
-            ui.add(egui::DragValue::u32(&mut self.value));
+            ui.add(egui::DragValue::new(&mut self.value));
             ui.separator();
 
-            if ui.button("new name").clicked() {
+            if ui.button("new value").clicked() {
                 let res = cmd::new::Val::new(
                     KeyString::from(self.key_buf.as_str()).unwrap_or_default(),
                     self.value,
@@ -424,22 +443,21 @@ impl NodeEditor {
     pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) -> egui::Response {
         ui.vertical(|ui| {
             ui.label("name");
-            egui::combo_box_with_label(
-                ui,
+            egui::ComboBox::from_label(
                 state // display the selected key's name value
                     .active
                     .name_table
                     .get(self.name_buf.as_str())
                     .unwrap_or(&arbor_core::NameString::new())
                     .to_string(),
-                self.name_buf.clone(),
-                |ui| {
-                    // Name must be in key form when selecting,
-                    for name in state.active.name_table.keys() {
-                        ui.selectable_value(&mut self.name_buf, name.to_string(), name.as_str());
-                    }
-                },
-            );
+            )
+            .selected_text(self.name_buf.clone())
+            .show_ui(ui, |ui| {
+                // Name must be in key form when selecting,
+                for name in state.active.name_table.keys() {
+                    ui.selectable_value(&mut self.name_buf, name.to_string(), name.as_str());
+                }
+            });
             ui.separator();
             ui.label("text");
             ui.add(
@@ -458,7 +476,7 @@ impl NodeEditor {
                 .execute(state);
                 match res {
                     Ok(node_index) => {
-                        state.active.tree[NodeIndex::new(node_index)].pos =
+                        state.active.tree.nodes_mut()[node_index].pos =
                             arbor_core::Position::new(0.3, 0.3)
                     }
                     Err(e) => println!("{}", e),
@@ -471,8 +489,8 @@ impl NodeEditor {
 
 #[derive(Serialize, Deserialize)]
 pub struct EdgeEditor {
-    source_node: u32,
-    target_node: u32,
+    source_node: usize,
+    target_node: usize,
     text_buf: String,
 }
 
@@ -490,10 +508,10 @@ impl EdgeEditor {
     pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) -> egui::Response {
         ui.vertical(|ui| {
             ui.label("source node");
-            ui.add(egui::DragValue::u32(&mut self.source_node));
+            ui.add(egui::DragValue::new(&mut self.source_node));
 
             ui.label("target Node");
-            ui.add(egui::DragValue::u32(&mut self.target_node));
+            ui.add(egui::DragValue::new(&mut self.target_node));
 
             ui.separator();
             ui.add(
@@ -576,14 +594,14 @@ impl TreePainting {
             ui.separator();
             ui.label("fill");
             ui.color_edit_button_srgba(&mut self.fill);
-            ui.label("x position");
-            ui.add(egui::Slider::f32(&mut self.zoom, 0.0001..=2.0));
+            ui.label("zoom");
+            ui.add(egui::Slider::new(&mut self.zoom, 0.0001..=2.0));
             ui.separator();
             ui.label("x position");
-            ui.add(egui::DragValue::f32(&mut self.pan.x));
+            ui.add(egui::DragValue::new(&mut self.pan.x));
             ui.separator();
             ui.label("y position");
-            ui.add(egui::DragValue::f32(&mut self.pan.y));
+            ui.add(egui::DragValue::new(&mut self.pan.y));
             ui.separator();
         })
         .response
@@ -607,16 +625,15 @@ impl TreePainting {
         let from_screen = to_screen.inverse();
 
         // draw edges first, since they need to be behind nodes
-        for edge_ref in data.tree.edge_references() {
-            let choice = data.tree.edge_weight(edge_ref.id()).unwrap();
+        for (edge_index, choice) in data.tree.edges().iter().enumerate() {
             let slice = &data.text[choice.section[0]..choice.section[1]];
             let _res = cmd::util::parse_edge(slice, &data.name_table, &mut self.hover_text_buf);
 
-            let source_node_index = edge_ref.source();
-            let target_node_index = edge_ref.target();
+            let source_node_index = data.tree.source_of(edge_index).unwrap();
+            let target_node_index = data.tree.target_of(edge_index).unwrap();
 
-            let source_pos = data.tree[source_node_index].pos;
-            let target_pos = data.tree[target_node_index].pos;
+            let source_pos = data.tree.get_node(source_node_index).unwrap().pos;
+            let target_pos = data.tree.get_node(target_node_index).unwrap().pos;
 
             let source_coord = to_screen * self.transform(egui::pos2(source_pos.x, source_pos.y));
             let target_coord = to_screen * self.transform(egui::pos2(target_pos.x, target_pos.y));
@@ -634,16 +651,11 @@ impl TreePainting {
 
             // paint popup with edge text if conditions are met
             if response.rect.contains(midpoint - bias) && self.zoom > 0.3 {
-                Self::edge_text_popup(
-                    &response.ctx,
-                    edge_ref.id().index(),
-                    midpoint - bias,
-                    |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(self.hover_text_buf.as_str());
-                        });
-                    },
-                );
+                Self::edge_text_popup(&response.ctx, edge_index, midpoint - bias, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(self.hover_text_buf.as_str());
+                    });
+                });
             }
 
             // Finally, paint arrow along edge, stop at edge of target node to show arrow tip
@@ -658,7 +670,7 @@ impl TreePainting {
         }
 
         // loop over the nodes, draw them, and update their location if being dragged
-        for n in data.tree.node_weights_mut() {
+        for n in data.tree.nodes_mut() {
             let pos = n.pos;
 
             let p = egui::pos2(pos.x, pos.y);
@@ -728,7 +740,7 @@ impl TreePainting {
                 egui::Frame::popup(&ctx.style()).show(ui, |ui| {
                     ui.set_max_width(MAX_TEXT_WIDTH);
                     add_contents(ui);
-                })
+                });
             })
     }
 
@@ -746,7 +758,7 @@ impl TreePainting {
                 egui::Frame::popup(&ctx.style()).show(ui, |ui| {
                     ui.set_max_width(MAX_TEXT_WIDTH);
                     add_contents(ui);
-                })
+                });
             })
     }
 
@@ -852,7 +864,7 @@ impl FrameHistory {
         let color = ui.visuals().text_color();
         let line_stroke = Stroke::new(1.0, color);
 
-        if let Some(pointer_pos) = ui.input().pointer.tooltip_pos() {
+        if let Some(pointer_pos) = ui.input().pointer.hover_pos() {
             if rect.contains(pointer_pos) {
                 let y = pointer_pos.y;
                 shapes.push(Shape::line_segment(
@@ -998,7 +1010,7 @@ impl BackendPanel {
         ui.horizontal(|ui| {
             ui.spacing_mut().slider_width = 90.0;
             ui.add(
-                egui::Slider::f32(pixels_per_point, 0.5..=5.0)
+                egui::Slider::new(pixels_per_point, 0.5..=5.0)
                     .logarithmic(true)
                     .text("Scale"),
             )

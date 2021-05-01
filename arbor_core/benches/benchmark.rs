@@ -79,5 +79,42 @@ fn quick_parse_node(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, quick_parse_node, stress_parse_node);
+/// Test of a worst case type of scenario for undo/redo, where there is an extremely large number
+/// of outgoing edges from a single node.
+fn stress_undo_redo(c: &mut Criterion) {
+    let mut state = EditorState::new(DialogueTreeData::default());
+    let test_key = KeyString::from("cat").unwrap();
+    let test_name = NameString::from("Behemoth").unwrap();
+
+    cmd::new::Name::new(test_key, test_name)
+        .execute(&mut state)
+        .unwrap();
+
+    for i in 0..10000 {
+        cmd::new::Node::new(test_key.to_string(), format!("test dialogue {}", i))
+            .execute(&mut state)
+            .unwrap();
+        cmd::new::Edge::new(0, i, format!("test choice {}", i), None, None)
+            .execute(&mut state)
+            .unwrap();
+    }
+    // bench part
+    c.bench_function("stress_undo_redo", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+                cmd::Undo::new().execute(&mut state).unwrap();
+            }
+            for _ in 0..10 {
+                cmd::Redo::new().execute(&mut state).unwrap();
+            }
+        })
+    });
+}
+
+criterion_group!(
+    benches,
+    quick_parse_node,
+    stress_parse_node,
+    stress_undo_redo
+);
 criterion_main!(benches);

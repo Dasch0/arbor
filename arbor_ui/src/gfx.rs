@@ -181,7 +181,7 @@ impl RenderTarget {
             size: extent,
             mip_level_count: 1,
             sample_count: samples as u32,
-            dimension: match extent.depth {
+            dimension: match extent.depth_or_array_layers {
                 1 => wgpu::TextureDimension::D2,
                 // TODO: Should multi-layer textures be D2 or D2Array?
                 _ => wgpu::TextureDimension::D2,
@@ -198,7 +198,7 @@ impl RenderTarget {
             size: extent,
             mip_level_count: 1,
             sample_count: samples as u32,
-            dimension: match extent.depth {
+            dimension: match extent.depth_or_array_layers {
                 1 => wgpu::TextureDimension::D2,
                 _ => wgpu::TextureDimension::D2,
             },
@@ -207,7 +207,7 @@ impl RenderTarget {
         });
 
         // Create views for each layer of texture
-        let views: Vec<wgpu::TextureView> = (0..extent.depth)
+        let views: Vec<wgpu::TextureView> = (0..extent.depth_or_array_layers)
             .into_iter()
             .map(|i| {
                 texture.create_view(&wgpu::TextureViewDescriptor {
@@ -216,14 +216,14 @@ impl RenderTarget {
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     aspect: wgpu::TextureAspect::All,
                     base_mip_level: 0,
-                    level_count: None,
+                    mip_level_count: None,
                     base_array_layer: i,
                     array_layer_count: std::num::NonZeroU32::new(1),
                 })
             })
             .collect();
 
-        let depth_views: Vec<wgpu::TextureView> = (0..extent.depth)
+        let depth_views: Vec<wgpu::TextureView> = (0..extent.depth_or_array_layers)
             .into_iter()
             .map(|i| {
                 depth_buffer.create_view(&wgpu::TextureViewDescriptor {
@@ -232,7 +232,7 @@ impl RenderTarget {
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     aspect: wgpu::TextureAspect::All,
                     base_mip_level: 0,
-                    level_count: None,
+                    mip_level_count: None,
                     base_array_layer: i,
                     array_layer_count: std::num::NonZeroU32::new(1),
                 })
@@ -274,7 +274,7 @@ impl ResolveTarget {
             size: target.extent,
             mip_level_count: 1,
             sample_count: 1,
-            dimension: match target.extent.depth {
+            dimension: match target.extent.depth_or_array_layers {
                 1 => wgpu::TextureDimension::D2,
                 // TODO: Should multi-layer textures always be D3?
                 _ => wgpu::TextureDimension::D2,
@@ -290,7 +290,7 @@ impl ResolveTarget {
             size: target.extent,
             mip_level_count: 1,
             sample_count: 1,
-            dimension: match target.extent.depth {
+            dimension: match target.extent.depth_or_array_layers {
                 1 => wgpu::TextureDimension::D2,
                 _ => wgpu::TextureDimension::D2,
             },
@@ -298,7 +298,7 @@ impl ResolveTarget {
             usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
         });
         // Create views for each layer of texture
-        let views: Vec<wgpu::TextureView> = (0..target.extent.depth)
+        let views: Vec<wgpu::TextureView> = (0..target.extent.depth_or_array_layers)
             .into_iter()
             .map(|i| {
                 texture.create_view(&wgpu::TextureViewDescriptor {
@@ -307,14 +307,14 @@ impl ResolveTarget {
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     aspect: wgpu::TextureAspect::All,
                     base_mip_level: 0,
-                    level_count: None,
+                    mip_level_count: None,
                     base_array_layer: i,
                     array_layer_count: std::num::NonZeroU32::new(1),
                 })
             })
             .collect();
 
-        let depth_views: Vec<wgpu::TextureView> = (0..target.extent.depth)
+        let depth_views: Vec<wgpu::TextureView> = (0..target.extent.depth_or_array_layers)
             .into_iter()
             .map(|i| {
                 depth_buffer.create_view(&wgpu::TextureViewDescriptor {
@@ -323,7 +323,7 @@ impl ResolveTarget {
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     aspect: wgpu::TextureAspect::All,
                     base_mip_level: 0,
-                    level_count: None,
+                    mip_level_count: None,
                     base_array_layer: i,
                     array_layer_count: std::num::NonZeroU32::new(1),
                 })

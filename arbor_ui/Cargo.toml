@@ -8,15 +8,14 @@ edition = "2018"
 
 [dependencies]
 rand = "0.8.3"
-serde-diff = "0.4.1"
 chrono = "0.4"
 futures-lite = "1.11"
 anyhow = "1.0"
-egui = { version = "0.10", features = ["persistence"] }
-epi = "0.10.0"
-egui_wgpu_backend = "0.5"
-egui_winit_platform = { version = "0.5", features = ["clipboard"] }
-wgpu = "0.7"
+egui = { version = "0.11", features = ["persistence"] }
+epi = "0.11.0"
+egui_wgpu_backend = { git = "https://github.com/Dasch0/egui_wgpu_backend" }
+egui_winit_platform = { version = "0.6", features = ["clipboard"] }
+wgpu = "0.8"
 winit = "0.24"
 bytemuck = { version = "1.4.1", features = ["derive"]}
 serde = "1.0.124"

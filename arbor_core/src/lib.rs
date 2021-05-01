@@ -606,6 +606,12 @@ pub mod tree {
             self.nodes.as_slice()
         }
 
+        /// Get an mutable slice of the nodes in the tree
+        #[inline]
+        pub fn nodes_mut(&mut self) -> &mut [Dialogue] {
+            self.nodes.as_mut_slice()
+        }
+
         /// Get the contents of an edge
         ///
         /// # Errors
@@ -1241,6 +1247,13 @@ impl DialogueTreeHistory {
         // drain any undone events before pushing
         self.record.drain(self.position..);
         self.record.push(event);
+        self.position += 1;
+    }
+
+    /// clear the history, this permanently deletes all events
+    fn clear(&mut self) {
+        self.record.clear();
+        self.position = 0;
     }
 
     /// Undo the most recent event in the history.
@@ -2438,7 +2451,7 @@ pub mod cmd {
     impl Executable for Redo {
         fn execute(&self, state: &mut EditorState) -> Result<usize> {
             info!("Redo");
-            state.history.undo(&mut state.active)?;
+            state.history.redo(&mut state.active)?;
             Ok(0)
         }
     }
@@ -2496,6 +2509,9 @@ pub mod cmd {
 
             // Confirm that that rebuilt tree is valid
             util::validate_tree(&state.active)?;
+
+            // Clear the undo/redo history
+            state.history.clear();
 
             Ok(state.active.uid)
         }

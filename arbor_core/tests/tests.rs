@@ -137,6 +137,39 @@ mod tree_tests {
         assert_eq!(format!("{:?}", tree), format!("{:?}", tree_full));
     }
 
+    /// Test top level undo-redo capability of EditorState
+    #[test]
+    fn undo_redo() {
+        let mut state = EditorState::new(DialogueTreeData::default());
+        let test_key = KeyString::from("cat").unwrap();
+        let test_name = NameString::from("Behemoth").unwrap();
+
+        cmd::new::Name::new(test_key, test_name)
+            .execute(&mut state)
+            .unwrap();
+
+        for i in 0..10 {
+            cmd::new::Node::new(test_key.to_string(), format!("test dialogue {}", i))
+                .execute(&mut state)
+                .unwrap();
+            cmd::new::Edge::new(0, i, format!("test choice {}", i), None, None)
+                .execute(&mut state)
+                .unwrap();
+        }
+
+        let tree_full = state.active.clone();
+
+        for _ in 0..15 {
+            cmd::Undo::new().execute(&mut state).unwrap();
+        }
+
+        for _ in 0..15 {
+            cmd::Redo::new().execute(&mut state).unwrap();
+        }
+
+        assert_eq!(format!("{:?}", state.active), format!("{:?}", tree_full));
+    }
+
     /// Test adding, removing, then re-inserting edges
     #[test]
     fn add_remove_edge() {
