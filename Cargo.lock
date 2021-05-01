@@ -735,8 +735,8 @@ dependencies = [
 
 [[package]]
 name = "egui_wgpu_backend"
-version = "0.6.0"
-source = "git+https://github.com/Dasch0/egui_wgpu_backend#256c1e7195f34bcc62358f429fbca5879ac4243a"
+version = "0.7.0"
+source = "git+https://github.com/hasenbanck/egui_wgpu_backend#dedfb390162ededcfe8258b3934f1d87fd719478"
 dependencies = [
  "bytemuck",
  "epi",

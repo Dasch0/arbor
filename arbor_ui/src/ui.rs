@@ -7,7 +7,7 @@ const MAX_NAME_WIDTH: f32 = 128.0;
 const MAX_TEXT_WIDTH: f32 = 160.0;
 
 // constants for maximum length to expect for text string buffers throughout UI
-// so far, longer names are allowed but will require some extra allocations
+// so far, longer texts are allowed but will require some extra allocations
 const MAX_NAME_LEN: usize = 32;
 const MAX_TEXT_LEN: usize = 256;
 
@@ -69,6 +69,7 @@ impl epi::App for ArborUi {
             .show(ctx, |ui| {
                 self.load_window.ui_content(&mut self.state, ui);
             });
+        self.load_window.open &= load_window_open;
 
         let mut rebuild_window_open = self.rebuild_window.open;
         egui::Window::new("Rebuild Project")
@@ -76,6 +77,7 @@ impl epi::App for ArborUi {
             .show(ctx, |ui| {
                 self.rebuild_window.ui_content(&mut self.state, ui);
             });
+        self.rebuild_window.open &= rebuild_window_open;
 
         let mut backend_panel_open = self.backend_panel.open;
         egui::Window::new("BackendPanel")
@@ -84,6 +86,7 @@ impl epi::App for ArborUi {
                 self.backend_panel.update(ctx, frame);
                 self.backend_panel.ui(ui, frame);
             });
+        self.backend_panel.open = backend_panel_open;
 
         // Draw rest of UI now that project status is sorted out
         //
