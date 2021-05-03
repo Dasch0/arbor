@@ -4,7 +4,7 @@ use egui::util::History;
 use serde::{Deserialize, Serialize};
 // constants for maximum width to show for text throughout UI
 const MAX_NAME_WIDTH: f32 = 128.0;
-const MAX_TEXT_WIDTH: f32 = 160.0;
+const MAX_TEXT_WIDTH: f32 = 512.0;
 
 // constants for maximum length to expect for text string buffers throughout UI
 // so far, longer texts are allowed but will require some extra allocations
@@ -138,42 +138,41 @@ impl epi::App for ArborUi {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Dialogue Tree");
-            self.painting.ui_control(ui);
-            egui::Frame::dark_canvas(ui.style()).show(ui, |ui| {
-                self.painting.ui_content(&mut self.state.active, ui);
-            });
-        });
-
-        egui::Window::new("Name Editor")
-            .default_size(egui::vec2(MAX_NAME_WIDTH, f32::INFINITY))
-            .show(ctx, |ui| {
+        egui::Window::new("Editor Tools").show(ctx, |ui| {
+            egui::CollapsingHeader::new("Name Editor").show(ui, |ui| {
                 // left panel for editing tools on selected node
                 egui::ScrollArea::auto_sized().show(ui, |ui| {
                     self.name_editor.ui_content(&mut self.state, ui);
                 });
             });
 
-        egui::Window::new("Value Editor")
-            .default_size(egui::vec2(MAX_NAME_WIDTH, f32::INFINITY))
-            .show(ctx, |ui| {
+            egui::CollapsingHeader::new("Value Editor").show(ui, |ui| {
                 // left panel for editing tools on selected node
                 egui::ScrollArea::auto_sized().show(ui, |ui| {
                     self.value_editor.ui_content(&mut self.state, ui);
                 });
             });
 
-        egui::Window::new("Node Editor").show(ctx, |ui| {
-            // left panel for editing tools on selected node
-            egui::ScrollArea::auto_sized().show(ui, |ui| {
-                self.node_editor.ui_content(&mut self.state, ui);
+            egui::CollapsingHeader::new("Node Editor").show(ui, |ui| {
+                // left panel for editing tools on selected node
+                egui::ScrollArea::auto_sized().show(ui, |ui| {
+                    self.node_editor.ui_content(&mut self.state, ui);
+                });
+            });
+
+            egui::CollapsingHeader::new("Edge Editor").show(ui, |ui| {
+                egui::ScrollArea::auto_sized().show(ui, |ui| {
+                    self.edge_editor.ui_content(&mut self.state, ui);
+                });
             });
         });
 
-        egui::Window::new("Edge Editor").show(ctx, |ui| {
-            egui::ScrollArea::auto_sized().show(ui, |ui| {
-                self.edge_editor.ui_content(&mut self.state, ui);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading(self.state.active.name.clone());
+            self.painting.ui_control(ui);
+            egui::Frame::dark_canvas(ui.style()).show(ui, |ui| {
+                self.painting
+                    .ui_content(&mut self.state.active, &mut self.state.history, ui);
             });
         });
     }
@@ -373,7 +372,11 @@ impl NameEditor {
                 )
                 .execute(state);
                 match res {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // clear buffers if everything worked ok
+                        self.key_buf.clear();
+                        self.text_buf.clear();
+                    }
                     Err(e) => println!("{}", e),
                 }
             }
@@ -418,7 +421,11 @@ impl ValueEditor {
                 )
                 .execute(state);
                 match res {
-                    Ok(_) => self.value = 0,
+                    Ok(_) => {
+                        // clear buffers if everything worked ok
+                        self.key_buf.clear();
+                        self.value = 0;
+                    }
                     Err(e) => println!("{}", e),
                 }
             }
@@ -467,7 +474,7 @@ impl NodeEditor {
                 egui::TextEdit::multiline(&mut self.text_buf)
                     .text_style(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY)
-                    .desired_rows(20),
+                    .desired_rows(10),
             );
             ui.separator();
 
@@ -521,7 +528,7 @@ impl EdgeEditor {
                 egui::TextEdit::multiline(&mut self.text_buf)
                     .text_style(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY)
-                    .desired_rows(20),
+                    .desired_rows(10),
             );
             ui.separator();
 
@@ -558,6 +565,9 @@ pub struct TreePainting {
     pub pan_start: egui::Pos2,
     /// the origin, moved around by pans but only updated after pan completed
     pub origin: egui::Pos2,
+    /// temporary storage of the position of a node being dragged. Used to add a click-and-drag
+    /// event to the undo/redo history
+    node_drag_pos: arbor_core::Position,
 }
 
 impl Default for TreePainting {
@@ -572,6 +582,7 @@ impl Default for TreePainting {
             pan: egui::pos2(0.0, 0.0),
             pan_start: egui::pos2(0.0, 0.0),
             origin: egui::pos2(0.0, 0.0),
+            node_drag_pos: arbor_core::Position::default(),
         }
     }
 }
@@ -613,6 +624,7 @@ impl TreePainting {
     pub fn ui_content(
         &mut self,
         data: &mut arbor_core::DialogueTreeData,
+        history: &mut arbor_core::DialogueTreeHistory,
         ui: &mut egui::Ui,
     ) -> egui::Response {
         // get an area to paint to
@@ -673,7 +685,7 @@ impl TreePainting {
         }
 
         // loop over the nodes, draw them, and update their location if being dragged
-        for n in data.tree.nodes_mut() {
+        for (i, n) in data.tree.nodes_mut().iter_mut().enumerate() {
             let pos = n.pos;
 
             let p = egui::pos2(pos.x, pos.y);
@@ -702,11 +714,31 @@ impl TreePainting {
                 });
             }
 
-            // move node
+            // move node with mouse drag
             if let Some(pointer_pos) = resp.interact_pointer_pos() {
                 let new_pos = self.reform(from_screen * pointer_pos);
+                // bypass normal cmd interface here to avoid spamming event history during a drag
                 n.pos = arbor_core::Position::new(new_pos.x, new_pos.y);
             }
+            // save initial position of a node when starting the drag, used below when qualifying
+            // the node movement in the undo/redo history
+            if resp.drag_started() {
+                self.node_drag_pos = n.pos;
+            }
+            // qualify node movement in event history after drag release
+            if resp.drag_released() {
+                let mut old_pos_node = n.clone();
+                old_pos_node.pos = self.node_drag_pos;
+                history.push(
+                    arbor_core::tree::event::NodeEdit {
+                        index: i,
+                        from: old_pos_node,
+                        to: *n,
+                    }
+                    .into(),
+                );
+            }
+
             painter.add(egui::Shape::circle_filled(
                 coord,
                 self.node_size * self.zoom,

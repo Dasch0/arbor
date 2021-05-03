@@ -1243,7 +1243,7 @@ impl Default for DialogueTreeHistory {
 
 impl DialogueTreeHistory {
     /// Push a new event onto the history. This will remove record of all 'undone' changes.
-    fn push(&mut self, event: DialogueTreeEvent) {
+    pub fn push(&mut self, event: DialogueTreeEvent) {
         // drain any undone events before pushing
         self.record.drain(self.position..);
         self.record.push(event);
@@ -1251,7 +1251,7 @@ impl DialogueTreeHistory {
     }
 
     /// clear the history, this permanently deletes all events
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.record.clear();
         self.position = 0;
     }
@@ -1261,7 +1261,7 @@ impl DialogueTreeHistory {
     /// # Errors
     /// Fails and returns an error if the current position is 0, indicating there are no events to
     /// undo
-    fn undo(&mut self, tree: &mut DialogueTreeData) -> Result<()> {
+    pub fn undo(&mut self, tree: &mut DialogueTreeData) -> Result<()> {
         // Cannot undo if position is 0, return an error
         anyhow::ensure!(self.position > 0);
 
@@ -1273,7 +1273,7 @@ impl DialogueTreeHistory {
     ///
     /// # Errors
     /// Fails and returns an error if there are no undone events to redo
-    fn redo(&mut self, tree: &mut DialogueTreeData) -> Result<()> {
+    pub fn redo(&mut self, tree: &mut DialogueTreeData) -> Result<()> {
         // Cannot undo if position is 0, return an error
         anyhow::ensure!(self.position < self.record.len());
 
