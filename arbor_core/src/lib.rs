@@ -1779,7 +1779,7 @@ pub mod cmd {
                 let new_project = DialogueTreeData::new(self.name.as_str());
 
                 let encoded = bincode::serialize(&new_project)?;
-                std::fs::write(self.name.clone() + TREE_EXT, encoded);
+                let _res = std::fs::write(self.name.clone() + TREE_EXT, encoded);
 
                 if self.set_active {
                     *state = EditorState::new(new_project);

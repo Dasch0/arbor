@@ -700,7 +700,7 @@ impl TreePainting {
                 egui::Sense::click_and_drag(),
             );
             // select edge if the text pop-up is clicked
-            if let Some(_) = resp.interact_pointer_pos() {
+            if resp.interact_pointer_pos().is_some() {
                 active_selection = Selection::Edge(edge_index);
             }
 
@@ -780,7 +780,7 @@ impl TreePainting {
 
             // qualify node movement in event history after drag release
             if resp.drag_released() {
-                let mut old_pos_node = n.clone();
+                let mut old_pos_node = *n;
                 old_pos_node.pos = self.node_drag_pos;
                 history.push(
                     arbor_core::tree::event::NodeEdit {

@@ -1,7 +1,7 @@
 use arbor_core::{cmd, EditorState, Executable, KeyString, NameString, Position, Result};
 use rand::Rng;
 
-static TEXT: &'static str = "
+static TEXT: &str = "
 Lorem ipsum dolor sit amet, consectetur adipiscing elit. Donec rutrum nunc at nulla iaculis tempor.
 Donec ut magna at orci mattis accumsan. Nulla mattis pulvinar congue. Mauris ac lectus velit. 
 Aliquam erat volutpat. Cras suscipit risus eget magna semper, id condimentum orci dignissim. 
