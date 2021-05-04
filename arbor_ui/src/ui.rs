@@ -1,7 +1,11 @@
-use arbor_core::*;
+use super::util::lorem_ipsum;
+use arbor_core::{cmd, tree, DialogueTreeData, EditorState, Executable, KeyString, NameString};
+use eframe::egui;
+use eframe::epi;
 use egui::emath::{Pos2, Rect, RectTransform};
 use egui::util::History;
 use serde::{Deserialize, Serialize};
+
 // constants for maximum width to show for text throughout UI
 const MAX_NAME_WIDTH: f32 = 128.0;
 const MAX_TEXT_WIDTH: f32 = 512.0;
@@ -10,6 +14,13 @@ const MAX_TEXT_WIDTH: f32 = 512.0;
 // so far, longer texts are allowed but will require some extra allocations
 const MAX_NAME_LEN: usize = 32;
 const MAX_TEXT_LEN: usize = 256;
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub enum Selection {
+    None,
+    Node(tree::NodeIndex),
+    Edge(tree::EdgeIndex),
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct ArborUi {
@@ -23,6 +34,7 @@ pub struct ArborUi {
     node_editor: NodeEditor,
     edge_editor: EdgeEditor,
     state: arbor_core::EditorState,
+    active_selection: Selection,
 }
 
 impl Default for ArborUi {
@@ -38,6 +50,7 @@ impl Default for ArborUi {
             node_editor: Default::default(),
             edge_editor: Default::default(),
             state: EditorState::new(DialogueTreeData::default()),
+            active_selection: Selection::None,
         }
     }
 }
@@ -135,6 +148,17 @@ impl epi::App for ArborUi {
                         }
                     }
                 });
+
+                egui::menu::menu(ui, "Test", |ui| {
+                    ui.separator();
+                    if ui.button("lorem ipsum").clicked() {
+                        let res = lorem_ipsum(&mut self.state, 100);
+                        match res {
+                            Ok(_) => {}
+                            Err(e) => println!("{}", e),
+                        }
+                    }
+                });
             });
         });
 
@@ -171,8 +195,12 @@ impl epi::App for ArborUi {
             ui.heading(self.state.active.name.clone());
             self.painting.ui_control(ui);
             egui::Frame::dark_canvas(ui.style()).show(ui, |ui| {
-                self.painting
-                    .ui_content(&mut self.state.active, &mut self.state.history, ui);
+                self.active_selection = self.painting.ui_content(
+                    &mut self.state.active,
+                    &mut self.state.history,
+                    self.active_selection,
+                    ui,
+                );
             });
         });
     }
@@ -555,6 +583,7 @@ impl EdgeEditor {
 pub struct TreePainting {
     pub stroke: egui::Color32,
     pub fill: egui::Color32,
+    pub select_color: egui::Color32,
     pub hover_name_buf: String,
     pub hover_text_buf: String,
     pub node_size: f32,
@@ -575,6 +604,7 @@ impl Default for TreePainting {
         Self {
             stroke: egui::Color32::LIGHT_BLUE,
             fill: egui::Color32::LIGHT_GRAY,
+            select_color: egui::Color32::RED,
             hover_name_buf: String::with_capacity(MAX_NAME_LEN),
             hover_text_buf: String::with_capacity(MAX_TEXT_LEN),
             node_size: 20.0,
@@ -621,12 +651,15 @@ impl TreePainting {
         .response
     }
 
+    /// Draw the painting of the dialogue tree, return an optional value describing any in-progress
+    /// or completed events
     pub fn ui_content(
         &mut self,
         data: &mut arbor_core::DialogueTreeData,
         history: &mut arbor_core::DialogueTreeHistory,
+        mut active_selection: Selection,
         ui: &mut egui::Ui,
-    ) -> egui::Response {
+    ) -> Selection {
         // get an area to paint to
         let (response, painter) =
             ui.allocate_painter(ui.available_size_before_wrap_finite(), egui::Sense::hover());
@@ -659,19 +692,45 @@ impl TreePainting {
                 (source_coord.y + target_coord.y) / 2.0,
             );
 
-            // bias currently shifts the action text a bit up & left so it overlaps with
-            // the line.
-            // NOTE: This is has been tuned manually
-            let bias = egui::vec2(20.0, 10.0);
+            // create clickable hitbox at midpoint
+            let rect = Rect::from_center_size(midpoint, egui::vec2(self.node_size, self.node_size));
+            let resp = ui.interact(
+                rect,
+                egui::Id::new(edge_index).with("__edge_id"),
+                egui::Sense::click_and_drag(),
+            );
+            // select edge if the text pop-up is clicked
+            if let Some(_) = resp.interact_pointer_pos() {
+                active_selection = Selection::Edge(edge_index);
+            }
 
             // paint popup with edge text if conditions are met
-            if response.rect.contains(midpoint - bias) && self.zoom > 0.3 {
-                Self::edge_text_popup(&response.ctx, edge_index, midpoint - bias, |ui| {
+            if response.rect.contains(midpoint) && self.zoom > 0.3 {
+                Self::edge_text_popup(&response.ctx, edge_index, midpoint, |ui| {
                     ui.vertical(|ui| {
                         ui.label(self.hover_text_buf.as_str());
                     });
                 });
             }
+
+            // change edge color if this edge is the actively selected thing
+            let edge_color = match active_selection {
+                Selection::Edge(e) => {
+                    if e == edge_index {
+                        self.select_color
+                    } else {
+                        self.stroke
+                    }
+                }
+                _ => self.stroke,
+            };
+
+            // draw circle around edge hitbox
+            painter.add(egui::Shape::circle_filled(
+                midpoint,
+                self.node_size * 0.5 * self.zoom, // FIXME: edge vs node scaling is hardcoded
+                edge_color,
+            ));
 
             // Finally, paint arrow along edge, stop at edge of target node to show arrow tip
             Self::arrow(
@@ -680,7 +739,7 @@ impl TreePainting {
                 target_coord,
                 self.node_size,
                 self.zoom,
-                (self.zoom, self.stroke).into(),
+                (self.zoom, edge_color).into(),
             );
         }
 
@@ -690,10 +749,11 @@ impl TreePainting {
 
             let p = egui::pos2(pos.x, pos.y);
             let coord = to_screen * self.transform(p);
-            let rect = Rect::from_center_size(coord, egui::vec2(self.node_size, self.node_size));
+            let rect =
+                Rect::from_center_size(coord, egui::vec2(self.node_size * 2., self.node_size * 2.));
             let resp = ui.interact(
                 rect,
-                egui::Id::new(n.section.hash),
+                egui::Id::new(i).with("__node_index"),
                 egui::Sense::click_and_drag(),
             );
             let node_slice = &data.text[n.section[0]..n.section[1]];
@@ -704,27 +764,20 @@ impl TreePainting {
                 &mut self.hover_text_buf,
             );
 
-            if response.rect.contains(coord) && self.zoom > 0.3 {
-                Self::node_text_popup(&resp.ctx, n.section.hash, coord, |ui| {
-                    ui.vertical(|ui| {
-                        ui.label(self.hover_name_buf.as_str());
-                        ui.label("------");
-                        ui.label(self.hover_text_buf.as_str());
-                    });
-                });
-            }
-
             // move node with mouse drag
             if let Some(pointer_pos) = resp.interact_pointer_pos() {
                 let new_pos = self.reform(from_screen * pointer_pos);
                 // bypass normal cmd interface here to avoid spamming event history during a drag
                 n.pos = arbor_core::Position::new(new_pos.x, new_pos.y);
+                active_selection = Selection::Node(i);
             }
+
             // save initial position of a node when starting the drag, used below when qualifying
             // the node movement in the undo/redo history
             if resp.drag_started() {
                 self.node_drag_pos = n.pos;
             }
+
             // qualify node movement in event history after drag release
             if resp.drag_released() {
                 let mut old_pos_node = n.clone();
@@ -739,11 +792,37 @@ impl TreePainting {
                 );
             }
 
-            painter.add(egui::Shape::circle_filled(
-                coord,
-                self.node_size * self.zoom,
-                self.fill,
-            ));
+            // get custom fill color for active selection
+            let fill_color = match active_selection {
+                Selection::Node(n) => {
+                    if n == i {
+                        self.select_color
+                    } else {
+                        self.fill
+                    }
+                }
+                _ => self.fill,
+            };
+
+            // only draw text if the user is zoomed in enough for it to make sense
+            if response.rect.contains(coord) && self.zoom > 0.3 {
+                Self::node_text_popup(&resp.ctx, n.section.hash, coord, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(self.hover_name_buf.as_str());
+                        ui.label("------");
+                        ui.label(self.hover_text_buf.as_str());
+                    });
+                });
+            }
+
+            // draw nodes
+            if response.rect.contains(coord) {
+                painter.add(egui::Shape::circle_filled(
+                    coord,
+                    self.node_size * self.zoom,
+                    fill_color,
+                ));
+            }
         }
 
         // handle dragging to pan screen after drawing nodes so that clicking/dragging nodes
@@ -758,7 +837,13 @@ impl TreePainting {
             self.pan = self.origin + pan_vec;
         }
 
-        response
+        // clear selection if a click occured that didn't hit a node/edge up above
+        if pan_response.clicked() {
+            active_selection = Selection::None;
+        }
+
+        // return active selection to rest of the UI
+        active_selection
     }
 
     fn edge_text_popup(
