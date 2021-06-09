@@ -12,3 +12,6 @@ wgpu = "0.8"
 bytemuck = { version = "1.5", features = ["derive"]}
 log = "0.4"
 futures = "0.3"
+wgpu_glyph = "0.12"
+anyhow = "1.0"
+image = "0.23"
