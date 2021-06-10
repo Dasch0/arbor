@@ -47,27 +47,12 @@ fn draw_test_text(
     // Queue text on top, it will be drawn first.
     // Depth buffer will make it appear on top.
     glyph_brush.queue(Section {
-        screen_position: (30.0, 30.0),
+        screen_position: (400.0, 400.0),
         text: vec![Text::default()
-            .with_text("Hello Sailor!")
+            .with_text("Enter freely & of your own will!")
             .with_scale(95.0)
             .with_color([0.8, 0.8, 0.8, 1.0])
             .with_z(0.9)],
-        ..Section::default()
-    });
-
-    // Queue background text next.
-    glyph_brush.queue(Section {
-        bounds: (size.0 as f32, size.1 as f32),
-        text: vec![Text::default()
-            .with_text(
-                &include_str!("../data/text/hello.txt")
-                    .replace("\n\n", "")
-                    .repeat(10),
-            )
-            .with_scale(30.0)
-            .with_color([0.05, 0.05, 0.1, 1.0])
-            .with_z(0.2)],
         ..Section::default()
     });
 
@@ -124,7 +109,7 @@ fn main() {
     let test_texture = gfx::Texture::from_bytes(
         &gpu,
         &sprite_brush,
-        include_bytes!("../data/images/test.png"),
+        include_bytes!("../data/images/vamp.png"),
     )
     .expect("failed to load texture");
 
@@ -144,7 +129,8 @@ fn main() {
             };
 
             let (frame_start, mut encoder) = gfx::begin_frame(&gpu);
-            let mut renderpass = gfx::begin_renderpass(&mut encoder, &frame.output.view);
+            let mut renderpass =
+                gfx::begin_renderpass(&mut encoder, &frame.output.view, &frame_depth_view);
 
             gfx::draw_sprite(&mut renderpass, &sprite_brush, &test_texture, &test_quad);
             gfx::end_renderpass(renderpass);

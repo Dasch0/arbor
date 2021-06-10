@@ -1,9 +1,8 @@
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use futures::task::SpawnExt;
-use image::GenericImageView;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{file, io, mem, path};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -47,12 +46,7 @@ impl Gpu {
 
         let optional_features = wgpu::Features::empty();
 
-        // TODO: support for setups without unsized_binding_array
-        let required_features = wgpu::Features::default()
-            | wgpu::Features::PUSH_CONSTANTS
-            | wgpu::Features::UNSIZED_BINDING_ARRAY
-            | wgpu::Features::SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
-            | wgpu::Features::SAMPLED_TEXTURE_BINDING_ARRAY;
+        let required_features = wgpu::Features::default();
 
         let adapter_features = adapter.features();
 
@@ -98,13 +92,6 @@ impl Gpu {
     pub fn new(window: &Window) -> (Gpu, wgpu::Surface) {
         futures::executor::block_on(Gpu::init(window))
     }
-
-    /// Wraps the async init function with a blocking call
-    /// Wraps the GPU handle in ARC
-    pub fn new_with_arc(window: &Window) -> (Arc<Gpu>, wgpu::Surface) {
-        let (gpu, surface) = futures::executor::block_on(Gpu::init(window));
-        (Arc::new(gpu), surface)
-    }
 }
 
 #[repr(C)]
@@ -114,10 +101,30 @@ pub struct Vertex {
     _tex_coord: [f32; 2],
 }
 impl Vertex {
-    pub fn new(pos: [i8; 3], tc: [i8; 2]) -> Vertex {
+    pub fn new(pos: [f32; 3], tc: [f32; 2]) -> Vertex {
         Vertex {
             _pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32, 1.0],
             _tex_coord: [tc[0] as f32, tc[1] as f32],
+        }
+    }
+
+    /// Get a description of the vertex layout
+    pub fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::InputStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+            ],
         }
     }
 }
@@ -208,56 +215,54 @@ impl Brush {
             });
 
         // Create the render pipeline.
-        let pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("imgui-wgpu pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &vertex_shader_module,
-                entry_point: "main",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::InputStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4],
-                }],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Cw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                clamp_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &fragment_shader_module,
-                entry_point: "main",
-                targets: &[wgpu::ColorTargetState {
-                    format: texture_format,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
-                            dst_factor: wgpu::BlendFactor::One,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrite::ALL,
-                }],
-            }),
-        });
+        let pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("imgui-wgpu pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &vertex_shader_module,
+                    entry_point: "main",
+                    buffers: &[Vertex::desc()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Cw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    clamp_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_shader_module,
+                    entry_point: "main",
+                    targets: &[wgpu::ColorTargetState {
+                        format: texture_format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrite::ALL,
+                    }],
+                }),
+            });
 
         Self {
             pipeline,
@@ -287,24 +292,21 @@ pub struct Texture {
 
 impl Texture {
     pub fn from_bytes(gpu: &Gpu, brush: &Brush, bytes: &[u8]) -> Result<Self> {
-        let img = image::load_from_memory(bytes)?;
-        Self::from_image(gpu, brush, &img)
-    }
-
-    pub fn from_image(gpu: &Gpu, brush: &Brush, img: &image::DynamicImage) -> Result<Self> {
-        let rgba = img.as_rgba8().unwrap();
-        let dimensions = img.dimensions();
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let (info, mut reader) = decoder.read_info().unwrap();
+        let mut buf = vec![0; info.buffer_size()];
+        reader.next_frame(&mut buf).unwrap();
 
         let size = wgpu::Extent3d {
-            width: dimensions.0,
-            height: dimensions.1,
+            width: info.width,
+            height: info.height,
             depth_or_array_layers: 1,
         };
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size,
             mip_level_count: 1,
-            sample_count: 8,
+            sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_DST,
@@ -316,11 +318,11 @@ impl Texture {
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
             },
-            rgba,
+            &buf,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: std::num::NonZeroU32::new(4 * dimensions.0),
-                rows_per_image: std::num::NonZeroU32::new(dimensions.1),
+                bytes_per_row: std::num::NonZeroU32::new(4 * info.width),
+                rows_per_image: std::num::NonZeroU32::new(info.height),
             },
             size,
         );
@@ -341,11 +343,11 @@ impl Texture {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view), // CHANGED!
+                    resource: wgpu::BindingResource::TextureView(&view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler), // CHANGED!
+                    resource: wgpu::BindingResource::Sampler(&sampler),
                 },
             ],
             label: None,
@@ -371,10 +373,10 @@ impl Quad {
     pub fn from_test_vertices(gpu: &Gpu) -> Self {
         let num_verts = 4;
         let verts = [
-            Vertex::new([-1, 1, 0], [-1, 1]),
-            Vertex::new([1, 1, 0], [1, 1]),
-            Vertex::new([-1, -1, 0], [-1, -1]),
-            Vertex::new([1, -1, 0], [1, -1]),
+            Vertex::new([-0.5, -0.5, 0.0], [0.0, 1.0]),
+            Vertex::new([0.5, -0.5, 0.0], [1.0, 1.0]),
+            Vertex::new([-0.5, 0.5, 0.0], [0.0, 0.0]),
+            Vertex::new([0.5, 0.5, 0.0], [1.0, 0.0]),
         ];
 
         let vertex_buffer = gpu
@@ -452,6 +454,7 @@ pub fn begin_frame(gpu: &Gpu) -> (Instant, wgpu::CommandEncoder) {
 pub fn begin_renderpass<'render>(
     encoder: &'render mut wgpu::CommandEncoder,
     render_target: &'render wgpu::TextureView,
+    depth_view: &'render wgpu::TextureView,
 ) -> wgpu::RenderPass<'render> {
     // Clear frame
     let renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -469,7 +472,14 @@ pub fn begin_renderpass<'render>(
                 store: true,
             },
         }],
-        depth_stencil_attachment: None,
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth_view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(1.0),
+                store: true,
+            }),
+            stencil_ops: None,
+        }),
     });
 
     renderpass
