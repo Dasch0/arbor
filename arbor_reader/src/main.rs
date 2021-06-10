@@ -1,4 +1,5 @@
 mod gfx;
+mod static_init;
 
 use anyhow::Result;
 use std::io::Write;

@@ -147,6 +147,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "futures",
+ "lazy_static",
  "log",
  "png",
  "wgpu",

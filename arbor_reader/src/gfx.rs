@@ -2,12 +2,20 @@ use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use futures::task::SpawnExt;
 use std::time::{Duration, Instant};
-use std::{file, io, mem, path};
+use std::{file, io, mem, path, sync};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Handles for static GPU constructs.
+///
+/// The core instance, adapter, device, and queue of the GPU is practically guaranteed to exist
+/// while the program is running. Storing these 'static reduces overhead of having to reference
+/// count gpu resources that aren't going anywhere when multithreading, and keeps the application
+/// from needing to hold onto persistent gpu data
+//static INSTANCE: wgpu::Instance = sync::Once::new();
 
 /// Handle to core WGPU stuctures representing physical access to the gpu, such as the device and
 /// queue. Within the limitations of this renderer, all constructs stored in the Gpu are
