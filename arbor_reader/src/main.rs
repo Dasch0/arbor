@@ -1,24 +1,16 @@
-mod event;
 mod gfx;
 mod ui;
+mod window;
 
 use anyhow::Result;
 use std::io::Write;
 use wgpu;
 use wgpu_glyph::GlyphBrush;
 use wgpu_glyph::{ab_glyph, GlyphBrushBuilder, Section, Text};
-use winit::{
-    event::{Event, WindowEvent},
-    event_loop,
-};
+use winit::event_loop::{self, ControlFlow};
 
 const INITIAL_WIDTH: u32 = 1920;
 const INITIAL_HEIGHT: u32 = 1080;
-
-/// A custom event type to force a redraw
-pub enum ArborEvent {
-    RequestRedraw,
-}
 
 pub fn init_test_text(
     device: &wgpu::Device,
@@ -88,21 +80,8 @@ fn main() {
     let mut stdout = std::io::stdout();
 
     // Window
-    let event_loop = winit::event_loop::EventLoop::with_user_event();
-    let window = winit::window::WindowBuilder::new()
-        .with_decorations(true)
-        .with_resizable(true)
-        .with_transparent(false)
-        .with_title("arbor")
-        .with_inner_size(winit::dpi::PhysicalSize {
-            width: INITIAL_WIDTH,
-            height: INITIAL_HEIGHT,
-        })
-        .build(&event_loop)
-        .unwrap();
-
-    // track the window size
-    let mut size = window.inner_size();
+    let (event_loop, window, mut window_state) =
+        window::init("arbor_reader", INITIAL_WIDTH, INITIAL_HEIGHT);
 
     // Renderer
     let mut gfx_context = gfx::init(&window);
@@ -121,47 +100,48 @@ fn main() {
     // text
     let mut glyph_brush = init_test_text(&gfx_context.device).unwrap();
 
-    event_loop.run(move |event, _, control_flow| match event {
-        Event::RedrawRequested(..) => {
-            let (mut encoder, frame) = gfx::begin_frame(&gfx_context).unwrap();
-            let mut renderpass = gfx::begin_renderpass(&mut encoder, &frame);
-
-            gfx::draw_sprite(&mut renderpass, &sprite_brush, &test_texture, &test_quad);
-            gfx::end_renderpass(renderpass);
-
-            draw_test_text(
-                &mut gfx_context,
-                &mut encoder,
-                &frame,
-                &mut glyph_brush,
-                size,
-            );
-
-            let frame_duration = gfx::end_frame(&mut gfx_context, encoder, frame);
-
-            print!("\rframe_time: {:?}", frame_duration);
-            stdout.flush().unwrap();
+    event_loop.run(move |event, _, control_flow| {
+        // set control flow to only update when explicitly called
+        *control_flow = event_loop::ControlFlow::Wait;
+        // This statement repeatedly calls update() until there are no more events
+        if window_state.update(event) {
+            return;
         }
 
-        Event::MainEventsCleared | Event::UserEvent(ArborEvent::RequestRedraw) => {
-            window.request_redraw();
+        if window_state.quit {
+            *control_flow = event_loop::ControlFlow::Exit;
         }
 
-        Event::WindowEvent { event, .. } => match event {
-            WindowEvent::Resized(new_size) => {
-                size = new_size;
-                gfx_context.resize(size.width, size.height);
-            }
-            WindowEvent::CloseRequested => *control_flow = event_loop::ControlFlow::Exit,
-            WindowEvent::MouseInput { state, button, .. } => {}
-            WindowEvent::CursorMoved {
-                device_id,
-                position,
-                ..
-            } => {}
-            WindowEvent::Touch(touch) => {}
-            _ => {}
-        },
-        _ => {}
+        if window_state.resize {
+            gfx_context.resize(window_state.size)
+        }
+
+        if window_state.rescale {
+            std::unimplemented!();
+        }
+
+        if window_state.input.cursor_pressed() {
+            println!("click!");
+        }
+
+        // after this point, window_state is now ready to be inspected
+        let (mut encoder, frame) = gfx::begin_frame(&gfx_context).unwrap();
+        let mut renderpass = gfx::begin_renderpass(&mut encoder, &frame);
+
+        gfx::draw_sprite(&mut renderpass, &sprite_brush, &test_texture, &test_quad);
+        gfx::end_renderpass(renderpass);
+
+        draw_test_text(
+            &mut gfx_context,
+            &mut encoder,
+            &frame,
+            &mut glyph_brush,
+            window_state.size,
+        );
+
+        let frame_duration = gfx::end_frame(&mut gfx_context, encoder, frame);
+
+        print!("\rframe_time: {:?}", frame_duration);
+        stdout.flush().unwrap();
     });
 }

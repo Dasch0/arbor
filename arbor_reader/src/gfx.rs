@@ -1,3 +1,4 @@
+use crate::window;
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use futures::task::SpawnExt;
@@ -8,6 +9,7 @@ use winit::window::Window;
 
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+pub const PRESENT_MODE: wgpu::PresentMode = wgpu::PresentMode::Mailbox;
 
 /// Handle to core WGPU stuctures representing physical access to the gpu, such as the device,
 /// queue, and swapchain.
@@ -27,13 +29,13 @@ pub struct Context {
 
 impl Context {
     /// Resize the GPU to target a new swapchain size
-    pub fn resize(&mut self, width: u32, height: u32) {
+    pub fn resize(&mut self, size: window::PhysicalSize<u32>) {
         let frame_descriptor = wgpu::SwapChainDescriptor {
             usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
             format: OUTPUT_FORMAT,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::Mailbox,
+            width: size.width,
+            height: size.height,
+            present_mode: PRESENT_MODE,
         };
         self.swap_chain = self
             .device
@@ -43,8 +45,8 @@ impl Context {
         self.depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth buffer"),
             size: wgpu::Extent3d {
-                width,
-                height,
+                width: size.width,
+                height: size.height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -398,7 +400,7 @@ async fn initialize_gfx(window: &Window) -> Context {
         format: OUTPUT_FORMAT,
         width: size.width,
         height: size.height,
-        present_mode: wgpu::PresentMode::Mailbox,
+        present_mode: PRESENT_MODE,
     };
     let swap_chain = device.create_swap_chain(&surface, &frame_descriptor);
 
@@ -449,8 +451,10 @@ async fn initialize_gfx(window: &Window) -> Context {
 /// framedrops will likely occur at some point
 pub fn begin_frame(context: &Context) -> anyhow::Result<(wgpu::CommandEncoder, Frame)> {
     // Begin to draw the frame.
-    let frame_start = Instant::now();
     let data = context.swap_chain.get_current_frame()?;
+
+    // start counting time the moment we have the frame
+    let frame_start = Instant::now();
 
     let depth_view = context
         .depth_texture
