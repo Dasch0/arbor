@@ -1,23 +1,26 @@
+mod event;
 mod gfx;
-mod static_init;
+mod ui;
 
 use anyhow::Result;
 use std::io::Write;
 use wgpu;
 use wgpu_glyph::GlyphBrush;
 use wgpu_glyph::{ab_glyph, GlyphBrushBuilder, Section, Text};
-use winit::event::Event::*;
-use winit::event_loop::ControlFlow;
+use winit::{
+    event::{Event, WindowEvent},
+    event_loop,
+};
 
 const INITIAL_WIDTH: u32 = 1920;
 const INITIAL_HEIGHT: u32 = 1080;
 
 /// A custom event type to force a redraw
-enum Event {
+pub enum ArborEvent {
     RequestRedraw,
 }
 
-fn init_test_text(
+pub fn init_test_text(
     device: &wgpu::Device,
 ) -> Result<wgpu_glyph::GlyphBrush<wgpu::DepthStencilState>> {
     // Prepare glyph_brush
@@ -38,12 +41,11 @@ fn init_test_text(
 }
 
 fn draw_test_text(
-    gpu: &mut gfx::Gpu,
+    context: &mut gfx::Context,
     encoder: &mut wgpu::CommandEncoder,
+    frame: &gfx::Frame,
     glyph_brush: &mut GlyphBrush<wgpu::DepthStencilState>,
-    size: (u32, u32),
-    frame: &wgpu::SwapChainFrame,
-    depth_view: &wgpu::TextureView,
+    size: winit::dpi::PhysicalSize<u32>,
 ) {
     // Queue text on top, it will be drawn first.
     // Depth buffer will make it appear on top.
@@ -60,12 +62,12 @@ fn draw_test_text(
     // Draw all the text!
     glyph_brush
         .draw_queued(
-            &gpu.device,
-            &mut gpu.staging_belt,
+            &context.device,
+            &mut context.staging_belt,
             encoder,
-            &frame.output.view,
+            frame.view(),
             wgpu::RenderPassDepthStencilAttachment {
-                view: &depth_view,
+                view: &frame.depth_view,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(-1.0),
                     store: true,
@@ -75,8 +77,8 @@ fn draw_test_text(
                     store: true,
                 }),
             },
-            size.0,
-            size.1,
+            size.width,
+            size.height,
         )
         .expect("Draw queued");
 }
@@ -98,77 +100,68 @@ fn main() {
         })
         .build(&event_loop)
         .unwrap();
-    let size = window.inner_size();
 
-    // gpu
-    let (mut gpu, surface) = gfx::Gpu::new(&window);
-    let (mut frame_descriptor, mut swapchain, mut frame_depth_view) =
-        gfx::create_swapchain(&gpu.device, &surface, size);
+    // track the window size
+    let mut size = window.inner_size();
+
+    // Renderer
+    let mut gfx_context = gfx::init(&window);
 
     // sprites
-    let sprite_brush = gfx::Brush::new_sprite_brush(&gpu);
+    let sprite_brush = gfx::Brush::new_sprite_brush(&gfx_context);
     let test_texture = gfx::Texture::from_bytes(
-        &gpu,
+        &gfx_context,
         &sprite_brush,
-        include_bytes!("../data/images/vamp.png"),
+        include_bytes!("../data/images/test.png"),
     )
     .expect("failed to load texture");
 
-    let test_quad = gfx::Quad::from_test_vertices(&gpu);
+    let test_quad = gfx::Quad::from_test_vertices(&gfx_context);
 
     // text
-    let mut glyph_brush = init_test_text(&gpu.device).unwrap();
+    let mut glyph_brush = init_test_text(&gfx_context.device).unwrap();
 
     event_loop.run(move |event, _, control_flow| match event {
-        RedrawRequested(..) => {
-            let frame = match swapchain.get_current_frame() {
-                Ok(frame) => frame,
-                Err(e) => {
-                    eprintln!("Dropped frame with error: {}", e);
-                    return;
-                }
-            };
-
-            let (frame_start, mut encoder) = gfx::begin_frame(&gpu);
-            let mut renderpass =
-                gfx::begin_renderpass(&mut encoder, &frame.output.view, &frame_depth_view);
+        Event::RedrawRequested(..) => {
+            let (mut encoder, frame) = gfx::begin_frame(&gfx_context).unwrap();
+            let mut renderpass = gfx::begin_renderpass(&mut encoder, &frame);
 
             gfx::draw_sprite(&mut renderpass, &sprite_brush, &test_texture, &test_quad);
             gfx::end_renderpass(renderpass);
 
             draw_test_text(
-                &mut gpu,
+                &mut gfx_context,
                 &mut encoder,
-                &mut glyph_brush,
-                (frame_descriptor.width, frame_descriptor.height),
                 &frame,
-                &frame_depth_view,
+                &mut glyph_brush,
+                size,
             );
 
-            let frame_duration = gfx::end_frame(&mut gpu, encoder, frame_start);
+            let frame_duration = gfx::end_frame(&mut gfx_context, encoder, frame);
 
             print!("\rframe_time: {:?}", frame_duration);
             stdout.flush().unwrap();
         }
 
-        MainEventsCleared | UserEvent(Event::RequestRedraw) => {
+        Event::MainEventsCleared | Event::UserEvent(ArborEvent::RequestRedraw) => {
             window.request_redraw();
         }
 
-        WindowEvent { event, .. } => match event {
-            winit::event::WindowEvent::Resized(size) => {
-                let (new_frame_descriptor, new_swapchain, new_frame_depth_view) =
-                    gfx::create_swapchain(&gpu.device, &surface, size);
-
-                frame_descriptor = new_frame_descriptor;
-                swapchain = new_swapchain;
-                frame_depth_view = new_frame_depth_view;
+        Event::WindowEvent { event, .. } => match event {
+            WindowEvent::Resized(new_size) => {
+                size = new_size;
+                gfx_context.resize(size.width, size.height);
             }
-            winit::event::WindowEvent::CloseRequested => {
-                *control_flow = ControlFlow::Exit;
-            }
+            WindowEvent::CloseRequested => *control_flow = event_loop::ControlFlow::Exit,
+            WindowEvent::MouseInput { state, button, .. } => {}
+            WindowEvent::CursorMoved {
+                device_id,
+                position,
+                ..
+            } => {}
+            WindowEvent::Touch(touch) => {}
             _ => {}
         },
-        _ => (),
+        _ => {}
     });
 }
