@@ -554,15 +554,11 @@ pub fn draw_sprite<'render>(
     renderpass.draw(0..quad.num_verts, 0..1);
 }
 
-pub fn end_renderpass<'render>(renderpass: wgpu::RenderPass<'render>) {
+pub fn end_renderpass(renderpass: wgpu::RenderPass) {
     drop(renderpass);
 }
 
-pub fn end_frame<'render>(
-    context: &mut Context,
-    encoder: wgpu::CommandEncoder,
-    frame: Frame,
-) -> Duration {
+pub fn end_frame(context: &mut Context, encoder: wgpu::CommandEncoder, frame: Frame) -> Duration {
     // Submit the commands.
     context.staging_belt.finish();
     context.queue.submit(std::iter::once(encoder.finish()));

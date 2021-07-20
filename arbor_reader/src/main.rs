@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 mod gfx;
 mod text;
 mod ui;
