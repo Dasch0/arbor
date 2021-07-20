@@ -5,15 +5,19 @@
 ///
 /// All inner match statements where possible adhere to conditional moves to avoid excess branching
 ///
-pub use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, MouseButton, TouchPhase, WindowEvent};
+
+/// Public type for standarized 2 dimensional window size.
+pub type Size = PhysicalSize<u32>;
+pub type Position = PhysicalPosition<f64>;
 
 /// Stores state of window actions, created from a raw winit handle
 pub struct WindowState {
     /// Tracked state for user input
     pub input: Input,
     /// Size of the window
-    pub size: PhysicalSize<u32>,
+    pub size: Size,
     /// DPI scaling currently in place in the window
     pub scale: f64,
     /// status flag indicating the app should resize
@@ -86,7 +90,7 @@ impl WindowState {
 
 /// Implement this trait to handle events and interact with the window
 pub struct Input {
-    cursor_position: PhysicalPosition<f64>,
+    pub cursor_position: Position,
     pub text: String,
     cursor_pressed: bool,
     cursor_last_pressed: bool,
@@ -96,7 +100,7 @@ impl Input {
     /// Create a new input container
     fn new() -> Self {
         Self {
-            cursor_position: PhysicalPosition::<f64>::new(0.0, 0.0),
+            cursor_position: Position::new(0.0, 0.0),
             text: String::with_capacity(100),
             cursor_pressed: false,
             cursor_last_pressed: false,
@@ -168,7 +172,7 @@ pub fn init(
         .with_resizable(true)
         .with_transparent(false)
         .with_title(title)
-        .with_inner_size(winit::dpi::PhysicalSize { width, height })
+        .with_inner_size(Size { width, height })
         .build(&event_loop)
         .unwrap();
 

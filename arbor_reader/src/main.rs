@@ -1,79 +1,13 @@
 mod gfx;
+mod text;
 mod ui;
 mod window;
 
-use anyhow::Result;
-use std::io::Write;
-use wgpu;
-use wgpu_glyph::GlyphBrush;
-use wgpu_glyph::{ab_glyph, GlyphBrushBuilder, Section, Text};
-use winit::event_loop::{self, ControlFlow};
+use std::{io::Write, time::Duration};
+use winit::event_loop;
 
 const INITIAL_WIDTH: u32 = 1920;
 const INITIAL_HEIGHT: u32 = 1080;
-
-pub fn init_test_text(
-    device: &wgpu::Device,
-) -> Result<wgpu_glyph::GlyphBrush<wgpu::DepthStencilState>> {
-    // Prepare glyph_brush
-    let font_data =
-        ab_glyph::FontArc::try_from_slice(include_bytes!("../data/fonts/Lora-Regular.ttf"))?;
-
-    let glyph_brush = GlyphBrushBuilder::using_font(font_data)
-        .depth_stencil_state(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Greater,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        })
-        .build(&device, gfx::OUTPUT_FORMAT);
-
-    Ok(glyph_brush)
-}
-
-fn draw_test_text(
-    context: &mut gfx::Context,
-    encoder: &mut wgpu::CommandEncoder,
-    frame: &gfx::Frame,
-    glyph_brush: &mut GlyphBrush<wgpu::DepthStencilState>,
-    size: winit::dpi::PhysicalSize<u32>,
-) {
-    // Queue text on top, it will be drawn first.
-    // Depth buffer will make it appear on top.
-    glyph_brush.queue(Section {
-        screen_position: (400.0, 400.0),
-        text: vec![Text::default()
-            .with_text("Enter freely & of your own will!")
-            .with_scale(95.0)
-            .with_color([0.8, 0.8, 0.8, 1.0])
-            .with_z(0.9)],
-        ..Section::default()
-    });
-
-    // Draw all the text!
-    glyph_brush
-        .draw_queued(
-            &context.device,
-            &mut context.staging_belt,
-            encoder,
-            frame.view(),
-            wgpu::RenderPassDepthStencilAttachment {
-                view: &frame.depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(-1.0),
-                    store: true,
-                }),
-                stencil_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(0),
-                    store: true,
-                }),
-            },
-            size.width,
-            size.height,
-        )
-        .expect("Draw queued");
-}
 
 fn main() {
     // console output
@@ -97,8 +31,14 @@ fn main() {
 
     let test_quad = gfx::Quad::from_test_vertices(&gfx_context);
 
+    //let ui_rect = ui::Rect::from_tuple((400.0, 400.0, 200.0, 200.0));
+    let ui_rect = ui::Rect::from_coords(400.0, 600.0, 400.0, 600.0);
+    let mut ui_quad = ui_rect.to_quad(&gfx_context, window.inner_size());
+
     // text
-    let mut glyph_brush = init_test_text(&gfx_context.device).unwrap();
+    let mut text_renderer = text::Renderer::new(&gfx_context);
+
+    let mut last_frame_duration = Duration::new(1, 0);
 
     event_loop.run(move |event, _, control_flow| {
         // set control flow to only update when explicitly called
@@ -113,35 +53,60 @@ fn main() {
         }
 
         if window_state.resize {
-            gfx_context.resize(window_state.size)
+            gfx_context.resize(window_state.size);
+            ui_quad = ui_rect.to_quad(&gfx_context, window.inner_size());
         }
 
         if window_state.rescale {
             std::unimplemented!();
         }
 
-        if window_state.input.cursor_pressed() {
-            println!("click!");
-        }
+        let input = &window_state.input;
 
+        //
         // after this point, window_state is now ready to be inspected
-        let (mut encoder, frame) = gfx::begin_frame(&gfx_context).unwrap();
-        let mut renderpass = gfx::begin_renderpass(&mut encoder, &frame);
+        //
+        //
 
+        // RENDER
+        let (mut encoder, frame) = gfx::begin_frame(&gfx_context).unwrap();
+
+        let mut renderpass = gfx::begin_renderpass(&mut encoder, &frame);
         gfx::draw_sprite(&mut renderpass, &sprite_brush, &test_texture, &test_quad);
+        gfx::draw_sprite(&mut renderpass, &sprite_brush, &test_texture, &ui_quad);
         gfx::end_renderpass(renderpass);
 
-        draw_test_text(
-            &mut gfx_context,
-            &mut encoder,
-            &frame,
-            &mut glyph_brush,
-            window_state.size,
+        text_renderer.enqueue(
+            text::styles::DIALOGUE,
+            (10.0, 10.0),
+            0.1,
+            format!("\rframe_time: {:?}", last_frame_duration).as_str(),
+        );
+        text_renderer.enqueue(
+            text::styles::DIALOGUE,
+            (10.0, 20.0),
+            0.1,
+            format!("\rmouse_cursor: {:?}", input.cursor_position).as_str(),
         );
 
-        let frame_duration = gfx::end_frame(&mut gfx_context, encoder, frame);
+        if ui_rect.clicked(input) {
+            text_renderer.enqueue(
+                text::styles::TITLE,
+                (ui_rect.x1 as f32, ui_rect.x2 as f32),
+                0.1,
+                "clicked!",
+            );
+        }
+        text_renderer.enqueue(text::styles::TITLE, (100.0, 100.0), 0.0, "Dracula");
+        text_renderer.enqueue(
+            text::styles::DIALOGUE,
+            (400.0, 400.0),
+            0.0,
+            "Enter of your own free will!",
+        );
+        text_renderer.draw(&mut gfx_context, &mut encoder, window_state.size, &frame);
 
-        print!("\rframe_time: {:?}", frame_duration);
+        last_frame_duration = gfx::end_frame(&mut gfx_context, encoder, frame);
         stdout.flush().unwrap();
     });
 }

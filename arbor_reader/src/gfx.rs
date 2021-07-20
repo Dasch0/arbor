@@ -5,6 +5,7 @@ use futures::task::SpawnExt;
 use std::time::{Duration, Instant};
 use std::{file, mem};
 use wgpu::util::DeviceExt;
+pub use wgpu::CommandEncoder;
 use winit::window::Window;
 
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
@@ -29,7 +30,7 @@ pub struct Context {
 
 impl Context {
     /// Resize the GPU to target a new swapchain size
-    pub fn resize(&mut self, size: window::PhysicalSize<u32>) {
+    pub fn resize(&mut self, size: window::Size) {
         let frame_descriptor = wgpu::SwapChainDescriptor {
             usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
             format: OUTPUT_FORMAT,
@@ -225,16 +226,6 @@ impl Brush {
     }
 }
 
-/// Dummy structs used to restrict the draw methods available in different states.
-mod draw_stage {
-    /// Initial stage where a renderpass has not been started
-    pub struct Init;
-    /// A renderpass has started, multiple entities may be drawn in the same renderpass
-    pub struct Draw;
-    /// Drawing is completed and the renderpass is ready to be submitted to the gpu
-    pub struct Finish;
-}
-
 /// A gfx::Texture stores the underlying texture as well as a quad, sampler, and bind_group to draw
 /// to
 pub struct Texture {
@@ -319,7 +310,12 @@ impl Texture {
 }
 
 /// Stores data for a single resizable quad
+// TODO: Clean up quad implementation
+//      standardize format (indexed)
+//      share vertex buffers between quads on GPU
+//      possibly use a single actual quad with model transform?
 pub struct Quad {
+    pub vertices: [Vertex; 4],
     pub vertex_buffer: wgpu::Buffer,
     pub num_verts: u32,
 }
@@ -328,7 +324,7 @@ impl Quad {
     /// Create a quad using hardcoded test vertices
     pub fn from_test_vertices(context: &Context) -> Self {
         let num_verts = 4;
-        let verts = [
+        let vertices = [
             Vertex::new([-0.5, -0.5, 0.0], [0.0, 1.0]),
             Vertex::new([0.5, -0.5, 0.0], [1.0, 1.0]),
             Vertex::new([-0.5, 0.5, 0.0], [0.0, 0.0]),
@@ -339,11 +335,44 @@ impl Quad {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(&verts),
+                contents: bytemuck::cast_slice(&vertices),
                 usage: wgpu::BufferUsage::VERTEX,
             });
 
         Self {
+            vertices,
+            vertex_buffer,
+            num_verts,
+        }
+    }
+
+    /// Create a quad using x and y coordinates. These should be normalized (-1 to 1) with top-left
+    /// as x1y1
+    pub fn from_coords(context: &Context, x1: f32, x2: f32, y1: f32, y2: f32) -> Self {
+        let num_verts = 4;
+        // Implementation note: y1 and y2 are flipped to match wgpu defined coordinate system
+        //  https://gpuweb.github.io/gpuweb/#coordinate-systems
+        //
+        // we use top-left as origin everywhere because that is how winit is set up, so this
+        // inversion is only exposed here
+        let y1_wgpu = -y2;
+        let y2_wgpu = -y1;
+        let vertices = [
+            Vertex::new([x1, y1_wgpu, 0.0], [0.0, 1.0]),
+            Vertex::new([x2, y1_wgpu, 0.0], [1.0, 1.0]),
+            Vertex::new([x1, y2_wgpu, 0.0], [0.0, 0.0]),
+            Vertex::new([x2, y2_wgpu, 0.0], [1.0, 0.0]),
+        ];
+        let vertex_buffer = context
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsage::VERTEX,
+            });
+
+        Self {
+            vertices,
             vertex_buffer,
             num_verts,
         }
