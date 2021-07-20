@@ -4,3 +4,4 @@
 ## Introduction
 Arbor is a tree based text editor. Intended for storyboarding, dialogue, and branching narrative development.
 
+## :construction: This repository is under construction :construction:
