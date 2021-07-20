@@ -33,19 +33,3 @@ jobs:
           # exclude arbor_ui as remote does not provide linux, and currently no automated tests are done on the gui itself
           command: test
           args: --workspace --exclude arbor_ui
-  
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      - run: rustup component add clippy; sudo apt-get install libspeechd-dev
-      - uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: -- -D warnings

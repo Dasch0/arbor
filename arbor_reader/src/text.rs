@@ -12,7 +12,7 @@ pub enum Font {
 }
 
 /// Table for fonts. Should match the [Font] enum ordering
-const FONT_TABLE: &[&'static [u8]] = &[include_bytes!("../data/fonts/Lora-Regular.ttf")];
+const FONT_TABLE: &[&[u8]] = &[include_bytes!("../data/fonts/Lora-Regular.ttf")];
 
 /// Definitions for style presets. Each preset is an instance of [StyleData]
 pub mod styles {
