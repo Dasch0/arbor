@@ -1,14 +1,19 @@
+use wgpu_glyph::ab_glyph;
+
 use crate::{gfx, window};
 
-/// Data for the size and position of a rectangular area. The rectangular area is in screen
-/// coordinates. Values are stored as float64 for easy checking against mouse cursor data
-///
+/// Screen Coordinates:
 /// x1y1 -------- x2y1
 ///   |            |
 ///   |            |
 ///   |            |
 ///   |            |
 /// x2y1 -------- x2y2
+
+/// Data for the size and position of a rectangular area. The rectangular area is in screen
+/// coordinates. Values are stored as float64 for easy checking against mouse cursor data
+///
+#[derive(Debug)]
 pub struct Rect {
     pub x1: f64,
     pub x2: f64,
@@ -17,6 +22,15 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// Get a gfx::Point corresponding to the center of the rect at z = 0.0
+    pub fn pt(&self) -> gfx::Point {
+        gfx::Point {
+            x: (self.x1 + self.x2) / 2.0,
+            y: (self.y1 + self.y2) / 2.0,
+            z: 0.0,
+        }
+    }
+
     /// Create a new Rect from a tuple of the (top left) x-y origin, and the desired width/height
     pub fn from_tuple((x, y, width, height): (f64, f64, f64, f64)) -> Self {
         Self {
@@ -42,11 +56,6 @@ impl Rect {
         let x2_normalized: f32 = ((self.x2 - center.x) / center.x) as f32;
         let y1_normalized: f32 = ((self.y1 - center.y) / center.y) as f32;
         let y2_normalized: f32 = ((self.y2 - center.y) / center.y) as f32;
-
-        println!(
-            "{}, {}, {}, {}",
-            x1_normalized, x2_normalized, y1_normalized, y2_normalized
-        );
 
         gfx::Quad::from_coords(
             context,
@@ -82,5 +91,16 @@ impl Rect {
     #[inline]
     pub fn released(&self, input: &window::Input) -> bool {
         input.cursor_released() && self.hovered(input)
+    }
+}
+
+impl From<ab_glyph::Rect> for Rect {
+    fn from(item: ab_glyph::Rect) -> Rect {
+        Rect {
+            x1: item.min.x as f64,
+            y1: item.min.y as f64,
+            x2: item.max.x as f64,
+            y2: item.max.y as f64,
+        }
     }
 }

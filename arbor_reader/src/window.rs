@@ -4,7 +4,7 @@
 /// Adapted from crate winit_input_helper @ https://crates.io/crates/winit_input_helper/0.10.0/dependencies
 ///
 /// All inner match statements where possible adhere to conditional moves to avoid excess branching
-///
+use std::str;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, MouseButton, TouchPhase, WindowEvent};
 
@@ -13,7 +13,7 @@ pub type Size = PhysicalSize<u32>;
 pub type Position = PhysicalPosition<f64>;
 
 /// Stores state of window actions, created from a raw winit handle
-pub struct WindowState {
+pub struct State {
     /// Tracked state for user input
     pub input: Input,
     /// Size of the window
@@ -28,7 +28,7 @@ pub struct WindowState {
     pub quit: bool,
 }
 
-impl WindowState {
+impl State {
     pub fn new(window: &winit::window::Window) -> Self {
         Self {
             input: Input::new(),
@@ -101,7 +101,7 @@ impl Input {
     fn new() -> Self {
         Self {
             cursor_position: Position::new(0.0, 0.0),
-            text: String::with_capacity(100),
+            text: String::with_capacity(64),
             cursor_pressed: false,
             cursor_last_pressed: false,
         }
@@ -154,9 +154,16 @@ impl Input {
     pub fn cursor_held(&self) -> bool {
         self.cursor_pressed & self.cursor_last_pressed
     }
+
+    /// Return a chars iterator of all keypresses in the last frame
+    pub fn chars(&mut self) -> str::Chars {
+        self.text.chars()
+    }
 }
 
-/// Convenience function to create a winit window and WindowState handle
+/// Convenience function to create a winit window, event loop, and WindowState handle
+///
+/// T is any custom event types the event_loop should recognize
 pub fn init(
     title: &'static str,
     width: u32,
@@ -164,7 +171,7 @@ pub fn init(
 ) -> (
     winit::event_loop::EventLoop<()>,
     winit::window::Window,
-    WindowState,
+    State,
 ) {
     let event_loop = winit::event_loop::EventLoop::with_user_event();
     let window_handle = winit::window::WindowBuilder::new()
@@ -176,7 +183,7 @@ pub fn init(
         .build(&event_loop)
         .unwrap();
 
-    let window_state = WindowState::new(&window_handle);
+    let window_state = State::new(&window_handle);
 
     (event_loop, window_handle, window_state)
 }

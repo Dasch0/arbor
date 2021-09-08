@@ -2,10 +2,12 @@ use crate::window;
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use futures::task::SpawnExt;
+use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 use std::time::{Duration, Instant};
 use std::{file, mem};
 use wgpu::util::DeviceExt;
 pub use wgpu::CommandEncoder;
+pub use wgpu::RenderPass;
 use winit::window::Window;
 
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
@@ -379,6 +381,81 @@ impl Quad {
     }
 }
 
+/// 3 Dimensional point in winit screen coordinates
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Add for Point {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            x: self.x + other.x,
+            y: self.y + other.y,
+            z: self.z + other.z,
+        }
+    }
+}
+
+impl Sub for Point {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        Self {
+            x: self.x - other.x,
+            y: self.y - other.y,
+            z: self.z - other.z,
+        }
+    }
+}
+
+impl AddAssign for Point {
+    fn add_assign(&mut self, other: Self) {
+        self.x += other.x;
+        self.y += other.y;
+        self.z += other.z;
+    }
+}
+
+impl SubAssign for Point {
+    fn sub_assign(&mut self, other: Self) {
+        self.x -= other.x;
+        self.y -= other.y;
+        self.z -= other.z;
+    }
+}
+
+impl Mul<f64> for Point {
+    type Output = Self;
+    fn mul(self, other: f64) -> Self {
+        Self {
+            x: self.x * other,
+            y: self.y * other,
+            z: self.z * other,
+        }
+    }
+}
+
+impl Point {
+    pub fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+
+    /// find a new point from a point on the UI such that an element with a certain width and
+    /// height will be centered on that point
+    pub fn centering_offset_of(&self, width: f64, height: f64) -> Self {
+        Self {
+            x: self.x - width / 2.0,
+            y: self.y - height / 2.0,
+            z: self.z,
+        }
+    }
+}
+
 /// Wraps the async init function with blocking call
 pub fn init(window: &Window) -> Context {
     futures::executor::block_on(initialize_gfx(window))
@@ -478,7 +555,7 @@ async fn initialize_gfx(window: &Window) -> Context {
 /// If the frame cannot be started (usually due to a failure to get the next frame from the
 /// swapchain). An error will be returned. Note that this should be handled gracefully, as
 /// framedrops will likely occur at some point
-pub fn begin_frame(context: &Context) -> anyhow::Result<(wgpu::CommandEncoder, Frame)> {
+pub fn begin_frame(context: &Context) -> anyhow::Result<(CommandEncoder, Frame)> {
     // Begin to draw the frame.
     let data = context.swap_chain.get_current_frame()?;
 
@@ -510,7 +587,7 @@ pub fn begin_frame(context: &Context) -> anyhow::Result<(wgpu::CommandEncoder, F
 pub fn begin_renderpass<'render>(
     encoder: &'render mut wgpu::CommandEncoder,
     frame: &'render Frame,
-) -> wgpu::RenderPass<'render> {
+) -> RenderPass<'render> {
     // Clear frame
     let renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("Render pass"),

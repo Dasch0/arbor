@@ -16,3 +16,4 @@ wgpu_glyph = "0.12"
 anyhow = "1.0"
 png = "0.16"
 lazy_static = "1.4"
+arbor_core = { version = "0.1.0", path = "../arbor_core" }
