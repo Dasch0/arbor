@@ -226,6 +226,9 @@ impl Brush {
             bind_group_layout,
         }
     }
+
+    /// brush to paint a rectangular area with a color
+    new_rect_brush
 }
 
 /// A gfx::Texture stores the underlying texture as well as a quad, sampler, and bind_group to draw

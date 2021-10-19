@@ -5,7 +5,7 @@ mod ui;
 mod window;
 
 use arbor_core;
-use arbor_core::Executable;
+use arbor_core::{cmd, Executable};
 use std::{io::Write, time::Duration};
 use text::styles;
 use winit::event_loop;
@@ -26,16 +26,22 @@ pub enum States {
 
 /// Data for editor mode
 pub struct Editor {
+    pub current_node_id: usize,
+    pub prev_node_id: usize,
     pub script: arbor_core::EditorState,
-    pub buf: String,
+    pub name_buf: String,
+    pub text_buf: String,
     pub history: text::input::History,
 }
 
 impl Default for Editor {
     fn default() -> Self {
         Self {
+            current_node_id: 0,
+            prev_node_id: 0,
             script: arbor_core::EditorState::new(arbor_core::DialogueTreeData::default()),
-            buf: String::with_capacity(4096),
+            name_buf: String::with_capacity(128),
+            text_buf: String::with_capacity(4096),
             history: text::input::History::with_capacity(4096),
         }
     }
@@ -53,12 +59,12 @@ impl Editor {
         let menu_pt = gfx::Point::new(ws.size.width as f64 * 0.5, ws.size.height as f64 * 0.3, 0.0);
 
         // parse the text, ignore separators and no undo allowed
-        text::input::parse_single_no_history(&mut self.buf, ws.input.chars());
+        text::input::parse_single_no_history(&mut self.text_buf, ws.input.chars());
 
         // FIXME: automate cursor drawing
-        self.buf.push('|');
+        self.text_buf.push('|');
 
-        let title = txt.enqueue(styles::TITLE, menu_pt, self.buf.as_str());
+        let title = txt.enqueue(styles::TITLE, menu_pt, self.text_buf.as_str());
         let subtitle = txt.enqueue(
             styles::SUBTITLE,
             title.pt() + styles::TITLE.inc(),
@@ -66,7 +72,7 @@ impl Editor {
         );
 
         // FIXME: automate cursor drawing
-        self.buf.pop();
+        self.text_buf.pop();
 
         // Draw buttons
         let start = txt.enqueue(styles::MENU, subtitle.pt() + styles::TITLE.inc(), "Start");
@@ -74,7 +80,7 @@ impl Editor {
 
         // FIXME: ugly
         if start.clicked(&ws.input) {
-            let res = arbor_core::cmd::new::Project::new(self.buf.drain(..).collect(), true)
+            let res = arbor_core::cmd::new::Project::new(self.text_buf.drain(..).collect(), true)
                 .execute(&mut self.script);
             if let Err(e) = res {
                 log::error!("{}", e);
@@ -94,22 +100,43 @@ impl Editor {
         _renderpass: &mut gfx::RenderPass,
         txt: &mut text::Renderer,
     ) -> States {
-        // Display popup for user to enter name of new project
+        // ui anchor points and bounds
         let dialogue_pt =
-            gfx::Point::new(ws.size.width as f64 * 0.2, ws.size.height as f64 * 0.2, 0.0);
+            gfx::Point::new(ws.size.width as f64 * 0.3, ws.size.height as f64 * 0.3, 0.0);
         let dialogue_bounds = (ws.size.width as f32 * 0.6, ws.size.height as f32 * 0.2);
+        let name_pt = gfx::Point::new(ws.size.width as f64 * 0.2, ws.size.height as f64 * 0.2, 0.0);
+        let save_pt = gfx::Point::new(ws.size.width as f64 * 0.8, ws.size.height as f64 * 0.8, 0.0);
+
+        // ui elements
+        let name_rect = txt.enqueue(styles::MENU, name_pt, self.name_buf.as_str());
+        let save_rect = txt.enqueue(styles::MENU, save_pt, "Save");
+        let next_rect = txt.enqueue(styles::MENU, save_rect.pt() + styles::MENU.inc(), "Next");
 
         // send input to parser (input text will be cleared next frame)
-        text::input::parse(&mut self.buf, ws.input.chars(), &mut self.history);
-
-        self.buf.push('|');
-        txt.enqueue_with_bounds(
+        text::input::parse(&mut self.text_buf, ws.input.chars(), &mut self.history);
+        self.text_buf.push('|');
+        let dialogue_rect = txt.enqueue_with_bounds(
             styles::DIALOGUE,
             dialogue_pt,
             dialogue_bounds,
-            self.buf.as_str(),
+            self.text_buf.as_str(),
         );
-        self.buf.pop();
+        self.text_buf.pop();
+
+        // app logic
+        if save_rect.clicked(&ws.input) {
+            let res = cmd::new::Node::new(
+                self.name_buf.drain(..).collect(),
+                self.text_buf.drain(..).collect(),
+            )
+            .execute(&mut self.script);
+            match res {
+                Ok(node_index) => {
+                    self.current_node_id = node_index;
+                }
+                Err(e) => log::error!("{}", e),
+            }
+        }
 
         States::EditorLoop
     }
@@ -255,6 +282,8 @@ pub fn draw_performance_metrics(
         format!("\rmouse_cursor: {:?}", metrics.1).as_str(),
     );
 }
+
+pub fn draw_button(rect: ui::Rect, renderpass: gfx::RenderPass) {}
 
 /// handles quit request
 pub fn quit(control_flow: &mut event_loop::ControlFlow) -> States {

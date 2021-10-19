@@ -6,26 +6,13 @@ edition = "2018"
 
 [dependencies]
 log = "0.4.14"
-rand = "0.8.3"
-rayon = "1.5.0"
-arrayvec = { version = "0.6.0", features = ["serde"] }
-serde = { version = "1.0.125", features = ["derive"] }
-diff-struct = "0.3"
-bincode = "1.3.2"
-structopt = "0.3.21"
-enum_dispatch = "0.3.5"
-derive-new = "0.5"
-enum_from_str = "0.1.0"
-enum_from_str_derive = "0.1.0"
+nanoserde = "0.1"
 seahash = "4.1.0"
-thiserror = "1.0"
-anyhow = "1.0"
 fixedbitset = "0.4"
 
 [dev-dependencies]
-shellwords = "1.1.0"
-simple_logger = "1.11.0"
-chrono = "0.4.19"
+simple_logger = "1.11"
+chrono = "0.4"
 criterion = "0.3"
 
 [[bench]]

@@ -1,29 +1,14 @@
-use arbor_core::*;
+use arbor_core::{editor, util, EffectKind, NameTable, ReqKind};
 use criterion::{criterion_group, criterion_main, Criterion};
 
 /// Benchmark node parsing worst case, many substitutions and improperly sized buffer
 fn stress_parse_node(c: &mut Criterion) {
     let mut name_table = NameTable::default();
-    name_table.insert(
-        KeyString::from("Elle").unwrap(),
-        NameString::from("Amberson").unwrap(),
-    );
-    name_table.insert(
-        KeyString::from("Patrick").unwrap(),
-        NameString::from("Breakforest").unwrap(),
-    );
-    name_table.insert(
-        KeyString::from("Anna").unwrap(),
-        NameString::from("Catmire").unwrap(),
-    );
-    name_table.insert(
-        KeyString::from("Laura").unwrap(),
-        NameString::from("Dagson").unwrap(),
-    );
-    name_table.insert(
-        KeyString::from("John").unwrap(),
-        NameString::from("Elliot").unwrap(),
-    );
+    name_table.insert("Elle".to_string(), "Amberson".to_string());
+    name_table.insert("Patrick".to_string(), "Breakforest".to_string());
+    name_table.insert("Anna".to_string(), "Catmire".to_string());
+    name_table.insert("Laura".to_string(), "Dagson".to_string());
+    name_table.insert("John".to_string(), "Elliot".to_string());
 
     let text = "::Elle::xzunz::Anna::lxn ::Elle::cn::Patrick::o::Laura::sokxt::Patrick::eowln
     ::Patrick::::John::c::Patrick::iw qyyhr.jxhccpyvchze::Anna::ox hi::Laura::nlv::John::peh
@@ -43,7 +28,7 @@ fn stress_parse_node(c: &mut Criterion) {
         b.iter(|| {
             let mut name_buf = String::with_capacity(1);
             let mut buf = String::with_capacity(1);
-            cmd::util::parse_node(text, &name_table, &mut name_buf, &mut buf).unwrap();
+            util::parse_node(text, &name_table, &mut name_buf, &mut buf).unwrap();
         })
     });
 }
@@ -51,14 +36,8 @@ fn stress_parse_node(c: &mut Criterion) {
 /// Benchmark standard node parsing case, few substitutions and pre-allocated buffer
 fn quick_parse_node(c: &mut Criterion) {
     let mut name_table = NameTable::default();
-    name_table.insert(
-        KeyString::from("vamp").unwrap(),
-        NameString::from("Dracula").unwrap(),
-    );
-    name_table.insert(
-        KeyString::from("king").unwrap(),
-        NameString::from("King Laugh").unwrap(),
-    );
+    name_table.insert("vamp".to_string(), "Dracula".to_string());
+    name_table.insert("king".to_string(), "King Laugh".to_string());
 
     let text = "::vamp::It is a strange world, a sad world, a world full of miseries, and woes, and 
     troubles. And yet when ::king:: come, he make them all dance to the tune he play. Bleeding hearts, 
@@ -74,7 +53,7 @@ fn quick_parse_node(c: &mut Criterion) {
     // bench part
     c.bench_function("quick_parse_node", |b| {
         b.iter(|| {
-            cmd::util::parse_node(text, &name_table, &mut name_buf, &mut buf).unwrap();
+            util::parse_node(text, &name_table, &mut name_buf, &mut buf).unwrap();
         })
     });
 }
@@ -82,30 +61,34 @@ fn quick_parse_node(c: &mut Criterion) {
 /// Test of a worst case type of scenario for undo/redo, where there is an extremely large number
 /// of outgoing edges from a single node.
 fn stress_undo_redo(c: &mut Criterion) {
-    let mut state = EditorState::new(DialogueTreeData::default());
-    let test_key = KeyString::from("cat").unwrap();
-    let test_name = NameString::from("Behemoth").unwrap();
+    let mut editor = editor::Editor::new("undo_redo_bench", None).unwrap();
+    let test_key = "cat";
+    let test_name = "Behemoth";
 
-    cmd::new::Name::new(test_key, test_name)
-        .execute(&mut state)
-        .unwrap();
+    editor.new_name(test_key, test_name).unwrap();
 
     for i in 0..10000 {
-        cmd::new::Node::new(test_key.to_string(), format!("test dialogue {}", i))
-            .execute(&mut state)
+        editor
+            .new_node(test_key, &format!("test dialogue {}", i))
             .unwrap();
-        cmd::new::Edge::new(0, i, format!("test choice {}", i), None, None)
-            .execute(&mut state)
+        editor
+            .new_edge(
+                &format!("test choice {}", i),
+                0,
+                i,
+                ReqKind::No,
+                EffectKind::No,
+            )
             .unwrap();
     }
     // bench part
     c.bench_function("stress_undo_redo", |b| {
         b.iter(|| {
             for _ in 0..10 {
-                cmd::Undo::new().execute(&mut state).unwrap();
+                editor.undo().unwrap();
             }
             for _ in 0..10 {
-                cmd::Redo::new().execute(&mut state).unwrap();
+                editor.redo().unwrap();
             }
         })
     });

@@ -102,7 +102,6 @@ impl epi::App for ArborUi {
         self.backend_panel.open = backend_panel_open;
 
         // Draw rest of UI now that project status is sorted out
-        //
         egui::TopPanel::top("Menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 egui::menu::menu(ui, "File", |ui| {
