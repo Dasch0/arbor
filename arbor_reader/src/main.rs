@@ -5,8 +5,9 @@ mod ui;
 mod window;
 
 use arbor_core;
-use arbor_core::{cmd, Executable};
+use arbor_core::{editor, Result};
 use std::{io::Write, time::Duration};
+use text::input::History;
 use text::styles;
 use winit::event_loop;
 
@@ -25,29 +26,28 @@ pub enum States {
 }
 
 /// Data for editor mode
-pub struct Editor {
+pub struct EditorState {
     pub current_node_id: usize,
     pub prev_node_id: usize,
-    pub script: arbor_core::EditorState,
-    pub name_buf: String,
     pub text_buf: String,
-    pub history: text::input::History,
+    pub editor_data: editor::Editor,
+    pub input_history: History,
 }
 
-impl Default for Editor {
+impl Default for EditorState {
+    /// Create a new EditState instance
     fn default() -> Self {
         Self {
             current_node_id: 0,
             prev_node_id: 0,
-            script: arbor_core::EditorState::new(arbor_core::DialogueTreeData::default()),
-            name_buf: String::with_capacity(128),
             text_buf: String::with_capacity(4096),
-            history: text::input::History::with_capacity(4096),
+            editor_data: editor::Editor::new("template", None).unwrap(),
+            input_history: History::with_capacity(4096),
         }
     }
 }
 
-impl Editor {
+impl EditorState {
     /// Draws interface for creating a new editor instance
     pub fn draw_new(
         &mut self,
@@ -80,12 +80,18 @@ impl Editor {
 
         // FIXME: ugly
         if start.clicked(&ws.input) {
-            let res = arbor_core::cmd::new::Project::new(self.text_buf.drain(..).collect(), true)
-                .execute(&mut self.script);
-            if let Err(e) = res {
-                log::error!("{}", e);
+            let res = editor::Editor::new(&self.text_buf, None);
+            match res {
+                Ok(editor) => {
+                    self.text_buf.clear();
+                    self.editor_data = editor;
+                    States::EditorLoop
+                }
+                Err(e) => {
+                    log::error!("{}", e);
+                    States::EditorStart
+                }
             }
-            States::EditorLoop
         } else if cancel.clicked(&ws.input) {
             States::TitleScreen
         } else {
@@ -108,12 +114,16 @@ impl Editor {
         let save_pt = gfx::Point::new(ws.size.width as f64 * 0.8, ws.size.height as f64 * 0.8, 0.0);
 
         // ui elements
-        let name_rect = txt.enqueue(styles::MENU, name_pt, self.name_buf.as_str());
+        let name_rect = txt.enqueue(styles::MENU, name_pt, &self.text_buf);
         let save_rect = txt.enqueue(styles::MENU, save_pt, "Save");
         let next_rect = txt.enqueue(styles::MENU, save_rect.pt() + styles::MENU.inc(), "Next");
 
         // send input to parser (input text will be cleared next frame)
-        text::input::parse(&mut self.text_buf, ws.input.chars(), &mut self.history);
+        text::input::parse(
+            &mut self.text_buf,
+            ws.input.chars(),
+            &mut self.input_history,
+        );
         self.text_buf.push('|');
         let dialogue_rect = txt.enqueue_with_bounds(
             styles::DIALOGUE,
@@ -125,14 +135,11 @@ impl Editor {
 
         // app logic
         if save_rect.clicked(&ws.input) {
-            let res = cmd::new::Node::new(
-                self.name_buf.drain(..).collect(),
-                self.text_buf.drain(..).collect(),
-            )
-            .execute(&mut self.script);
+            let res = self.editor_data.new_node(&self.text_buf, &self.text_buf);
             match res {
                 Ok(node_index) => {
                     self.current_node_id = node_index;
+                    self.text_buf.clear();
                 }
                 Err(e) => log::error!("{}", e),
             }
@@ -177,7 +184,7 @@ fn main() {
     // App data
     // always starts at title screen
     let mut state = States::TitleScreen;
-    let mut editor = Editor::default();
+    let mut editor = EditorState::default();
 
     event_loop.run(move |event, _, control_flow| {
         // set control flow to only update when explicitly called
@@ -265,25 +272,36 @@ pub fn draw_title_menu(
 
 // TODO: Create metrics struct
 pub fn draw_performance_metrics(
-    text_renderer: &mut text::Renderer,
+    txt: &mut text::Renderer,
     metrics: (std::time::Duration, window::Position),
 ) {
     let info_pt = gfx::Point::new(10.0, 10.0, 0.0);
     let line_height = gfx::Point::new(0.0, 24.0, 0.0);
 
-    text_renderer.enqueue(
+    txt.enqueue(
         styles::METRIC,
         info_pt,
         format!("\rframe_time: {:?}", metrics.0).as_str(),
     );
-    text_renderer.enqueue(
+    txt.enqueue(
         styles::METRIC,
         info_pt + line_height,
         format!("\rmouse_cursor: {:?}", metrics.1).as_str(),
     );
 }
 
-pub fn draw_button(rect: ui::Rect, renderpass: gfx::RenderPass) {}
+/// draw a clickable button, appearance can change based on hover/clicked status
+pub fn draw_button(
+    position: gfx::Point,
+    text: &str,
+    txt: &mut text::Renderer,
+    renderpass: gfx::RenderPass,
+    input: &window::Input,
+) {
+    let rect = txt.enqueue(styles::BUTTON, position, text);
+}
+
+pub fn draw_dropdown() {}
 
 /// handles quit request
 pub fn quit(control_flow: &mut event_loop::ControlFlow) -> States {

@@ -1,18 +1,58 @@
 use crate::window;
-use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
-use futures::task::SpawnExt;
+use std::borrow::Cow;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 use std::time::{Duration, Instant};
-use std::{file, mem};
+use std::{file, fmt, mem};
+use wgpu;
 use wgpu::util::DeviceExt;
-pub use wgpu::CommandEncoder;
-pub use wgpu::RenderPass;
 use winit::window::Window;
 
+use glyph_brush::ab_glyph;
+
+pub use wgpu::CommandEncoder;
+pub use wgpu::RenderPass;
+
+/// Default output format for renderer
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
+/// Default depth format for renderer
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Default present mode for renderer
 pub const PRESENT_MODE: wgpu::PresentMode = wgpu::PresentMode::Mailbox;
+
+/// Identity transform matrix
+#[rustfmt::skip]
+pub const IDENTITY_MATRIX: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+];
+
+/// Gfx Result type wraps `gfx::Error`
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Top level errors from the gfx module
+#[derive(Debug)]
+pub enum Error {
+    Generic,
+    Surface(wgpu::SurfaceError),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::Generic => write!(f, "An unspecified error occured..."),
+            Error::Surface(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<wgpu::SurfaceError> for Error {
+    fn from(t: wgpu::SurfaceError) -> Self {
+        Error::Surface(t)
+    }
+}
 
 /// Handle to core WGPU stuctures representing physical access to the gpu, such as the device,
 /// queue, and swapchain.
@@ -22,28 +62,13 @@ pub struct Context {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface,
-    pub swap_chain: wgpu::SwapChain,
     pub depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
-    pub staging_belt: wgpu::util::StagingBelt,
-    pub thread_pool: futures::executor::LocalPool,
-    pub thread_spawner: futures::executor::LocalSpawner,
 }
 
 impl Context {
     /// Resize the GPU to target a new swapchain size
     pub fn resize(&mut self, size: window::Size) {
-        let frame_descriptor = wgpu::SwapChainDescriptor {
-            usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
-            format: OUTPUT_FORMAT,
-            width: size.width,
-            height: size.height,
-            present_mode: PRESENT_MODE,
-        };
-        self.swap_chain = self
-            .device
-            .create_swap_chain(&self.surface, &frame_descriptor);
-
         log::trace!("Create swapchain depth textures");
         self.depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth buffer"),
@@ -56,28 +81,21 @@ impl Context {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         });
     }
 }
 
 /// Storage for per-frame gpu information
 pub struct Frame {
-    pub data: wgpu::SwapChainFrame,
+    pub view: wgpu::TextureView,
     pub depth_view: wgpu::TextureView,
     pub start_time: Instant,
 }
 
-impl Frame {
-    /// Concisely return a reference to the Frame TextureView
-    pub fn view(&self) -> &wgpu::TextureView {
-        &self.data.output.view
-    }
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-/// Vertex primitive type for Gfx
+/// Vertex primitive type for gfx
 pub struct Vertex {
     pub pos: [f32; 4],
     pub tex_coord: [f32; 2],
@@ -95,7 +113,7 @@ impl Vertex {
     pub fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::InputStepMode::Vertex,
+            step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
                     offset: 0,
@@ -108,6 +126,33 @@ impl Vertex {
                     format: wgpu::VertexFormat::Float32x2,
                 },
             ],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+/// Color primitive for gfx
+pub struct Color {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl Color {
+    pub fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self { r, g, b, a }
+    }
+}
+
+impl From<[f32; 4]> for Color {
+    fn from(t: [f32; 4]) -> Color {
+        Color {
+            r: t[0],
+            g: t[1],
+            b: t[2],
+            a: t[3],
         }
     }
 }
@@ -141,7 +186,7 @@ impl Brush {
                     entries: &[
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
-                            visibility: wgpu::ShaderStage::FRAGMENT,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Texture {
                                 multisampled: false,
                                 sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -151,7 +196,7 @@ impl Brush {
                         },
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
-                            visibility: wgpu::ShaderStage::FRAGMENT,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Sampler {
                                 comparison: false,
                                 filtering: true,
@@ -193,7 +238,7 @@ impl Brush {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: false,
+                    depth_write_enabled: true,
                     depth_compare: wgpu::CompareFunction::Always,
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
@@ -216,7 +261,7 @@ impl Brush {
                                 operation: wgpu::BlendOperation::Add,
                             },
                         }),
-                        write_mask: wgpu::ColorWrite::ALL,
+                        write_mask: wgpu::ColorWrites::ALL,
                     }],
                 }),
             });
@@ -226,9 +271,6 @@ impl Brush {
             bind_group_layout,
         }
     }
-
-    /// brush to paint a rectangular area with a color
-    new_rect_brush
 }
 
 /// A gfx::Texture stores the underlying texture as well as a quad, sampler, and bind_group to draw
@@ -241,11 +283,18 @@ pub struct Texture {
 }
 
 impl Texture {
-    pub fn from_bytes(context: &Context, brush: &Brush, bytes: &[u8]) -> Result<Self> {
+    /// Generate a texture from the raw bytes of a `png` image. This image must be encoded with
+    /// `rgba` format
+    pub fn from_png(context: &Context, bytes: &[u8]) -> Result<Self> {
         let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-        let (info, mut reader) = decoder.read_info().unwrap();
-        let mut buf = vec![0; info.buffer_size()];
-        reader.next_frame(&mut buf).unwrap();
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+
+        // if color type is not rgba, fail
+        if info.color_type != png::ColorType::Rgba {
+            return Err(Error::Generic);
+        }
 
         let size = wgpu::Extent3d {
             width: info.width,
@@ -259,11 +308,12 @@ impl Texture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         });
 
         context.queue.write_texture(
             wgpu::ImageCopyTexture {
+                aspect: wgpu::TextureAspect::All,
                 texture: &texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
@@ -314,6 +364,27 @@ impl Texture {
     }
 }
 
+/// A 2d region of the screen, generally used for scissoring the render target
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Zeroable, Pod, Default)]
+pub struct Region {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub heigh: u32,
+}
+
+impl Into<[f32; 4]> for Region {
+    fn into(self) -> [f32; 4] {
+        [
+            self.x as f32,
+            self.y as f32,
+            self.width as f32,
+            self.heigh as f32,
+        ]
+    }
+}
+
 /// Stores data for a single resizable quad
 // TODO: Clean up quad implementation
 //      standardize format (indexed)
@@ -341,7 +412,7 @@ impl Quad {
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Vertex Buffer"),
                 contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsage::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX,
             });
 
         Self {
@@ -353,6 +424,8 @@ impl Quad {
 
     /// Create a quad using x and y coordinates. These should be normalized (-1 to 1) with top-left
     /// as x1y1
+    // TODO: Creating a buffer for each quad is absurdly inefficient. Fix this when creating the
+    // actual gfx renderer struct
     pub fn from_coords(context: &Context, x1: f32, x2: f32, y1: f32, y2: f32) -> Self {
         let num_verts = 4;
         // Implementation note: y1 and y2 are flipped to match wgpu defined coordinate system
@@ -373,7 +446,7 @@ impl Quad {
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Vertex Buffer"),
                 contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsage::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX,
             });
 
         Self {
@@ -459,28 +532,24 @@ impl Point {
     }
 }
 
-/// Wraps the async init function with blocking call
+/// Top level function for initializing the GFX module
+///
+/// This is required to obtain a valid gfx [Context]
 pub fn init(window: &Window) -> Context {
-    futures::executor::block_on(initialize_gfx(window))
-}
-
-/// Creates the GPU handle and returns the window surface used
-async fn initialize_gfx(window: &Window) -> Context {
     log::info!("Initializing gfx...");
     log::trace!("Create instance");
-    let instance = wgpu::Instance::new(wgpu::BackendBit::PRIMARY);
+    let instance = wgpu::Instance::new(wgpu::Backends::all());
 
     log::trace!("Obtain window surface");
     let surface = unsafe { instance.create_surface(window) };
 
     log::trace!("Create adapter");
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-        })
-        .await
-        .unwrap();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
+    }))
+    .unwrap();
 
     let optional_features = wgpu::Features::empty();
     let required_features = wgpu::Features::default();
@@ -489,31 +558,18 @@ async fn initialize_gfx(window: &Window) -> Context {
     let trace_dir = std::env::var("WGPU_TRACE");
 
     log::trace!("Create device & queue");
-    let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                label: None,
-                features: (adapter_features & optional_features) | required_features,
-                limits: required_limits,
-            },
-            trace_dir.ok().as_ref().map(std::path::Path::new),
-        )
-        .await
-        .unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: None,
+            features: (adapter_features & optional_features) | required_features,
+            limits: required_limits,
+        },
+        trace_dir.ok().as_ref().map(std::path::Path::new),
+    ))
+    .unwrap();
 
-    log::trace!("Create swapchain");
+    log::trace!("Create depth texture");
     let size = window.inner_size();
-
-    let frame_descriptor = wgpu::SwapChainDescriptor {
-        usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
-        format: OUTPUT_FORMAT,
-        width: size.width,
-        height: size.height,
-        present_mode: PRESENT_MODE,
-    };
-    let swap_chain = device.create_swap_chain(&surface, &frame_descriptor);
-
-    log::trace!("Create swapchain depth textures");
     let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Depth buffer"),
         size: wgpu::Extent3d {
@@ -525,31 +581,338 @@ async fn initialize_gfx(window: &Window) -> Context {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
     });
-
     let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    log::trace!("Create staging belt and thread pool utilities");
-    let staging_belt = wgpu::util::StagingBelt::new(1024);
-    let thread_pool = futures::executor::LocalPool::new();
-    let thread_spawner = thread_pool.spawner();
-
-    log::info!("Gfx initialization complete!");
-
+    log::info!("gfx initialization complete!");
     Context {
         instance,
         adapter,
         device,
         queue,
         surface,
-        swap_chain,
         depth_texture,
         depth_view,
-        staging_belt,
-        thread_pool,
-        thread_spawner,
     }
+}
+
+/// Data stored in Text renderer vertex buffer to draw glyphs obtained from glyph_brush
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Zeroable, Pod)]
+struct GlyphVertex {
+    left_top: [f32; 3],
+    right_bottom: [f32; 2],
+    tex_left_top: [f32; 2],
+    tex_right_bottom: [f32; 2],
+    scissor: [f32; 4],
+    color: [f32; 4],
+}
+
+impl GlyphVertex {
+    /// helper function to get the vertex attributes of the struct
+    #[inline]
+    fn vertex_attributes() -> [wgpu::VertexAttribute; 6] {
+        wgpu::vertex_attr_array! [
+                        0 => Float32x3,
+                        1 => Float32x2,
+                        2 => Float32x2,
+                        3 => Float32x2,
+                        4 => Float32x4,
+                        5 => Float32x4,
+        ]
+    }
+}
+
+impl From<glyph_brush::GlyphVertex<'_>> for GlyphVertex {
+    /// obtain a `gfx::GlyphVertex` from a glyph_brush::GlyphVertex`
+    fn from(
+        glyph_brush::GlyphVertex {
+            mut tex_coords,
+            pixel_coords,
+            bounds,
+            extra,
+        }: glyph_brush::GlyphVertex,
+    ) -> GlyphVertex {
+        let gl_bounds = bounds;
+
+        let mut rect = ab_glyph::Rect {
+            min: ab_glyph::point(pixel_coords.min.x as f32, pixel_coords.min.y as f32),
+            max: ab_glyph::point(pixel_coords.max.x as f32, pixel_coords.max.y as f32),
+        };
+
+        // handle overlapping bounds, modify uv_rect to preserve texture aspect
+        if rect.max.x > gl_bounds.max.x {
+            let old_width = rect.width();
+            rect.max.x = gl_bounds.max.x;
+            tex_coords.max.x = tex_coords.min.x + tex_coords.width() * rect.width() / old_width;
+        }
+
+        if rect.min.x < gl_bounds.min.x {
+            let old_width = rect.width();
+            rect.min.x = gl_bounds.min.x;
+            tex_coords.min.x = tex_coords.max.x - tex_coords.width() * rect.width() / old_width;
+        }
+
+        if rect.max.y > gl_bounds.max.y {
+            let old_height = rect.height();
+            rect.max.y = gl_bounds.max.y;
+            tex_coords.max.y = tex_coords.min.y + tex_coords.height() * rect.height() / old_height;
+        }
+
+        if rect.min.y < gl_bounds.min.y {
+            let old_height = rect.height();
+            rect.min.y = gl_bounds.min.y;
+            tex_coords.min.y = tex_coords.max.y - tex_coords.height() * rect.height() / old_height;
+        }
+
+        GlyphVertex {
+            left_top: [rect.min.x, rect.max.y, extra.z],
+            right_bottom: [rect.max.x, rect.min.y],
+            tex_left_top: [tex_coords.min.x, tex_coords.max.y],
+            tex_right_bottom: [tex_coords.max.x, tex_coords.min.y],
+            scissor: [0.0; 4],
+            color: extra.color,
+        }
+    }
+}
+
+/// Data needed to render text. Utilized by the top level renderer struct
+struct Text {
+    current_glyphs: usize,
+    max_glyphs: usize,
+    pipeline: wgpu::RenderPipeline,
+    transform: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+    glyph_buffer: wgpu::Buffer,
+    uniforms: wgpu::BindGroup,
+    cache: wgpu::Texture,
+    cache_view: wgpu::TextureView,
+}
+
+impl Text {
+    const INITIAL_VERTEX_BUFFER_LEN: usize = 50000;
+    fn new(
+        cache_width: u32,
+        cache_height: u32,
+        filter_mode: wgpu::FilterMode,
+        render_format: wgpu::TextureFormat,
+        ctx: &Context,
+    ) -> Self {
+        let transform = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gfx::Text transform uniform buffer"),
+                contents: bytemuck::cast_slice(&IDENTITY_MATRIX),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("gfx::Text texture sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: filter_mode,
+            min_filter: filter_mode,
+            mipmap_filter: filter_mode,
+            ..Default::default()
+        });
+
+        let cache = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gfx::Text cache texture"),
+            size: wgpu::Extent3d {
+                width: cache_width,
+                height: cache_height,
+                depth_or_array_layers: 1,
+            },
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            mip_level_count: 1,
+            sample_count: 1,
+        });
+        let cache_view = cache.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let uniform_layout = Self::uniform_layout(ctx);
+
+        let uniforms = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gfx::Text uniforms"),
+            layout: &uniform_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &transform,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&cache_view),
+                },
+            ],
+        });
+
+        let glyph_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gfx::Text vertex buffer"),
+            size: mem::size_of::<GlyphVertex>() as u64 * Text::INITIAL_VERTEX_BUFFER_LEN as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                push_constant_ranges: &[],
+                bind_group_layouts: &[&uniform_layout],
+            });
+
+        let shader = ctx
+            .device
+            .create_shader_module(&wgpu::ShaderModuleDescriptor {
+                label: Some("gfx::Text shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                    "../data/shaders/glyph.wgsl"
+                ))),
+            });
+
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: mem::size_of::<GlyphVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &GlyphVertex::vertex_attributes(),
+                    }],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    front_face: wgpu::FrontFace::Cw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[wgpu::ColorTargetState {
+                        format: render_format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }],
+                }),
+            });
+
+        Self {
+            current_glyphs: 0,
+            max_glyphs: Self::INITIAL_VERTEX_BUFFER_LEN,
+            pipeline,
+            transform,
+            sampler,
+            glyph_buffer,
+            uniforms,
+            cache,
+            cache_view,
+        }
+    }
+
+    fn upload(&mut self, ctx: &Context, glyphs: &mut [GlyphVertex], region: Option<Region>) {
+        // early return if nothing to upload
+        if glyphs.is_empty() {
+            self.current_glyphs = 0;
+            return;
+        }
+
+        // process any clipping regions
+        if let Some(region) = region {
+            for glyph in glyphs.iter_mut() {
+                glyph.scissor = region.into();
+            }
+        }
+
+        if glyphs.len() > self.max_glyphs {}
+    }
+
+    fn draw<'render>(&'render self, renderpass: &mut wgpu::RenderPass<'render>) {
+        renderpass.set_pipeline(&self.pipeline);
+        renderpass.set_bind_group(0, &self.uniforms, &[]);
+        renderpass.set_vertex_buffer(0, self.glyph_buffer.slice(..));
+        renderpass.draw(0..4, 0..self.current_glyphs as u32);
+    }
+
+    /// Helper function to generate the uniform layout for the Text renderer pipeline
+    fn uniform_layout(ctx: &Context) -> wgpu::BindGroupLayout {
+        ctx.device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gfx::Text uniforms layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                mem::size_of::<[f32; 16]>() as u64
+                            ),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler {
+                            filtering: true,
+                            comparison: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            })
+    }
+}
+
+struct Renderer<'ctx> {
+    ctx: &'ctx Context,
+    text: Text,
 }
 
 /// Called to begin a new frame to be drawn to
@@ -558,12 +921,16 @@ async fn initialize_gfx(window: &Window) -> Context {
 /// If the frame cannot be started (usually due to a failure to get the next frame from the
 /// swapchain). An error will be returned. Note that this should be handled gracefully, as
 /// framedrops will likely occur at some point
-pub fn begin_frame(context: &Context) -> anyhow::Result<(CommandEncoder, Frame)> {
+pub fn begin_frame(context: &Context) -> Result<(CommandEncoder, Frame)> {
     // Begin to draw the frame.
-    let data = context.swap_chain.get_current_frame()?;
+    let output = context.surface.get_current_texture()?;
 
     // start counting time the moment we have the frame
-    let frame_start = Instant::now();
+    let start_time = Instant::now();
+
+    let view = output
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
 
     let depth_view = context
         .depth_texture
@@ -578,8 +945,8 @@ pub fn begin_frame(context: &Context) -> anyhow::Result<(CommandEncoder, Frame)>
     Ok((
         encoder,
         Frame {
-            start_time: frame_start,
-            data,
+            start_time,
+            view,
             depth_view,
         },
     ))
@@ -595,7 +962,7 @@ pub fn begin_renderpass<'render>(
     let renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("Render pass"),
         color_attachments: &[wgpu::RenderPassColorAttachment {
-            view: frame.view(),
+            view: &frame.view,
             resolve_target: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -640,12 +1007,8 @@ pub fn end_renderpass(renderpass: wgpu::RenderPass) {
 
 pub fn end_frame(context: &mut Context, encoder: wgpu::CommandEncoder, frame: Frame) -> Duration {
     // Submit the commands.
-    context.staging_belt.finish();
     context.queue.submit(std::iter::once(encoder.finish()));
 
     // end frame draw
-    let belt_future = context.staging_belt.recall();
-    context.thread_spawner.spawn(belt_future).unwrap();
-
     Instant::now() - frame.start_time
 }

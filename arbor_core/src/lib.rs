@@ -8,18 +8,9 @@ use log::{debug, info, trace};
 use nanoserde::{DeJson, SerJson};
 use stack_str::StackStr;
 use std::num::ParseIntError;
-pub use std::{
-    borrow::Cow,
-    collections::{HashMap, VecDeque},
-    fmt,
-    io::Write,
-    ops::Range,
-    time::Instant,
-};
-use tree::{
-    event::{EdgeEdit, EdgeInsert, EdgeRemove, LinkMove, NodeEdit, NodeInsert, NodeRemove},
-    Tree,
-};
+use std::{collections::HashMap, fmt};
+use tree::event::{EdgeEdit, EdgeInsert, EdgeRemove, LinkMove, NodeEdit, NodeInsert, NodeRemove};
+pub use tree::Tree;
 
 // TODO: Minor Features
 // 1. More tests and benchmarks, focus on rebuild_tree
@@ -59,7 +50,7 @@ pub type NameString = StackStr<NAME_MAX_LEN>;
 //NOTE: currently unused because the treemodule does not use generics. This is due to a lack of
 //      generic support in nanoserde. Once nanoserde supports generics this will become
 //      Tree<Dialogue, Choice>
-type DialogueTree = tree::Tree;
+pub type DialogueTree = tree::Tree;
 
 /// Struct representing a section of text in a rope. This section contains a start and end index,
 /// stored in an array. The first element should always be smaller than the second. Additionally

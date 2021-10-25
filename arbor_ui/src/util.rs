@@ -1,4 +1,5 @@
-use arbor_core::{cmd, EditorState, Executable, KeyString, NameString, Position, Result};
+use arbor_core::{editor::Editor, EffectKind, ReqKind, Result};
+use eframe::egui::Pos2;
 use rand::Rng;
 
 static TEXT: &str = "
@@ -17,14 +18,16 @@ Duis dignissim dapibus lobortis. Vestibulum rutrum elit ac nulla porttitor, at i
 ";
 
 /// Helper function that creates a giant random tree, mainly going to be used for dev purposes
-pub fn lorem_ipsum(state: &mut EditorState, count: usize) -> Result<()> {
+pub fn lorem_ipsum(position_table: &mut Vec<Pos2>, count: usize) -> Result<Editor> {
     // spin up rng
     let mut rng = rand::thread_rng();
     // create new project
-    cmd::new::Project::new("lorem_ipsum".into(), true).execute(state)?;
+    let mut editor = Editor::new("lorem_ipsum", None)?;
+    // reset position table
+    position_table.clear();
 
-    let key = KeyString::from("author")?;
-    cmd::new::Name::new(key, NameString::from("Cicero")?).execute(state)?;
+    let key = "author";
+    editor.new_name(key, "Cicero")?;
 
     // create a ton of nodes
     for i in 0..count {
@@ -36,13 +39,14 @@ pub fn lorem_ipsum(state: &mut EditorState, count: usize) -> Result<()> {
         // bias so later nodes have generally higher valued positions
         let bias = i as f32 * 0.1;
 
-        let pos = Position::new(
+        let pos = Pos2::new(
             rng.gen_range(bias - 1.0..bias + 1.0),
             rng.gen_range(bias - 1.0..bias + 1.0),
         );
-        let idx = cmd::new::Node::new(key.to_string(), TEXT[text_start..text_end].to_string())
-            .execute(state)?;
-        state.active.tree.get_node_mut(idx)?.pos = pos;
+        let idx = editor.new_node(key, &TEXT[text_start..text_end]).unwrap();
+        // verify length of position_table
+        assert_eq!(position_table.len(), idx);
+        position_table.push(pos);
     }
 
     // create a ton of edges
@@ -55,15 +59,15 @@ pub fn lorem_ipsum(state: &mut EditorState, count: usize) -> Result<()> {
         let start = rng.gen_range(0..count);
         let end = rng.gen_range(start..count);
 
-        let _idx = cmd::new::Edge::new(
+        let _idx = editor.new_edge(
+            &TEXT[text_start..text_end],
             start,
             end,
-            TEXT[text_start..text_end].to_string(),
-            None,
-            None,
-        )
-        .execute(state)?;
+            ReqKind::No,
+            EffectKind::No,
+        );
     }
 
-    Ok(())
+    // return the editor for the ui to use
+    Ok(editor)
 }

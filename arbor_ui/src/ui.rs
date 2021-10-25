@@ -1,10 +1,12 @@
+use std::path;
+
 use super::util::lorem_ipsum;
-use arbor_core::{cmd, tree, DialogueTreeData, EditorState, Executable, KeyString, NameString};
+use arbor_core::editor::Editor;
+use arbor_core::{self, tree, EffectKind, ReqKind};
 use eframe::egui;
 use eframe::epi;
 use egui::emath::{Pos2, Rect, RectTransform};
 use egui::util::History;
-use serde::{Deserialize, Serialize};
 
 // constants for maximum width to show for text throughout UI
 const MAX_NAME_WIDTH: f32 = 128.0;
@@ -15,14 +17,12 @@ const MAX_TEXT_WIDTH: f32 = 512.0;
 const MAX_NAME_LEN: usize = 32;
 const MAX_TEXT_LEN: usize = 256;
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
 pub enum Selection {
     None,
     Node(tree::NodeIndex),
     Edge(tree::EdgeIndex),
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct ArborUi {
     painting: TreePainting,
     new_window: NewProjectWindow,
@@ -33,11 +33,16 @@ pub struct ArborUi {
     value_editor: ValueEditor,
     node_editor: NodeEditor,
     edge_editor: EdgeEditor,
-    state: arbor_core::EditorState,
     active_selection: Selection,
+    position_table: Vec<Pos2>,
+    arbor_editor: arbor_core::editor::Editor,
 }
 
 impl Default for ArborUi {
+    /// Default method for creating an arborUI at startup
+    ///
+    /// # Panic
+    /// If core arbor initialization fails
     fn default() -> Self {
         Self {
             painting: Default::default(),
@@ -49,8 +54,9 @@ impl Default for ArborUi {
             value_editor: Default::default(),
             node_editor: Default::default(),
             edge_editor: Default::default(),
-            state: EditorState::new(DialogueTreeData::default()),
             active_selection: Selection::None,
+            position_table: Vec::new(),
+            arbor_editor: Editor::new("template", None).unwrap(),
         }
     }
 }
@@ -72,7 +78,7 @@ impl epi::App for ArborUi {
         egui::Window::new("New Project")
             .open(&mut new_window_open)
             .show(ctx, |ui| {
-                self.new_window.ui_content(&mut self.state, ui);
+                self.new_window.ui_content(&mut self.arbor_editor, ui);
             });
         self.new_window.open &= new_window_open;
 
@@ -80,7 +86,8 @@ impl epi::App for ArborUi {
         egui::Window::new("Load Project")
             .open(&mut load_window_open)
             .show(ctx, |ui| {
-                self.load_window.ui_content(&mut self.state, ui);
+                self.load_window
+                    .ui_content(&mut self.arbor_editor, &mut self.position_table, ui);
             });
         self.load_window.open &= load_window_open;
 
@@ -88,7 +95,7 @@ impl epi::App for ArborUi {
         egui::Window::new("Rebuild Project")
             .open(&mut rebuild_window_open)
             .show(ctx, |ui| {
-                self.rebuild_window.ui_content(&mut self.state, ui);
+                self.rebuild_window.ui_content(&mut self.arbor_editor, ui);
             });
         self.rebuild_window.open &= rebuild_window_open;
 
@@ -113,7 +120,7 @@ impl epi::App for ArborUi {
                         self.load_window.open = true;
                     }
                     if ui.button("save").clicked() {
-                        let res = cmd::Save::new().execute(&mut self.state);
+                        let res = self.arbor_editor.save(None);
                         match res {
                             Ok(_) => {}
                             Err(e) => println!("{}", e),
@@ -133,14 +140,14 @@ impl epi::App for ArborUi {
                 egui::menu::menu(ui, "Edit", |ui| {
                     ui.separator();
                     if ui.button("undo").clicked() {
-                        let res = cmd::Undo::new().execute(&mut self.state);
+                        let res = self.arbor_editor.undo();
                         match res {
                             Ok(_) => {}
                             Err(e) => println!("{}", e),
                         }
                     }
                     if ui.button("redo").clicked() {
-                        let res = cmd::Redo::new().execute(&mut self.state);
+                        let res = self.arbor_editor.redo();
                         match res {
                             Ok(_) => {}
                             Err(e) => println!("{}", e),
@@ -151,9 +158,9 @@ impl epi::App for ArborUi {
                 egui::menu::menu(ui, "Test", |ui| {
                     ui.separator();
                     if ui.button("lorem ipsum").clicked() {
-                        let res = lorem_ipsum(&mut self.state, 100);
+                        let res = lorem_ipsum(&mut self.position_table, 100);
                         match res {
-                            Ok(_) => {}
+                            Ok(r) => self.arbor_editor = r,
                             Err(e) => println!("{}", e),
                         }
                     }
@@ -165,39 +172,40 @@ impl epi::App for ArborUi {
             egui::CollapsingHeader::new("Name Editor").show(ui, |ui| {
                 // left panel for editing tools on selected node
                 egui::ScrollArea::auto_sized().show(ui, |ui| {
-                    self.name_editor.ui_content(&mut self.state, ui);
+                    self.name_editor.ui_content(&mut self.arbor_editor, ui);
                 });
             });
 
             egui::CollapsingHeader::new("Value Editor").show(ui, |ui| {
                 // left panel for editing tools on selected node
                 egui::ScrollArea::auto_sized().show(ui, |ui| {
-                    self.value_editor.ui_content(&mut self.state, ui);
+                    self.value_editor.ui_content(&mut self.arbor_editor, ui);
                 });
             });
 
             egui::CollapsingHeader::new("Node Editor").show(ui, |ui| {
                 // left panel for editing tools on selected node
                 egui::ScrollArea::auto_sized().show(ui, |ui| {
-                    self.node_editor.ui_content(&mut self.state, ui);
+                    self.node_editor.ui_content(&mut self.arbor_editor, ui);
                 });
             });
 
             egui::CollapsingHeader::new("Edge Editor").show(ui, |ui| {
                 egui::ScrollArea::auto_sized().show(ui, |ui| {
-                    self.edge_editor.ui_content(&mut self.state, ui);
+                    self.edge_editor.ui_content(&mut self.arbor_editor, ui);
                 });
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(self.state.active.name.clone());
+            ui.heading(&self.arbor_editor.arbor.name);
             self.painting.ui_control(ui);
             egui::Frame::dark_canvas(ui.style()).show(ui, |ui| {
-                self.active_selection = self.painting.ui_content(
-                    &mut self.state.active,
-                    &mut self.state.history,
-                    self.active_selection,
+                self.painting.ui_content(
+                    &mut self.arbor_editor.arbor,
+                    &mut self.position_table,
+                    &mut self.arbor_editor.history,
+                    &mut self.active_selection,
                     ui,
                 );
             });
@@ -206,7 +214,6 @@ impl epi::App for ArborUi {
 }
 
 /// Window for loading a project
-#[derive(Serialize, Deserialize)]
 pub struct LoadWindow {
     name_buf: String,
     open: bool,
@@ -226,7 +233,12 @@ impl Default for LoadWindow {
 impl LoadWindow {
     /// Content for Load Project window. Returns flag if a new project has been loaded into the
     /// editor state by arbor_core
-    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) {
+    pub fn ui_content(
+        &mut self,
+        editor: &mut Editor,
+        position_table: &mut Vec<Pos2>,
+        ui: &mut egui::Ui,
+    ) {
         ui.label("project name");
         ui.add(
             egui::TextEdit::singleline(&mut self.name_buf)
@@ -235,43 +247,38 @@ impl LoadWindow {
         );
         ui.separator();
         if ui.button("load project").clicked() {
-            let res = arbor_core::cmd::Load::new(self.name_buf.drain(..).collect()).execute(state);
+            let res = Editor::load(path::Path::new(&self.name_buf));
             match res {
                 Ok(_) => {
                     // if ok, close the load project window
                     self.open = false;
-                    // Check if tree has many default positions, if so, give the user a warning
-                    let zeroed_count = state.active.tree.nodes().iter().fold(0, |sum, n| {
-                        sum + (n.pos.x == 0.0 && n.pos.y == 0.0) as usize
-                    });
-                    // NOTE: Right now show the warning if more than 1 node is at zero, maybe
-                    // increase this threshold if using a really large tree?
-                    if zeroed_count > 1 {
-                        let mut temp_bool = self.was_none;
-                        egui::Window::new("Warning")
-                            .open(&mut temp_bool)
-                            .show(ui.ctx(), |ui| {
-                                ui.label(
-                                    concat!(
+
+                    // TODO: actually store the position list in the filesystem and load it too
+                    // displaying warning about placement as a result
+                    *position_table = vec![Pos2::default(); editor.arbor.tree.nodes().len()];
+                    let mut temp_bool = self.was_none;
+                    egui::Window::new("Warning")
+                        .open(&mut temp_bool)
+                        .show(ui.ctx(), |ui| {
+                            ui.label(
+                                concat!(
             "The loaded tree did not contain preset positions for visualizing the dialogue tree.\r\n",
             "This is likely because the dialogue tree was created outside the UI editor.\r\n",
             "All nodes with no position information have been set to a default position and will\r\n",
             "need to be manually arranged."
                                 ));
                             });
-                        self.was_none = temp_bool;
-                    }
+                    self.was_none = temp_bool;
                 }
                 Err(e) => {
                     println!("{}", e);
                 }
-            }
+            };
         }
     }
 }
 
 /// Window for creating a new project
-#[derive(Serialize, Deserialize)]
 pub struct NewProjectWindow {
     name_buf: String,
     open: bool,
@@ -291,7 +298,7 @@ impl Default for NewProjectWindow {
 impl NewProjectWindow {
     /// Content for New Project Window. Returns if flag if a new project has been loaded into the
     /// editor state by arbor_core
-    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) {
+    pub fn ui_content(&mut self, editor: &mut Editor, ui: &mut egui::Ui) {
         ui.label("new project name");
         ui.add(
             egui::TextEdit::singleline(&mut self.name_buf)
@@ -305,14 +312,13 @@ impl NewProjectWindow {
         );
         ui.separator();
         if ui.button("create new project").clicked() {
-            let res = arbor_core::cmd::new::Project::new(
-                self.name_buf.drain(..).collect(),
-                self.set_active,
-            )
-            .execute(state);
+            let res = Editor::new(&self.name_buf, None);
             match res {
                 // if result, new project was created and we can close the window
-                Ok(_) => self.open = false,
+                Ok(r) => {
+                    self.open = false;
+                    *editor = r;
+                }
                 // if error, a new project isn't present yet, don't close yet
                 Err(e) => {
                     println!("{}", e);
@@ -325,7 +331,6 @@ impl NewProjectWindow {
 /// Window for Rebuilding the current tree
 ///
 /// Cleans up unused text, reorders nodes and edges for optimal access
-#[derive(Serialize, Deserialize)]
 pub struct RebuildWindow {
     open: bool,
 }
@@ -339,14 +344,14 @@ impl Default for RebuildWindow {
 impl RebuildWindow {
     /// Content for New Project Window. Returns if flag if a new project has been loaded into the
     /// editor state by arbor_core
-    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) {
+    pub fn ui_content(&mut self, editor: &mut Editor, ui: &mut egui::Ui) {
         ui.label(concat!(
             "This recreates the current dialogue tree, removing unused text and reordering nodes",
             "and edges for optimal access. Rebuilding the tree clears the entire undo/redo history"
         ));
         ui.separator();
         if ui.button("rebuild current project").clicked() {
-            let res = arbor_core::cmd::Rebuild::new().execute(state);
+            let res = editor.rebuild();
             match res {
                 Ok(_) => self.open = false,
                 Err(e) => {
@@ -358,7 +363,6 @@ impl RebuildWindow {
 }
 
 /// Struct for editing names
-#[derive(Serialize, Deserialize)]
 pub struct NameEditor {
     key_buf: String,
     text_buf: String,
@@ -374,7 +378,7 @@ impl Default for NameEditor {
 }
 
 impl NameEditor {
-    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) -> egui::Response {
+    pub fn ui_content(&mut self, editor: &mut Editor, ui: &mut egui::Ui) -> egui::Response {
         ui.vertical(|ui| {
             ui.label("key");
             ui.add(
@@ -392,12 +396,7 @@ impl NameEditor {
             ui.separator();
 
             if ui.button("new name").clicked() {
-                let res = cmd::new::Name::new(
-                    // FIXME: proper error handling for if keystring/namestring are too long
-                    KeyString::from(self.key_buf.as_str()).unwrap_or_default(),
-                    NameString::from(self.text_buf.as_str()).unwrap_or_default(),
-                )
-                .execute(state);
+                let res = editor.new_name(&self.key_buf, &self.text_buf);
                 match res {
                     Ok(_) => {
                         // clear buffers if everything worked ok
@@ -412,7 +411,6 @@ impl NameEditor {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct ValueEditor {
     key_buf: String,
     value: u32,
@@ -428,7 +426,7 @@ impl Default for ValueEditor {
 }
 
 impl ValueEditor {
-    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) -> egui::Response {
+    pub fn ui_content(&mut self, editor: &mut Editor, ui: &mut egui::Ui) -> egui::Response {
         ui.vertical(|ui| {
             ui.label("key");
             ui.add(
@@ -442,11 +440,7 @@ impl ValueEditor {
             ui.separator();
 
             if ui.button("new value").clicked() {
-                let res = cmd::new::Val::new(
-                    KeyString::from(self.key_buf.as_str()).unwrap_or_default(),
-                    self.value,
-                )
-                .execute(state);
+                let res = editor.new_val(&self.key_buf, self.value);
                 match res {
                     Ok(_) => {
                         // clear buffers if everything worked ok
@@ -461,7 +455,6 @@ impl ValueEditor {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct NodeEditor {
     name_buf: String,
     text_buf: String,
@@ -477,21 +470,21 @@ impl Default for NodeEditor {
 }
 
 impl NodeEditor {
-    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) -> egui::Response {
+    pub fn ui_content(&mut self, editor: &mut Editor, ui: &mut egui::Ui) -> egui::Response {
         ui.vertical(|ui| {
             ui.label("name");
             egui::ComboBox::from_label(
-                state // display the selected key's name value
-                    .active
+                editor // display the selected key's name value
+                    .arbor
                     .name_table
-                    .get(self.name_buf.as_str())
-                    .unwrap_or(&arbor_core::NameString::new())
+                    .get(&self.name_buf)
+                    .unwrap_or(&String::default())
                     .to_string(),
             )
             .selected_text(self.name_buf.clone())
             .show_ui(ui, |ui| {
                 // Name must be in key form when selecting,
-                for name in state.active.name_table.keys() {
+                for name in editor.arbor.name_table.keys() {
                     ui.selectable_value(&mut self.name_buf, name.to_string(), name.as_str());
                 }
             });
@@ -506,15 +499,12 @@ impl NodeEditor {
             ui.separator();
 
             if ui.button("new node").clicked() {
-                let res = cmd::new::Node::new(
-                    self.name_buf.drain(..).collect(),
-                    self.text_buf.drain(..).collect(),
-                )
-                .execute(state);
+                let res = editor.new_node(&self.name_buf, &self.text_buf);
                 match res {
                     Ok(node_index) => {
-                        state.active.tree.nodes_mut()[node_index].pos =
-                            arbor_core::Position::new(0.3, 0.3)
+                        // clear buffers if successful
+                        self.name_buf.clear();
+                        self.text_buf.clear();
                     }
                     Err(e) => println!("{}", e),
                 }
@@ -524,7 +514,6 @@ impl NodeEditor {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct EdgeEditor {
     source_node: usize,
     target_node: usize,
@@ -542,7 +531,7 @@ impl Default for EdgeEditor {
 }
 
 impl EdgeEditor {
-    pub fn ui_content(&mut self, state: &mut EditorState, ui: &mut egui::Ui) -> egui::Response {
+    pub fn ui_content(&mut self, editor: &mut Editor, ui: &mut egui::Ui) -> egui::Response {
         ui.vertical(|ui| {
             ui.label("source node");
             ui.add(egui::DragValue::new(&mut self.source_node));
@@ -560,14 +549,13 @@ impl EdgeEditor {
             ui.separator();
 
             if ui.button("new edge").clicked() {
-                let res = cmd::new::Edge::new(
+                let res = editor.new_edge(
+                    &self.text_buf,
                     self.source_node,
                     self.target_node,
-                    self.text_buf.drain(..).collect(),
-                    None,
-                    None,
-                )
-                .execute(state);
+                    ReqKind::No,
+                    EffectKind::No,
+                );
                 match res {
                     Ok(_) => println!("successfully added edge"),
                     Err(e) => println!("{}", e),
@@ -578,7 +566,6 @@ impl EdgeEditor {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct TreePainting {
     pub stroke: egui::Color32,
     pub fill: egui::Color32,
@@ -595,7 +582,7 @@ pub struct TreePainting {
     pub origin: egui::Pos2,
     /// temporary storage of the position of a node being dragged. Used to add a click-and-drag
     /// event to the undo/redo history
-    node_drag_pos: arbor_core::Position,
+    node_drag_pos: Pos2,
 }
 
 impl Default for TreePainting {
@@ -611,7 +598,7 @@ impl Default for TreePainting {
             pan: egui::pos2(0.0, 0.0),
             pan_start: egui::pos2(0.0, 0.0),
             origin: egui::pos2(0.0, 0.0),
-            node_drag_pos: arbor_core::Position::default(),
+            node_drag_pos: Pos2::default(),
         }
     }
 }
@@ -654,11 +641,12 @@ impl TreePainting {
     /// or completed events
     pub fn ui_content(
         &mut self,
-        data: &mut arbor_core::DialogueTreeData,
-        history: &mut arbor_core::DialogueTreeHistory,
-        mut active_selection: Selection,
+        arbor: &arbor_core::Arbor,
+        position_table: &mut Vec<Pos2>,
+        _history: &mut arbor_core::History,
+        active_selection: &mut Selection,
         ui: &mut egui::Ui,
-    ) -> Selection {
+    ) {
         // get an area to paint to
         let (response, painter) =
             ui.allocate_painter(ui.available_size_before_wrap_finite(), egui::Sense::hover());
@@ -672,15 +660,16 @@ impl TreePainting {
         let from_screen = to_screen.inverse();
 
         // draw edges first, since they need to be behind nodes
-        for (edge_index, choice) in data.tree.edges().iter().enumerate() {
-            let slice = &data.text[choice.section[0]..choice.section[1]];
-            let _res = cmd::util::parse_edge(slice, &data.name_table, &mut self.hover_text_buf);
+        for (edge_index, choice) in arbor.tree.edges().iter().enumerate() {
+            let slice = &arbor.text[choice.section[0]..choice.section[1]];
+            let _res =
+                arbor_core::util::parse_edge(slice, &arbor.name_table, &mut self.hover_text_buf);
 
-            let source_node_index = data.tree.source_of(edge_index).unwrap();
-            let target_node_index = data.tree.target_of(edge_index).unwrap();
+            let source_node_index = arbor.tree.source_of(edge_index).unwrap();
+            let target_node_index = arbor.tree.target_of(edge_index).unwrap();
 
-            let source_pos = data.tree.get_node(source_node_index).unwrap().pos;
-            let target_pos = data.tree.get_node(target_node_index).unwrap().pos;
+            let source_pos = position_table.get(source_node_index).unwrap();
+            let target_pos = position_table.get(source_node_index).unwrap();
 
             let source_coord = to_screen * self.transform(egui::pos2(source_pos.x, source_pos.y));
             let target_coord = to_screen * self.transform(egui::pos2(target_pos.x, target_pos.y));
@@ -700,7 +689,7 @@ impl TreePainting {
             );
             // select edge if the text pop-up is clicked
             if resp.interact_pointer_pos().is_some() {
-                active_selection = Selection::Edge(edge_index);
+                *active_selection = Selection::Edge(edge_index);
             }
 
             // paint popup with edge text if conditions are met
@@ -715,7 +704,7 @@ impl TreePainting {
             // change edge color if this edge is the actively selected thing
             let edge_color = match active_selection {
                 Selection::Edge(e) => {
-                    if e == edge_index {
+                    if *e == edge_index {
                         self.select_color
                     } else {
                         self.stroke
@@ -743,8 +732,8 @@ impl TreePainting {
         }
 
         // loop over the nodes, draw them, and update their location if being dragged
-        for (i, n) in data.tree.nodes_mut().iter_mut().enumerate() {
-            let pos = n.pos;
+        for (i, n) in arbor.tree.nodes().iter().enumerate() {
+            let pos = position_table.get_mut(i).unwrap();
 
             let p = egui::pos2(pos.x, pos.y);
             let coord = to_screen * self.transform(p);
@@ -755,10 +744,10 @@ impl TreePainting {
                 egui::Id::new(i).with("__node_index"),
                 egui::Sense::click_and_drag(),
             );
-            let node_slice = &data.text[n.section[0]..n.section[1]];
-            let _res = cmd::util::parse_node(
+            let node_slice = &arbor.text[n.section[0]..n.section[1]];
+            let _res = arbor_core::util::parse_node(
                 node_slice,
-                &data.name_table,
+                &arbor.name_table,
                 &mut self.hover_name_buf,
                 &mut self.hover_text_buf,
             );
@@ -767,34 +756,27 @@ impl TreePainting {
             if let Some(pointer_pos) = resp.interact_pointer_pos() {
                 let new_pos = self.reform(from_screen * pointer_pos);
                 // bypass normal cmd interface here to avoid spamming event history during a drag
-                n.pos = arbor_core::Position::new(new_pos.x, new_pos.y);
-                active_selection = Selection::Node(i);
+                *pos = Pos2::new(new_pos.x, new_pos.y);
+                *active_selection = Selection::Node(i);
             }
 
             // save initial position of a node when starting the drag, used below when qualifying
             // the node movement in the undo/redo history
             if resp.drag_started() {
-                self.node_drag_pos = n.pos;
+                self.node_drag_pos = *pos;
             }
 
             // qualify node movement in event history after drag release
             if resp.drag_released() {
                 let mut old_pos_node = *n;
-                old_pos_node.pos = self.node_drag_pos;
-                history.push(
-                    arbor_core::tree::event::NodeEdit {
-                        index: i,
-                        from: old_pos_node,
-                        to: *n,
-                    }
-                    .into(),
-                );
+                *pos = self.node_drag_pos;
+                // TODO: undo/redo not supported for node movements
             }
 
             // get custom fill color for active selection
             let fill_color = match active_selection {
                 Selection::Node(n) => {
-                    if n == i {
+                    if *n == i {
                         self.select_color
                     } else {
                         self.fill
@@ -838,11 +820,8 @@ impl TreePainting {
 
         // clear selection if a click occured that didn't hit a node/edge up above
         if pan_response.clicked() {
-            active_selection = Selection::None;
+            *active_selection = Selection::None;
         }
-
-        // return active selection to rest of the UI
-        active_selection
     }
 
     fn edge_text_popup(
@@ -1053,19 +1032,15 @@ impl Default for RunMode {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 struct BackendPanel {
     pub open: bool,
 
-    #[serde(skip)]
     // go back to `Reactive` mode each time we start
     run_mode: RunMode,
 
-    #[serde(skip)]
     /// current slider value for current gui scale
     pixels_per_point: Option<f32>,
 
-    #[serde(skip)]
     frame_history: FrameHistory,
 }
 

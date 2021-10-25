@@ -56,6 +56,12 @@ pub mod styles {
         size: 64.0,
         align: Align::Center,
     };
+    pub const BUTTON: Style = Style {
+        font: Font::LoraRegular,
+        color: [0.2, 0.2, 0.2, 1.0],
+        size: 64.0,
+        align: Align::Center,
+    };
 }
 
 /// StyleData for text types. Contains all information needed by other modules to render text
@@ -222,9 +228,8 @@ impl Renderer {
         self.glyph_brush
             .draw_queued(
                 &context.device,
-                &mut context.staging_belt,
                 encoder,
-                frame.view(),
+                &frame.view,
                 wgpu::RenderPassDepthStencilAttachment {
                     view: &frame.depth_view,
                     depth_ops: Some(wgpu::Operations {

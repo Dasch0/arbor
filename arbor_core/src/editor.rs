@@ -17,11 +17,11 @@ use std::str::FromStr;
 /// manner
 #[derive(Debug)]
 pub struct Editor {
-    arbor: Arbor,
-    backup: Arbor,
-    history: History,
-    path_buf: path::PathBuf,
-    serial_buf: String,
+    pub arbor: Arbor,
+    pub backup: Arbor,
+    pub history: History,
+    pub path_buf: path::PathBuf,
+    pub serial_buf: String,
 }
 
 impl Editor {
