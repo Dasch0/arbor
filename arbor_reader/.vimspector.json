@@ -4,7 +4,7 @@
       "adapter": "CodeLLDB",
       "configuration": {
         "request": "launch",
-        "program": "${workspaceRoot}/../target/debug/arbor_ui"
+        "program": "${workspaceRoot}/../target/debug/arbor_reader"
       }
     }
   }

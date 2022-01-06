@@ -1,12 +1,11 @@
-/// Utilizes wgpu_glyph to render text and provides font and style information
+/// Data and methods for text, font and style information
 ///
-use crate::gfx::{self, Point, OUTPUT_FORMAT};
+/// Uses `glyph_brush` to generate drawable glyphs
+use crate::gfx::{self, Point};
 use crate::ui::Rect;
-use crate::window;
+pub use glyph_brush::GlyphBrush;
+use glyph_brush::{ab_glyph, GlyphBrushBuilder, GlyphCruncher, Section, Text};
 use log::warn;
-use wgpu::DepthStencilState;
-pub use wgpu_glyph::GlyphBrush;
-use wgpu_glyph::{ab_glyph, GlyphBrushBuilder, GlyphCruncher, Section, Text};
 
 /// Enum for all supported fonts, used as an index into the [TextRenderer]'s [glyph_brush]
 pub enum Font {
@@ -29,36 +28,42 @@ pub mod styles {
     pub const TITLE: Style = Style {
         font: Font::LoraRegular,
         color: [0.3, 0.0, 0.0, 1.0],
+        background: [0.0, 0.0, 0.0, 0.0],
         size: 128.0,
         align: Align::Center,
     };
     pub const SUBTITLE: Style = Style {
         font: Font::LoraRegular,
         color: [0.8, 0.8, 0.8, 1.0],
+        background: [0.0, 0.0, 0.0, 0.0],
         size: 36.0,
         align: Align::Center,
     };
     pub const DIALOGUE: Style = Style {
         font: Font::LoraRegular,
         color: [0.8, 0.8, 0.8, 1.0],
+        background: [0.2, 0.2, 0.2, 0.8],
         size: 36.0,
         align: Align::Left,
     };
     pub const METRIC: Style = Style {
         font: Font::LoraRegular,
         color: [0.8, 0.8, 0.8, 1.0],
+        background: [0.0, 0.0, 0.0, 0.0],
         size: 24.0,
         align: Align::Left,
     };
     pub const MENU: Style = Style {
         font: Font::LoraRegular,
         color: [0.2, 0.2, 0.2, 1.0],
+        background: [0.0, 0.0, 0.0, 0.0],
         size: 64.0,
         align: Align::Center,
     };
     pub const BUTTON: Style = Style {
         font: Font::LoraRegular,
         color: [0.2, 0.2, 0.2, 1.0],
+        background: [0.0, 0.0, 0.0, 0.0],
         size: 64.0,
         align: Align::Center,
     };
@@ -70,6 +75,8 @@ pub struct Style {
     pub font: Font,
     /// color of the text, stored in RGBA format
     pub color: [f32; 4],
+    /// color of background elements, stored in RGBA format. Set alpha = 0 for no background
+    pub background: [f32; 4],
     /// Size of the text. This is an arbitrary/relative value, as the actual drawn size will
     /// depend on the scaling factor during rendering
     pub size: f32,
@@ -88,20 +95,24 @@ impl Style {
     }
 }
 
-/// Stores data needed to render text
-pub struct Renderer {
+/// Top level structure for writing text with layout and styles. Currently uses
+/// `glyph_brush` behind the scenes to create drawable glyphs for rendering
+// FIXME: currently using glyph_brush with immediate mode style drawing results in lots
+// of per frame allocations. This is extremely slow and must be improved in the future. In the
+// future, drop down to ab_glyph, implement own texture cache and layout
+pub struct Writer {
     /// glyph_brush storing all initialized font data
-    glyph_brush: GlyphBrush<DepthStencilState>,
+    pub glyph_brush: GlyphBrush<gfx::GlyphVertex>,
 }
 
-impl Renderer {
+impl Writer {
     /// Initialize resources to render text. Returns a [GlyphBrush] that may be used by [draw_text]
     ///
     /// Scans the provided path and adds all found font files to the GlyphBrush
     ///
     /// # Panics
     /// If the passed slice isn't a valid font binary
-    pub fn new(context: &gfx::Context) -> Renderer {
+    pub fn new() -> Writer {
         // Load all the fonts into a vec
         //
         // Implementation note:
@@ -113,20 +124,12 @@ impl Renderer {
             .map(|f| ab_glyph::FontArc::try_from_slice(f).expect("font loading failed"))
             .collect();
 
-        let glyph_brush = GlyphBrushBuilder::using_fonts(fonts)
-            .depth_stencil_state(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Greater,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            })
-            .build(&context.device, OUTPUT_FORMAT);
-        Renderer { glyph_brush }
+        let glyph_brush = GlyphBrushBuilder::using_fonts(fonts).build();
+        Writer { glyph_brush }
     }
 
     /// Enqueues text to be drawn by a subsequent call to [draw]
-    /// Position is (x, y, z) in winit screen coordinates
+    /// Position is (x, y, z) in screen coordinates
     ///
     /// Returns a bounding rect of the text if successfully created
     pub fn enqueue(&mut self, style: Style, position: Point, text: &str) -> Rect {
@@ -214,37 +217,6 @@ impl Renderer {
 
         self.glyph_brush.queue(section.clone());
         self.glyph_brush.glyph_bounds(section).unwrap().into()
-    }
-
-    /// Draw all text that was queued up
-    pub fn draw(
-        &mut self,
-        context: &mut gfx::Context,
-        encoder: &mut gfx::CommandEncoder,
-        size: window::Size,
-        frame: &gfx::Frame,
-    ) {
-        // Draw all the text!
-        self.glyph_brush
-            .draw_queued(
-                &context.device,
-                encoder,
-                &frame.view,
-                wgpu::RenderPassDepthStencilAttachment {
-                    view: &frame.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(-1.0),
-                        store: true,
-                    }),
-                    stencil_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0),
-                        store: true,
-                    }),
-                },
-                size.width,
-                size.height,
-            )
-            .expect("Draw queued");
     }
 }
 

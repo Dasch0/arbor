@@ -1,6 +1,5 @@
-use wgpu_glyph::ab_glyph;
-
 use crate::{gfx, window};
+use glyph_brush::ab_glyph;
 
 /// Screen Coordinates:
 /// x1y1 -------- x2y1
@@ -44,26 +43,6 @@ impl Rect {
     /// Create a new rect from raw coordinates
     pub fn from_coords(x1: f64, x2: f64, y1: f64, y2: f64) -> Self {
         Self { x1, x2, y1, y2 }
-    }
-
-    /// Create a [Quad] matching the bounds of a [Rect]. Requires knowing the current screen width
-    /// and height to accurately create the [Quad]
-    pub fn to_quad(&self, context: &gfx::Context, size: window::Size) -> gfx::Quad {
-        let center = window::Position::new(size.width as f64 / 2.0, size.height as f64 / 2.0);
-
-        // get normalized coordinates for quad, downcast to f32 for compatibility with GPU format
-        let x1_normalized: f32 = ((self.x1 - center.x) / center.x) as f32;
-        let x2_normalized: f32 = ((self.x2 - center.x) / center.x) as f32;
-        let y1_normalized: f32 = ((self.y1 - center.y) / center.y) as f32;
-        let y2_normalized: f32 = ((self.y2 - center.y) / center.y) as f32;
-
-        gfx::Quad::from_coords(
-            context,
-            x1_normalized,
-            x2_normalized,
-            y1_normalized,
-            y2_normalized,
-        )
     }
 
     /// Convenience method to check if the cursor is hovering over the rect this frame
