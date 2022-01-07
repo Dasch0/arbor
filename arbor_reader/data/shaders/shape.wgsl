@@ -14,7 +14,7 @@ fn vs_main(
     [[location(0)]] position: vec4<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.position = position;
+    out.position = pc.transform * position;
     return out;
 }
 

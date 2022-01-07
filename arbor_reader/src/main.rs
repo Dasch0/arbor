@@ -262,9 +262,10 @@ fn main() {
             gfx::end_renderpass(renderpass);
             let default_command_buffer = default_encoder.finish();
 
-            //let glyph_command_buffer = renderer.render_glyphs(&mut txt.glyph_brush, None, &frame, &ctx);
+            let glyph_command_buffer =
+                renderer.render_glyphs(&mut txt.glyph_brush, None, &frame, &ctx);
 
-            let command_buffers = [default_command_buffer]; //, glyph_command_buffer];
+            let command_buffers = [default_command_buffer, glyph_command_buffer]; //, glyph_command_buffer];
             last_frame_duration = gfx::end_frame(command_buffers, frame, &mut ctx);
 
             stdout.flush().unwrap();
@@ -297,19 +298,17 @@ pub fn draw_title_menu<'r, 'rpass>(
     renderer.draw_quad(renderpass, ctx);
     renderer.draw_triangle(renderpass, ctx);
 
-    // FIXME: ugly
-    States::TitleScreen
-    //if new.clicked(&ws.input) {
-    //    States::EditorStart
-    //} else if load.clicked(&ws.input) {
-    //    States::Load
-    //} else if options.clicked(&ws.input) {
-    //    States::Options
-    //} else if quit.clicked(&ws.input) {
-    //    States::Quit
-    //} else {
-    //    States::TitleScreen
-    //}
+    if new.clicked(&ws.input) {
+        States::EditorStart
+    } else if load.clicked(&ws.input) {
+        States::Load
+    } else if options.clicked(&ws.input) {
+        States::Options
+    } else if quit.clicked(&ws.input) {
+        States::Quit
+    } else {
+        States::TitleScreen
+    }
 }
 
 // TODO: Create metrics struct

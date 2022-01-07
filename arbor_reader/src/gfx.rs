@@ -1,6 +1,8 @@
 use crate::window;
 use bytemuck::{Pod, Zeroable};
+use std::any::type_name;
 use std::borrow::{self, Borrow, Cow};
+use std::marker::PhantomData;
 use std::ops::{self, Add, AddAssign, Mul, Sub, SubAssign};
 use std::time::{Duration, Instant};
 use std::{file, fmt, mem};
@@ -21,7 +23,7 @@ pub const INDEX_FORMAT: wgpu::IndexFormat = wgpu::IndexFormat::Uint32;
 /// Default depth format for renderer
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Default present mode for renderer
-pub const PRESENT_MODE: wgpu::PresentMode = wgpu::PresentMode::Mailbox;
+pub const PRESENT_MODE: wgpu::PresentMode = wgpu::PresentMode::Immediate;
 
 /// Identity transform matrix
 #[rustfmt::skip]
@@ -34,12 +36,12 @@ pub const IDENTITY_MATRIX: [f32; 16] = [
 
 /// Helper function to generate a generate a transform matrix.
 #[rustfmt::skip]
-pub fn orthographic_projection(width: u32, height: u32) -> [f32; 16] {
+pub fn ortho_transform_builder(zoom: f32, offset_x: f32, offset_y: f32, screen_width: u32, screen_height: u32) -> [f32; 16] {
     [
-        2.0 / width as f32, 0.0, 0.0, 0.0,
-        0.0, -2.0 / height as f32, 0.0, 0.0,
+        zoom / screen_width as f32, 0.0, 0.0, 0.0,
+        0.0, -zoom / screen_height as f32, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0,
-        -1.0, 1.0, 0.0, 1.0,
+        -1.0 + offset_x, 1.0 + offset_y, 0.0, 1.0,
     ]
 }
 
@@ -69,7 +71,7 @@ impl TexturedVertex {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
 /// Simple vertex primitive type for gfx
 pub struct Vertex {
     pub pos: [f32; 4],
@@ -112,7 +114,7 @@ impl From<[f32; 4]> for Color {
 }
 
 /// Index primitive type for gfx
-type Index = u16;
+type Index = u32;
 
 /// A 2d region of the screen, generally used for scissoring the render target
 #[repr(C)]
@@ -391,49 +393,60 @@ impl Texture {
     }
 }
 
-/// A GPU buffer with info on the offsets of different entries in the buffer
+/// A GPU buffer with info on the offsets of different entries in the buffer. Provide the type of
+/// data stored in the buffer as the generic param. This allows for correct offset calculation
 ///
 /// Useful for unified vertex/index/uniform buffers
-pub struct OffsetBuffer {
+pub struct OffsetBuffer<T: Pod> {
     /// buffer size in bytes
     pub size: u64,
-    pub buffer: wgpu::Buffer,
+    buffer: wgpu::Buffer,
     offset_table: Vec<u64>,
+    data_type: PhantomData<T>,
 }
 
-impl OffsetBuffer {
+impl<T: Pod> OffsetBuffer<T> {
     pub fn new(size: u64, usage: wgpu::BufferUsages, ctx: &Context) -> Self {
         // Create GPU resources
         let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("OffsetBuffer"),
+            label: Some(type_name::<Self>()),
             size,
             usage,
             mapped_at_creation: false,
         });
 
-        // assume max offsets unlikely to exceed buffer size in floats
+        // Can assume max offsets unlikely to exceed buffer size in floats
         let offsets = Vec::with_capacity((size / 4) as usize);
 
         Self {
             size,
             buffer,
             offset_table: offsets,
+            data_type: PhantomData::default(),
         }
     }
 
-    /// Push a new element to the end of the buffer. The slice must be sized to be aligned aligned
+    /// Push a new element to the end of the buffer. The slice must be sized to be aligned
     /// with [wgpu::COPY_BUFFER_ALIGNMENT]
     ///
     /// returns the ID of the newly added item
-    pub fn push(&mut self, data: &[u8], ctx: &Context) -> Result<usize> {
+    pub fn push(&mut self, data: &[T], ctx: &Context) -> Result<usize> {
+        let data_bytes: &[u8] = bytemuck::cast_slice(data);
         // early return if data is not aligned properly
-        if data.len() as u64 % wgpu::COPY_BUFFER_ALIGNMENT != 0 {
+        if data_bytes.len() as u64 % wgpu::COPY_BUFFER_ALIGNMENT != 0 {
             return Err(Error::Alignment);
         }
 
         let current_offset = *self.offset_table.last().unwrap_or(&0);
-        ctx.queue.write_buffer(&self.buffer, current_offset, data);
-        let new_offset = current_offset + data.len() as u64;
+        debug!(
+            "pushing {} bytes to buffer {:?} with offset {}",
+            data_bytes.len(),
+            self.buffer,
+            current_offset
+        );
+        ctx.queue
+            .write_buffer(&self.buffer, current_offset, data_bytes);
+        let new_offset = current_offset + data_bytes.len() as u64;
 
         self.offset_table.push(new_offset);
         Ok(self.offset_table.len())
@@ -459,11 +472,11 @@ impl OffsetBuffer {
         Ok(slice)
     }
 
-    /// get the [std::ops::Range] of of an entry in the offset buffer
+    /// get the [std::ops::Range] of the raw bytes of an entry in the offset buffer.
     ///
     /// # Error
     /// if the provided ID is invalid or out of range
-    pub fn get_range<'buf>(&'buf self, id: usize) -> Result<ops::Range<u32>> {
+    pub fn get_byte_range<'buf>(&'buf self, id: usize) -> Result<ops::Range<u32>> {
         if id >= self.offset_table.len() {
             return Err(Error::InvalidOffsetBufferEntry);
         }
@@ -474,6 +487,32 @@ impl OffsetBuffer {
             None => 0,
         } as u32;
         let end = self.offset_table[id] as u32;
+
+        Ok(start..end)
+    }
+
+    /// get the [std::ops::Range] of a data entry in the offset buffer. This range is based on the
+    /// type supplied to the [OffsetBuffer] at creation.
+    ///
+    /// # Error
+    /// if the provided ID is invalid or out of range
+    pub fn get_range<'buf>(&'buf self, id: usize) -> Result<ops::Range<u32>> {
+        if id >= self.offset_table.len() {
+            return Err(Error::InvalidOffsetBufferEntry);
+        }
+
+        trace!(
+            "getting range of type: {} type size reported as: {}",
+            type_name::<T>(),
+            mem::size_of::<T>()
+        );
+
+        let last_index = id.checked_sub(1);
+        let start = (match last_index {
+            Some(i) => self.offset_table[i],
+            None => 0,
+        } / mem::size_of::<T>() as u64) as u32;
+        let end = (self.offset_table[id] / mem::size_of::<T>() as u64) as u32;
 
         Ok(start..end)
     }
@@ -824,7 +863,9 @@ impl GlyphRenderer {
         ctx.queue.write_buffer(
             &self.transform,
             0,
-            bytemuck::cast_slice(&orthographic_projection(ctx.width, ctx.height)),
+            bytemuck::cast_slice(&ortho_transform_builder(
+                2.0, 0.0, 0.0, ctx.width, ctx.height,
+            )),
         );
 
         // check if any glyph changes occurred
@@ -1024,8 +1065,8 @@ struct ShapeRendererPushConstant {
 /// Data needed to render untextured shapes with simple geometries.
 pub struct ShapeRenderer {
     pipeline: wgpu::RenderPipeline,
-    vertex_buffer: OffsetBuffer,
-    index_buffer: OffsetBuffer,
+    vertex_buffer: OffsetBuffer<Vertex>,
+    index_buffer: OffsetBuffer<Index>,
 }
 
 impl ShapeRenderer {
@@ -1166,8 +1207,9 @@ impl ShapeRenderer {
 
         let vertex_range = self.vertex_buffer.get_range(shape_id)?;
         let index_range = self.index_buffer.get_range(shape_id)?;
+
         //TODO: logging
-        println!(
+        info!(
             "drawing shape_id: {:?}, index range: {:?}, base_vertex: {:?}",
             shape_id, index_range, vertex_range.start
         );
@@ -1179,22 +1221,22 @@ impl ShapeRenderer {
     /// Helper function to generate the vertices/indices for a unit quad centered around the
     /// origin
     fn upload_unit_quad(
-        vertex_buffer: &mut OffsetBuffer,
-        index_buffer: &mut OffsetBuffer,
+        vertex_buffer: &mut OffsetBuffer<Vertex>,
+        index_buffer: &mut OffsetBuffer<Index>,
         ctx: &Context,
     ) {
         let vertices = [
             Vertex {
-                pos: [0.5, 0.5, 0.0, 1.0],
+                pos: [1.0, 1.0, 0.0, 1.0],
             },
             Vertex {
-                pos: [-0.5, 0.5, 0.0, 1.0],
+                pos: [-1.0, 1.0, 0.0, 1.0],
             },
             Vertex {
-                pos: [-0.5, -0.5, 0.0, 1.0],
+                pos: [-1.0, -1.0, 0.0, 1.0],
             },
             Vertex {
-                pos: [0.5, -0.5, 0.0, 1.0],
+                pos: [1.0, -1.0, 0.0, 1.0],
             },
         ];
         vertex_buffer
@@ -1210,8 +1252,8 @@ impl ShapeRenderer {
     /// Helper function to generate the vertices/indices for a unit equilateral triangle centered
     /// around the origin
     fn upload_unit_triangle(
-        vertex_buffer: &mut OffsetBuffer,
-        index_buffer: &mut OffsetBuffer,
+        vertex_buffer: &mut OffsetBuffer<Vertex>,
+        index_buffer: &mut OffsetBuffer<Index>,
         ctx: &Context,
     ) {
         let vertices = [
@@ -1340,7 +1382,7 @@ impl Renderer {
                 ShapeRenderer::QUAD_SHAPE_ID,
                 [1.0, 0.5, 0.1, 1.0],
                 // FIXME: better way to get the camera transform in here?
-                orthographic_projection(ctx.width, ctx.height),
+                ortho_transform_builder(200.0, 1.0, -1.0, ctx.width, ctx.height),
                 renderpass,
             )
             .unwrap();
@@ -1358,7 +1400,7 @@ impl Renderer {
                 ShapeRenderer::TRIANGLE_SHAPE_ID,
                 [1.0, 0.5, 0.3, 1.0],
                 // FIXME: better way to get the camera transform in here?
-                orthographic_projection(ctx.width, ctx.height),
+                ortho_transform_builder(200.0, 1.0, 0.0, ctx.width, ctx.height),
                 renderpass,
             )
             .unwrap();
