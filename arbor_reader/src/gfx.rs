@@ -25,6 +25,15 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Default present mode for renderer
 pub const PRESENT_MODE: wgpu::PresentMode = wgpu::PresentMode::Immediate;
 
+/// Bind group universally used for data that changes infrequently
+pub const BIND_GROUP_STATIC_INDEX: u32 = 0;
+/// Bind group universally used for data that changes per frame
+pub const BIND_GROUP_PER_FRAME_INDEX: u32 = 1;
+/// Bind group universally used for data that changes per renderpass
+pub const BIND_GROUP_PER_RENDERPASS_INDEX: u32 = 2;
+/// Bind group universally used for data that changes per draw call
+pub const BIND_GROUP_PER_DRAW_INDEX: u32 = 3;
+
 /// Identity transform matrix
 #[rustfmt::skip]
 pub const IDENTITY_MATRIX: [f32; 16] = [
@@ -906,7 +915,7 @@ impl GlyphRenderer {
         info!("drawing glyphs");
         debug!("current_glyphs: {}", self.current_glyphs);
         renderpass.set_pipeline(&self.pipeline);
-        renderpass.set_bind_group(0, &self.uniforms, &[]);
+        renderpass.set_bind_group(BIND_GROUP_STATIC_INDEX, &self.uniforms, &[]);
         renderpass.set_vertex_buffer(0, self.glyph_buffer.slice(..));
         renderpass.draw(0..4, 0..self.current_glyphs as u32);
     }
@@ -1280,6 +1289,190 @@ impl ShapeRenderer {
     }
 }
 
+/// Push Constant data structure for [SpriteRenderer]
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+// NOTE: Align every field by 16 bytes!!!!
+struct SpriteInstance {
+    pub position: [f32; 4],
+    pub transform: [f32; 16],
+}
+
+/// Data needed to render untextured shapes with simple geometries.
+pub struct SpriteRenderer {
+    pipeline: wgpu::RenderPipeline,
+    // only a single quad is ever stored here, no need for offset buffer
+    vertex_buffer: wgpu::Buffer,
+    instance_buffer: OffsetBuffer<SpriteInstance>,
+    textures: Vec<wgpu::Texture>,
+    bind_groups: Vec<wgpu::BindGroup>,
+}
+
+impl SpriteRenderer {
+    /// Create a new ShapeRenderer with sensible default settings
+    pub fn default(ctx: &Context) -> Self {
+        Self::new(ctx, 256, OUTPUT_FORMAT)
+    }
+
+    pub fn new(ctx: &Context, buffer_size: u64, render_format: wgpu::TextureFormat) -> Self {
+        // fixed vertex buffer that just stores a unit quad. All textures will be drawn to this
+        // scaled quad
+        let vertex_buffer = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(type_name::<Self>()),
+                contents: bytemuck::cast_slice(&Self::unit_quad()),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        let shader = ctx
+            .device
+            .create_shader_module(&wgpu::ShaderModuleDescriptor {
+                label: Some("gfx::Sprite shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                    "../data/shaders/sprite.wgsl"
+                ))),
+            });
+
+        let bind_group_layouts =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("gfx::SpriteRenderer uniform layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: wgpu::BufferSize::new(
+                                    mem::size_of::<SpriteInstance>() as u64,
+                                ),
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler {
+                                filtering: true,
+                                comparison: false,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        // Shader/pipeline takes a vertex buffer, an index buffer, and a push constant containing a
+        // transform matrix and shape color
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                push_constant_ranges: &[],
+                bind_group_layouts: &[],
+            });
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: mem::size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &Vertex::vertex_attributes(),
+                    }],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[wgpu::ColorTargetState {
+                        format: render_format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }],
+                }),
+            });
+
+        Self {
+            vertex_buffer,
+            pipeline,
+        }
+    }
+
+    /// Low level implementation method to draw a sprite within an existing renderpass.
+    ///
+    /// # Error
+    ///
+    /// If the sprite id is not valid or is not already added to the vertex or index buffers
+    pub fn draw_sprite<'render>(
+        &'render self,
+        sprite_id: usize,
+        color: [f32; 4],
+        transform: [f32; 16],
+        renderpass: &mut wgpu::RenderPass<'render>,
+    ) -> Result<()> {
+        renderpass.set_bind_group(BIND_GROUP_PER_DRAW_INDEX, &self.bind_groups[sprite_id], &[]);
+        renderpass.set_pipeline(&self.pipeline);
+        renderpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        // always draw the 6 vertices of the quad with the instance data
+        renderpass.draw(0..6, 0..1);
+
+        Ok(())
+    }
+
+    /// Get the vertices to draw an un-indexed quad
+    fn unit_quad() -> [Vertex; 6] {
+        [
+            Vertex {
+                pos: [1.0, 1.0, 0.0, 1.0],
+            },
+            Vertex {
+                pos: [-1.0, 1.0, 0.0, 1.0],
+            },
+            Vertex {
+                pos: [-1.0, -1.0, 0.0, 1.0],
+            },
+            Vertex {
+                pos: [-1.0, -1.0, 0.0, 1.0],
+            },
+            Vertex {
+                pos: [1.0, -1.0, 0.0, 1.0],
+            },
+            Vertex {
+                pos: [1.0, 1.0, 0.0, 1.0],
+            },
+        ]
+    }
+}
+
 /// Top level gfx::Renderer object. This encapsulates the different data and methods for rendering
 /// different types of data as supported by gfx.
 ///
@@ -1306,6 +1499,7 @@ impl ShapeRenderer {
 pub struct Renderer {
     pub glyph: GlyphRenderer,
     pub shape: ShapeRenderer,
+    pub sprite: SpriteRenderer,
 }
 
 impl Renderer {

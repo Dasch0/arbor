@@ -341,8 +341,6 @@ pub fn draw_button(
     let _rect = txt.enqueue(styles::BUTTON, position, text);
 }
 
-pub fn draw_dropdown() {}
-
 /// handles quit request
 pub fn quit(control_flow: &mut event_loop::ControlFlow) -> States {
     *control_flow = event_loop::ControlFlow::Exit;
