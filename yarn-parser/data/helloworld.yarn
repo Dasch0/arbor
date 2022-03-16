@@ -1,0 +1,166 @@
+title: Hello World
+position: 35,-485
+---
+Narrator: Hello World!
+World: Hi, how's it going?
+Narrator: livin' the dream
+===
+title: Node
+position: -184,-589
+---
+World: So what do you want to do next
+-> Player: Craft some interpreters
+    World: Ok, lets switch to that
+    <<jump Craft>>
+-> Player: Continue testing out yarn syntax
+    World: Yea, lets keep doing this
+    <<jump Yarn>>
+===
+title: Craft
+position: 40,-545
+---
+
+===
+title: Yarn
+position: 44,-653
+---
+Narrator: So first observation, it seems that titles can't have spaces
+World: Huh...that seems a little weird, but not a big deal
+Narrator: The other interesting thing is that we can nest options
+-> World: Wait what do you mean?
+    Narrator: Like this, pick another option.
+    -> World: Another.
+    -> World: Option?
+    -> World: Whaaaaat???
+-> World: Like this?
+    Narrator: yea exactly, just keep choosing
+    -> World: All
+    -> World: The
+    -> World: Options
+    Narrator: I know right, it's crazy - and here I guess all the options lead back to the same node?
+-> World: Wait why are you choosing for ME? I'm not the player here
+    -> Narrator: It's for the sake of the exercise
+        -> World: Ok.. but I feel like I should be able to keep my autonomy here
+    -> Narrator: Wait I can respond with options too?
+        -> World: Maybe??
+        -> World: Looks like it
+    Narrator: wait what happens if I refuse to select an option?
+        -> World: oh jeez this is getting a bit crazy
+        -> World: Is it even worth supporting this?
+            Narrator: Idk it is faster to write...but on the other hand...
+            World: is it faster though? all you do otherwise is add a title and the -/= thing
+            Narrator: yea if vscode can auto-fill that then its fine
+    Narrator: Ok well now that that is sorted, its also kinda annoying that there's no dialogue preview
+    World: Well, if arbor reader gets going, maybe a little wasm magic can add a window and integrate with the jump to node thing
+    Narrator: maybe...
+    Narrator: Ok on to variables
+    <<jump Yarn_Variables>>
+===
+title: Yarn_Variables
+position: 284,-722
+---
+Narrator: Sidenote, yea making nodes isn't that bad, just titling lots of them is a pain
+World: definitely interesting... I feel like vscode should have some convenience helpers here, like if I type jump it automatically makes a new node
+Narrator: Yea, maybe it can be added in?
+World: maybe...
+Narrator: Anyway, ok so now lets test out variables
+<<set $testnum = $testnum + 1>>
+World: oh god, thats UB isn't it....
+Narrator: yea, hmm well I guess I could muck with the syntax a bit, declare all variables at the top?
+World: oh btw, what about user modifiable names?
+Narrator: good point, lets try it
+<<set $testname = "mark">>
+$testname: HELLO, i've just been instantiated
+World: why mark?
+Narrator: You can change it if you don't like it...
+World: ok.
+<<set $testname = "Behemoth">>
+$testname: Wow. and this guy talks about autonomy
+World: You can change it yourself too, its only temporary
+$testname: True....
+<<set $testname = "Woland">>
+World: Thats honestly better...
+$testname: yea, also isn't it crazy that I literally didn't exist until this node?
+Narrator: we probably shouldn't allow that to be honest...
+Narrator: Ok, well at least we have an idea of what's what, onto control flow!
+<<jump Yarn_ControlFlow>>
+===
+title: Yarn_ControlFlow
+position: 284,-631
+---
+Narrator: Ok this one might be tricky
+World: Yea, lets just try it first
+Narrator: Ok here it goes...setting a variable
+<<set $skill to 5>>
+World: Is a 'skill' of 5 good or bad?
+<<if $skill == 5>>
+Narrator: skill is just a number ya know
+-> World: A low number... <<if $skill <= 5>>
+-> World: A high number... <<if $skill > 5>>
+-> World: no need to get philosophical
+<< endif >>
+
+World: that endif is pretty interesting too, almost makes me think of subtrees
+Narrator: yea...that could get really messy though
+Narrator: hey wait look at this, something called 'attributes'
+<<jump Yarn_Attributes>>
+===
+title: Yarn_Attributes
+position: 284,-533
+---
+Narrator: [thinking] it's interesting that attributes can apply to part of the text [/]
+World: [thinking=2] also they can be created [/thinking] ad-hoc
+Narrator: ok and escaping is pretty straightforward \[ \]
+World: also check if we need to escape \:
+Narrator: ugh even if it works, we broke the linter
+World: ok...what about [nomarkup] ::::::::: [\]
+Narrator: poor linter
+Narrator: the character attribute is interesting too
+World: yea, thats more of a parsing detail than anything though...we still don't want to duplicate character names
+Narrator: And maybe that can be used for custom character names for free?
+World: eh....maybe
+Narrator: Lets continue on, to text replacement markers!
+<<jump Yarn_TextReplace>>
+===
+title: Yarn_TextReplace
+position: 283,-442
+---
+Narrator: I think [select value={$gender} m="he" f="she" nb="they" /] will be there!
+World: wait who?
+Narrator: no one... was just testing select
+Narrator: Ok this plural/ordinal is strange
+World: hmmm
+
+Narrator: Hey, look! [plural value={$pie_count} one="A pie" other="Some pies" /]!
+World: that syntax sure is wordy....
+Narrator: and yet again script breaks if pie_count doesn't exist
+World: yea definitely need to have a 'Variables' node
+Narrator: Last test..
+Narrator: The race is over! I came in [ordinal value={$race_position} one="%st" two="%nd" few="%rd" other="%th" /] place!
+World: how often would we need to use this again?
+Narrator: not sure, seems like something we could add a linter check for maybe?
+<<jump Yarn_Commands>>
+===
+title: Yarn_Commands
+position: 283,-351
+---
+Narrator: ok so...commands..
+World: basically enum_dispatch style enum right?
+Narrator: That's what i'm thinking..cool that was quick
+<<test_command string 1.0 1.00>>
+<<jump Yarn_Functions>>
+===
+title: Yarn_Functions
+position: 284,-254
+---
+Narrator: alright last bit, functions
+World: Ok I'll pick a random number: {random()}
+Narrator: And I'll roll the dice: {dice(6)}
+World: And I'll run a custom one: {test_custom(12.0)}
+===
+
+
+
+
+
+

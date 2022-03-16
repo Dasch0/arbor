@@ -6,4 +6,5 @@ members = [
     "arbor_cli",
     "arbor_ui",
     "arbor_reader",
+    "yarn-parser",
 ]

@@ -297,6 +297,7 @@ pub fn draw_title_menu<'r, 'rpass>(
 
     renderer.draw_quad(renderpass, ctx);
     renderer.draw_triangle(renderpass, ctx);
+    renderer.draw_sprite(0);
 
     if new.clicked(&ws.input) {
         States::EditorStart

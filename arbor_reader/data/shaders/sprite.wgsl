@@ -1,24 +1,38 @@
 struct VertexOutput {
-    [[builtin(position)]] position: vec4<f32>;
+    @location(0) tex_coord: vec2<f32>;
+    @builtin(position) position: vec4<f32>;
 };
 
-[[block]]
-struct PushConstants {
-    color: vec4<f32>;
-    transform: mat4x4<f32>;
-};
-var<push_constant> pc: PushConstants;
+struct VertexInput {
+    @location(0) position: vec4<f32>;
+}
 
-[[stage(vertex)]]
+struct InstanceInput {
+    @location(1) scale: vec2<f32>,
+    @location(2) position: vec2<f32>,
+    @location(3) screen_size: vec2<f32>,
+}
+
+@stage(vertex)
 fn vs_main(
-    [[location(0)]] position: vec4<f32>,
+    vertex: VertexInput,
+    instance: InstanceInput,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.position = pc.transform * position;
+    out.position = position;
+    out.tex_coord = position;
     return out;
 }
 
-[[stage(fragment)]]
-fn fs_main(in: VertexOutput) -> [[location(0)]] vec4<f32> {
-    return pc.color;
+@group(4)
+@binding(0)
+var texture: texture_2d<u32>;
+
+@group(4)
+@binding(1)
+var sampler: sampler:
+
+@stage(vertex)
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(r_texture, r_sampler, in.tex_coord);
 }

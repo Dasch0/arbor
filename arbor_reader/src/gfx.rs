@@ -1,12 +1,14 @@
 use crate::window;
+
+use thiserror::Error;
 use bytemuck::{Pod, Zeroable};
+use png;
 use std::any::type_name;
 use std::borrow::{self, Borrow, Cow};
 use std::marker::PhantomData;
 use std::ops::{self, Add, AddAssign, Mul, Sub, SubAssign};
 use std::time::{Duration, Instant};
-use std::{file, fmt, mem};
-use wgpu;
+use std::{file, fs, mem};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -45,12 +47,16 @@ pub const IDENTITY_MATRIX: [f32; 16] = [
 
 /// Helper function to generate a generate a transform matrix.
 #[rustfmt::skip]
-pub fn ortho_transform_builder(zoom: f32, offset_x: f32, offset_y: f32, screen_width: u32, screen_height: u32) -> [f32; 16] {
+pub fn ortho_transform_builder(
+    scale: [f32; 2],
+    offset: [f32; 2],
+    screen_size: [u32; 2],
+) -> [f32; 16] {
     [
-        zoom / screen_width as f32, 0.0, 0.0, 0.0,
-        0.0, -zoom / screen_height as f32, 0.0, 0.0,
+        scale[0] / screen_size[0] as f32, 0.0, 0.0, 0.0,
+        0.0, -scale[1] / screen_size[1] as f32, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0,
-        -1.0 + offset_x, 1.0 + offset_y, 0.0, 1.0,
+        -1.0 + offset[0], 1.0 + offset[1], 0.0, 1.0,
     ]
 }
 
@@ -88,9 +94,9 @@ pub struct Vertex {
 
 impl Vertex {
     /// Obtain the wgpu description of the vertex layout
-    fn vertex_attributes() -> [wgpu::VertexAttribute; 1] {
+    fn vertex_attributes(base_location: u32) -> [wgpu::VertexAttribute; 1] {
         wgpu::vertex_attr_array! [
-                        0 => Float32x4,
+                        base_location + 0 => Float32x4,
         ]
     }
 }
@@ -221,39 +227,35 @@ impl Point {
 }
 
 /// gfx Result type wraps `gfx::Error`
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, GfxError>;
 
 /// Top level errors from the gfx module
-#[derive(Debug)]
-pub enum Error {
+#[derive(Error, Debug)]
+pub enum GfxError {
+    #[error("Generic error")]
     Generic,
-    InvalidOffsetBufferEntry,
+    #[error("OffsetBuffer: {0}")]
+    OffsetBuffer(#[from] OffsetBufferErr),
+    #[error("Sprite: {0}")]
+    Sprite(#[from] SpriteErr),
+    #[error("wgpu::Surface: {0}")]
+    WgpuSurface(#[from] wgpu::SurfaceError),
+}
+
+#[derive(Error, Debug)]
+pub enum SpriteErr {
+    #[error("Handle is invalid")]
+    InvalidHandle,
+}
+
+#[derive(Error, Debug)]
+pub enum OffsetBufferErr {
+    #[error("Index or entry is out of range or otherwise invalid")]
+    InvalidEntry,
+    #[error("Data provided is misaligned and cannot be stored")]
     Alignment,
-    Surface(wgpu::SurfaceError),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::Generic => write!(f, "An unspecified error occured..."),
-            Error::InvalidOffsetBufferEntry => {
-                write!(
-                    f,
-                    "Attempted to access a nonexistent entry in an OffsetBuffer"
-                )
-            }
-            Error::Alignment => {
-                write!(f, "Attempted to access gpu memory with invalid alignment")
-            }
-            Error::Surface(e) => e.fmt(f),
-        }
-    }
-}
-
-impl From<wgpu::SurfaceError> for Error {
-    fn from(t: wgpu::SurfaceError) -> Self {
-        Error::Surface(t)
-    }
+    #[error("Data provided will not fit and cannot be stored")]
+    Full,
 }
 
 /// Handle to core WGPU stuctures representing physical access to the gpu, such as the device,
@@ -342,7 +344,7 @@ impl Texture {
 
         // if color type is not rgba, fail
         if info.color_type != png::ColorType::Rgba {
-            return Err(Error::Generic);
+            return Err(GfxError::Generic);
         }
 
         let size = wgpu::Extent3d {
@@ -443,10 +445,15 @@ impl<T: Pod> OffsetBuffer<T> {
         let data_bytes: &[u8] = bytemuck::cast_slice(data);
         // early return if data is not aligned properly
         if data_bytes.len() as u64 % wgpu::COPY_BUFFER_ALIGNMENT != 0 {
-            return Err(Error::Alignment);
+            return Err(OffsetBufferErr::Alignment.into());
         }
 
         let current_offset = *self.offset_table.last().unwrap_or(&0);
+        let new_offset = current_offset + data_bytes.len() as u64;
+
+        if new_offset > self.size {
+            return Err(OffsetBufferErr::Full.into());
+        }
         debug!(
             "pushing {} bytes to buffer {:?} with offset {}",
             data_bytes.len(),
@@ -455,7 +462,6 @@ impl<T: Pod> OffsetBuffer<T> {
         );
         ctx.queue
             .write_buffer(&self.buffer, current_offset, data_bytes);
-        let new_offset = current_offset + data_bytes.len() as u64;
 
         self.offset_table.push(new_offset);
         Ok(self.offset_table.len())
@@ -467,7 +473,7 @@ impl<T: Pod> OffsetBuffer<T> {
     /// if the provided ID is invalid or out of range
     pub fn get_slice<'buf>(&'buf self, id: usize) -> Result<wgpu::BufferSlice<'buf>> {
         if id >= self.offset_table.len() {
-            return Err(Error::InvalidOffsetBufferEntry);
+            return Err(OffsetBufferErr::InvalidEntry.into());
         }
 
         let last_index = id.checked_sub(1);
@@ -487,7 +493,7 @@ impl<T: Pod> OffsetBuffer<T> {
     /// if the provided ID is invalid or out of range
     pub fn get_byte_range<'buf>(&'buf self, id: usize) -> Result<ops::Range<u32>> {
         if id >= self.offset_table.len() {
-            return Err(Error::InvalidOffsetBufferEntry);
+            return Err(OffsetBufferErr::InvalidEntry.into());
         }
 
         let last_index = id.checked_sub(1);
@@ -507,7 +513,7 @@ impl<T: Pod> OffsetBuffer<T> {
     /// if the provided ID is invalid or out of range
     pub fn get_range<'buf>(&'buf self, id: usize) -> Result<ops::Range<u32>> {
         if id >= self.offset_table.len() {
-            return Err(Error::InvalidOffsetBufferEntry);
+            return Err(OffsetBufferErr::InvalidEntry.into());
         }
 
         trace!(
@@ -524,6 +530,14 @@ impl<T: Pod> OffsetBuffer<T> {
         let end = (self.offset_table[id] / mem::size_of::<T>() as u64) as u32;
 
         Ok(start..end)
+    }
+
+    /// Clear the buffer of all entries
+    /// 
+    /// In detail, this only removes the CPU side tracking information. The GPU content is still
+    /// present in memory, but will be overwritten on future writes
+    pub fn clear<'buf>(&'buf mut self) {
+        self.offset_table.clear()
     }
 }
 
@@ -625,14 +639,14 @@ pub struct GlyphVertex {
 impl GlyphVertex {
     /// helper function to get the vertex attributes of the struct
     #[inline]
-    fn vertex_attributes() -> [wgpu::VertexAttribute; 6] {
+    fn vertex_attributes(base_location: u32) -> [wgpu::VertexAttribute; 6] {
         wgpu::vertex_attr_array! [
-                        0 => Float32x3,
-                        1 => Float32x2,
-                        2 => Float32x2,
-                        3 => Float32x2,
-                        4 => Float32x4,
-                        5 => Float32x4,
+            base_location + 0 => Float32x3,
+            base_location + 1 => Float32x2,
+            base_location + 2 => Float32x2,
+            base_location + 3 => Float32x2,
+            base_location + 4 => Float32x4,
+            base_location + 5 => Float32x4,
         ]
     }
     /// Map internal `glyph_brush::GlyphVertex` layout to GPU compatible `gfx::GlyphVertex`
@@ -801,7 +815,7 @@ impl GlyphRenderer {
                     buffers: &[wgpu::VertexBufferLayout {
                         array_stride: mem::size_of::<GlyphVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &GlyphVertex::vertex_attributes(),
+                        attributes: &GlyphVertex::vertex_attributes(0),
                     }],
                 },
                 primitive: wgpu::PrimitiveState {
@@ -873,7 +887,7 @@ impl GlyphRenderer {
             &self.transform,
             0,
             bytemuck::cast_slice(&ortho_transform_builder(
-                2.0, 0.0, 0.0, ctx.width, ctx.height,
+                    [2.0, 2.0], [0.0, 0.0], [ctx.width, ctx.height],
             )),
         );
 
@@ -905,7 +919,7 @@ impl GlyphRenderer {
 
                 self.resize_cache(suggested.0, suggested.1, ctx);
                 glyph_brush.resize_texture(suggested.0, suggested.1);
-                Err(Error::Generic)
+                Err(GfxError::Generic)
             }
         }
     }
@@ -1142,7 +1156,7 @@ impl ShapeRenderer {
                     buffers: &[wgpu::VertexBufferLayout {
                         array_stride: mem::size_of::<Vertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &Vertex::vertex_attributes(),
+                        attributes: &Vertex::vertex_attributes(0),
                     }],
                 },
                 primitive: wgpu::PrimitiveState {
@@ -1185,6 +1199,17 @@ impl ShapeRenderer {
             index_buffer,
             pipeline,
         }
+    }
+
+    /// Add a shape to draw later. Make sure to call this fn outside of a renderpass
+    pub fn add_shape(&mut self, vertices: &[Vertex], indices: &[Index], ctx: &Context) -> usize {
+        self.vertex_buffer
+            .push(bytemuck::cast_slice(vertices), ctx)
+            .unwrap();
+
+        self.index_buffer
+            .push(bytemuck::cast_slice(&indices), ctx)
+            .unwrap()
     }
 
     /// Low level implementation method to draw a shape within an existing renderpass.
@@ -1289,32 +1314,54 @@ impl ShapeRenderer {
     }
 }
 
-/// Push Constant data structure for [SpriteRenderer]
+/// Per-instance data for [SpriteRenderer]
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 // NOTE: Align every field by 16 bytes!!!!
-struct SpriteInstance {
-    pub position: [f32; 4],
-    pub transform: [f32; 16],
+pub struct SpriteInstance {
+    pub scale: [f32; 2],
+    pub position: [f32; 2],
+    pub screen_size: [u32; 2],
 }
 
-/// Data needed to render untextured shapes with simple geometries.
+impl SpriteInstance {
+    /// Obtain the wgpu description of the vertex layout. Define the base location of the first
+    /// field based on other vertex buffers
+    fn vertex_attributes(base_location: u32) -> [wgpu::VertexAttribute; 3] {
+        wgpu::vertex_attr_array! [
+                        base_location + 0 => Float32x2,
+                        base_location + 1 => Float32x2,
+                        base_location + 2 => Uint32x2,
+        ]
+    }
+}
+
+type SpriteHandle = usize;
+
+/// Data needed to render textured sprites.
 pub struct SpriteRenderer {
-    pipeline: wgpu::RenderPipeline,
+    pub pipeline: wgpu::RenderPipeline,
+    pub uniform_layout: wgpu::BindGroupLayout,
     // only a single quad is ever stored here, no need for offset buffer
-    vertex_buffer: wgpu::Buffer,
-    instance_buffer: OffsetBuffer<SpriteInstance>,
-    textures: Vec<wgpu::Texture>,
-    bind_groups: Vec<wgpu::BindGroup>,
+    pub vertex_buffer: wgpu::Buffer,
+    /// per-frame gpu data for each sprite, handled as a instanced vertex buffer and cleared each
+    /// frame
+    pub instances: OffsetBuffer<SpriteInstance>,
+    /// per-frame list of textures to draw, used to acces the textures lut and cleared each frame
+    pub sprites: Vec<SpriteHandle>,
+    /// texture look up table
+    pub textures: Vec<wgpu::Texture>,
+    /// texture uniforms look up table
+    pub texture_uniforms: Vec<wgpu::BindGroup>,
 }
 
 impl SpriteRenderer {
     /// Create a new ShapeRenderer with sensible default settings
     pub fn default(ctx: &Context) -> Self {
-        Self::new(ctx, 256, OUTPUT_FORMAT)
+        Self::new(ctx, 512, OUTPUT_FORMAT)
     }
 
-    pub fn new(ctx: &Context, buffer_size: u64, render_format: wgpu::TextureFormat) -> Self {
+    pub fn new(ctx: &Context, sprite_capacity: usize, render_format: wgpu::TextureFormat) -> Self {
         // fixed vertex buffer that just stores a unit quad. All textures will be drawn to this
         // scaled quad
         let vertex_buffer = ctx
@@ -1334,7 +1381,7 @@ impl SpriteRenderer {
                 ))),
             });
 
-        let bind_group_layouts =
+        let uniform_layout =
             ctx.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("gfx::SpriteRenderer uniform layout"),
@@ -1354,6 +1401,16 @@ impl SpriteRenderer {
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
                             visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                multisampled: false,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Sampler {
                                 filtering: true,
                                 comparison: false,
@@ -1370,7 +1427,14 @@ impl SpriteRenderer {
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
                 push_constant_ranges: &[],
-                bind_group_layouts: &[],
+                bind_group_layouts: &[
+                    // pad empty bind groups to not displace less frequently updated bind groups
+                    // used by other renderers' draw calls
+                    &empty_bind_group(ctx),
+                    &empty_bind_group(ctx),
+                    &empty_bind_group(ctx),
+                    &uniform_layout, // uniform is updated per draw call
+                ],
             });
         let pipeline = ctx
             .device
@@ -1380,11 +1444,18 @@ impl SpriteRenderer {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: "vs_main",
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: mem::size_of::<Vertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &Vertex::vertex_attributes(),
-                    }],
+                    buffers: &[
+                        wgpu::VertexBufferLayout {
+                            array_stride: mem::size_of::<Vertex>() as u64,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &Vertex::vertex_attributes(0),
+                        },
+                        wgpu::VertexBufferLayout {
+                            array_stride: mem::size_of::<SpriteInstance>() as u64,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &SpriteInstance::vertex_attributes(1),
+                        },
+                    ],
                 },
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1421,31 +1492,161 @@ impl SpriteRenderer {
                 }),
             });
 
+
         Self {
-            vertex_buffer,
             pipeline,
+            uniform_layout,
+            vertex_buffer,
+            instances: OffsetBuffer::new(sprite_capacity as u64, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, ctx),
+            sprites: Vec::with_capacity(sprite_capacity),
+            textures: Vec::with_capacity(sprite_capacity),
+            texture_uniforms: Vec::with_capacity(sprite_capacity),
         }
     }
 
-    /// Low level implementation method to draw a sprite within an existing renderpass.
+    /// Load a png and add as a sprite. returns a handle to the sprite.
+    ///
+    /// Make sure to call this fn outside of a renderpass
+    ///
+    /// # Error
+    /// If the png cannot be loaded
+    // FIXME: this is a terrible way to load in sprites, define proper sprite fileformat later
+    pub fn add_sprite_from_png(
+        &mut self,
+        png_path: &str,
+        ctx: &Context,
+    ) -> SpriteHandle {
+        let decoder = png::Decoder::new(fs::File::open(png_path).unwrap());
+        let mut reader = decoder.read_info().unwrap();
+        // Allocate the output buffer.
+        let mut buf = vec![0; reader.output_buffer_size()];
+        // Read the next frame. An APNG might contain multiple frames.
+        let info = reader.next_frame(&mut buf).unwrap();
+        // Grab the bytes of the image.
+        let bytes = &buf[..info.buffer_size()];
+
+        let size = wgpu::Extent3d {
+            width: info.width,
+            height: info.height,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        });
+
+        ctx.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: std::num::NonZeroU32::new(4 * info.width),
+                rows_per_image: std::num::NonZeroU32::new(info.height),
+            },
+            size,
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let uniform = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.uniform_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+            label: None,
+        });
+
+        self.textures.push(texture);
+        self.texture_uniforms.push(uniform);
+        self.textures.len()
+    }
+
+    /// Enqueue some instances of a specific sprite to be drawn this frame.
+    ///
+    /// The SpriteRenderer uses instanced drawing to efficiently draw lots of instances of the same
+    /// sprite texture with different position, scaling, and other per-instance data. Prefer to 
+    /// submit every intended instance of a given sprite in a single call to this method for the
+    /// best performance.
+    ///
+    /// Call this before starting renderpass
+    ///
+    /// #Error
+    ///
+    /// If the draw is not enqueued for any reason. The SpriteRenderer state will still be valid -
+    /// just will not draw any content from the failed draw call
+    pub fn draw(&mut self, handle: SpriteHandle, instances: &[SpriteInstance], ctx: &Context) -> Result<()> {
+        // validate sprite handle
+        let _sprite = self.textures.get(handle).ok_or(SpriteErr::InvalidHandle)?;
+        let _uniform = self.texture_uniforms.get(handle).ok_or(SpriteErr::InvalidHandle)?;
+
+        self.sprites.push(handle);
+        self.instances.push(instances, ctx)?;
+
+        Ok(())
+    }
+
+    /// render all sprites to be drawn this frame
     ///
     /// # Error
     ///
-    /// If the sprite id is not valid or is not already added to the vertex or index buffers
-    pub fn draw_sprite<'render>(
+    /// If the SpriteRenderer state is invalid and unable to render all sprites. This
+    /// will result in some undeterminable number of spites being rendered. Errors here are
+    /// unexpected, and indicate an issue in earlier state updates to the SpriteRenderer.
+    pub fn render<'render>(
         &'render self,
-        sprite_id: usize,
-        color: [f32; 4],
-        transform: [f32; 16],
         renderpass: &mut wgpu::RenderPass<'render>,
     ) -> Result<()> {
-        renderpass.set_bind_group(BIND_GROUP_PER_DRAW_INDEX, &self.bind_groups[sprite_id], &[]);
-        renderpass.set_pipeline(&self.pipeline);
         renderpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        // always draw the 6 vertices of the quad with the instance data
-        renderpass.draw(0..6, 0..1);
+        renderpass.set_vertex_buffer(1, self.instances.buffer.slice(..));
+        renderpass.set_pipeline(&self.pipeline);
 
+        for (instance_index, sprite_handle) in self.sprites.iter().enumerate() {
+            let uniform = self.texture_uniforms.get(*sprite_handle).ok_or(SpriteErr::InvalidHandle)?;
+            let instance_range = self.instances.get_range(instance_index)?;
+
+            renderpass.set_bind_group(
+                BIND_GROUP_PER_DRAW_INDEX,
+                &uniform,
+                &[],
+            );
+            // always draw the 6 vertices of the quad with the instance data
+            renderpass.draw(0..6, instance_range);
+        }
+        
         Ok(())
+    }
+
+    /// Clear the per-frame state of the SpriteRenderer. Run this before starting a new frame
+    pub fn clear(&mut self) {
+        self.sprites.clear();
+        self.instances.clear();
     }
 
     /// Get the vertices to draw an un-indexed quad
@@ -1516,14 +1717,16 @@ impl Renderer {
         );
 
         let shape = ShapeRenderer::default(ctx);
-        Self { glyph, shape }
+
+        let sprite = SpriteRenderer::default(ctx);
+        Self { glyph, shape, sprite}
     }
 
     /// Create a new renderer with custom configs for the lower level renderers. This requires an
     /// initialized `gfx::Context` and requires that the context persists longer than the renderer.
     /// Generally this limits the context and renderer to the same thread
-    pub fn with_renderers(glyph: GlyphRenderer, shape: ShapeRenderer) -> Self {
-        Self { glyph, shape }
+    pub fn with_renderers(glyph: GlyphRenderer, shape: ShapeRenderer, sprite: SpriteRenderer) -> Self {
+        Self { glyph, shape, sprite}
     }
 
     /// Method to prepare and renders all drawn glyphs
@@ -1576,7 +1779,7 @@ impl Renderer {
                 ShapeRenderer::QUAD_SHAPE_ID,
                 [1.0, 0.5, 0.1, 1.0],
                 // FIXME: better way to get the camera transform in here?
-                ortho_transform_builder(200.0, 1.0, -1.0, ctx.width, ctx.height),
+                ortho_transform_builder([200.0, 200.0], [0.0, 0.0], [ctx.width, ctx.height]),
                 renderpass,
             )
             .unwrap();
@@ -1594,11 +1797,29 @@ impl Renderer {
                 ShapeRenderer::TRIANGLE_SHAPE_ID,
                 [1.0, 0.5, 0.3, 1.0],
                 // FIXME: better way to get the camera transform in here?
-                ortho_transform_builder(200.0, 1.0, 0.0, ctx.width, ctx.height),
+                ortho_transform_builder([200.0, 200.0],  [0.0, 0.0], [ctx.width, ctx.height]),
                 renderpass,
             )
             .unwrap();
     }
+
+    /// Draw a 2d triangle shape
+    pub fn draw_sprite<'renderer, 'rpass>(
+        &'renderer mut self,
+        sprite_id: SpriteHandle,
+        ctx: &Context
+    ) {
+        // default shapes always exist if initialized, safe to unwrap
+        self.sprite
+            .draw(ShapeRenderer::TRIANGLE_SHAPE_ID,
+                [1.0, 0.5, 0.3, 1.0],
+                // FIXME: better way to get the camera transform in here?
+                ortho_transform_builder([200.0, 200.0],  [0.0, 0.0], [ctx.width, ctx.height]),
+                renderpass,
+            )
+            .unwrap();
+    }
+
 }
 
 /// Top level gfx method begin a new frame to draw to
@@ -1718,4 +1939,14 @@ pub fn end_frame<const N: usize>(
     frame.surface_texture.present();
     // end frame draw
     Instant::now() - frame.start_time
+}
+
+/// Helper function to add an empty bind group to a pipeline. Use this to avoid storing frequently
+/// updated bind groups in the lower indices (see [BIND_GROUP_STATIC_INDEX])
+pub fn empty_bind_group(ctx: &Context) -> wgpu::BindGroupLayout {
+    ctx.device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[],
+            label: Some("empty bind group layout"),
+        })
 }
