@@ -10,72 +10,33 @@ fn fibonacci(n: u64) -> u64 {
 }
 
 fn simple_bench(c: &mut Criterion) {
+    const THREADS: usize = 32;
     let mut group = c.benchmark_group("simple_threaded_benchmark");
-    group.sample_size(10);
+    group.sampling_mode(criterion::SamplingMode::Flat);
     group.bench_function("single fib 1x35", |b| {
         b.iter(|| {
             black_box(fibonacci(black_box(35)));
-    })});
-    group.bench_function("single fib 8x35", |b| {
-        b.iter(|| {
-            black_box(fibonacci(black_box(35)));
-            black_box(fibonacci(black_box(35)));
-            black_box(fibonacci(black_box(35)));
-            black_box(fibonacci(black_box(35)));
-
-            black_box(fibonacci(black_box(35)));
-            black_box(fibonacci(black_box(35)));
-            black_box(fibonacci(black_box(35)));
-            black_box(fibonacci(black_box(35)));
-    })});
-    group.bench_function("finite threaded fib 8x35", |b| {
-        b.iter(|| {
-            pool::Finite::new()
-                .with_job(|| {black_box(fibonacci(black_box(35)));})
-                .with_job(|| {black_box(fibonacci(black_box(35)));})
-                .with_job(|| {black_box(fibonacci(black_box(35)));})
-                .with_job(|| {black_box(fibonacci(black_box(35)));})
-
-                .with_job(|| {black_box(fibonacci(black_box(35)));})
-                .with_job(|| {black_box(fibonacci(black_box(35)));})
-                .with_job(|| {black_box(fibonacci(black_box(35)));})
-                .with_job(|| {black_box(fibonacci(black_box(35)));})
-                .execute();
         })
     });
-
-    group.bench_function("finite threaded fib 8x5", |b| {
+    group.bench_function("single fib Nx35", |b| {
         b.iter(|| {
-            pool::Finite::new()
-                .with_job(|| {black_box(fibonacci(black_box(5)));})
-                .with_job(|| {black_box(fibonacci(black_box(5)));})
-                .with_job(|| {black_box(fibonacci(black_box(5)));})
-                .with_job(|| {black_box(fibonacci(black_box(5)));})
-
-                .with_job(|| {black_box(fibonacci(black_box(5)));})
-                .with_job(|| {black_box(fibonacci(black_box(5)));})
-                .with_job(|| {black_box(fibonacci(black_box(5)));})
-                .with_job(|| {black_box(fibonacci(black_box(5)));})
-                .execute();
+            for _ in 0..THREADS {
+                black_box(fibonacci(black_box(35)));
+            }
         })
     });
-
-    // criterion thrashes the threadpool with lots of parallel called iterations, which saturates
-    // the jobs queue. 
-    group.bench_function("pool threaded fib 8x5", |b| {
-        pool::scope(|scope| {
-            b.iter(|| {
-                    pool::spawn(scope, || {black_box(fibonacci(black_box(20)));});
-                    pool::spawn(scope, || {black_box(fibonacci(black_box(20)));});
-                    pool::spawn(scope, || {black_box(fibonacci(black_box(20)));});
-                    pool::spawn(scope, || {black_box(fibonacci(black_box(20)));});
-
-                    pool::spawn(scope,|| {black_box(fibonacci(black_box(20)));});
-                    pool::spawn(scope,|| {black_box(fibonacci(black_box(20)));});
-                    pool::spawn(scope,|| {black_box(fibonacci(black_box(20)));});
-                    pool::spawn(scope,|| {black_box(fibonacci(black_box(20)));});
+    group.bench_function("threaded fib Nx35", |b| {
+        let job0 = pool::job(|| {
+            black_box(fibonacci(black_box(35)));
+        });
+        b.iter(|| {
+            pool::scope(|mut scope: pool::Scope<THREADS>| {
+                for _ in 0..THREADS {
+                    scope.spawn(&job0);
+                }
+                scope
             });
-        }).unwrap();
+        });
     });
 }
 

@@ -1,225 +1,95 @@
-/// A small & opinionated threadpool implementation with minimal runtime costs. Most of this crate is
-/// adapted from bits and pieces of rayon: https://github.com/rayon-rs/rayon/tree/aa063b1c00cfa1fa74b8193f657998fba46c45b3
-use bumpalo::{boxed::Box, Bump};
-use std::{
-    io,
-    sync::atomic::{AtomicBool, Ordering},
-    thread,
-};
+use staticvec::StaticVec;
+/// Simple & opinionated parallelism tools with minimal dependencies or runtime overhead. Most of
+/// this crate is adapted from bits and pieces of rayon:
+/// https://github.com/rayon-rs/rayon/tree/aa063b1c00cfa1fa74b8193f657998fba46c45b3
+use std::{marker::PhantomData, thread};
 
-/// Maximum supported threads
-pub const MAX_THREADS: usize = 7;
+pub use job::InlineJob;
 
-/// Data for simple parallel execution of a finite number of jobs. Each job gets its own thread.
-/// Add jobs by passing in closures using [with_job], then run all tasks using [execute]. All jobs
-/// are guaranteed to complete and join when execute returns, and all threads will be destroyed at
-/// that time.
-///
-/// This should be used for extremely simple cases, when you have a small set (<core count) number
-/// of long running (> 1ms) separate tasks that you only need to run once. If you need a varying
-/// or large number of jobs to run, use [pool::Scope] instead.
-// TODO: Replace vec with inline storage
-pub struct Finite {
-    arena: Bump,
-    jobs: Vec<job::Ref>,
-    threads: Vec<thread::JoinHandle<()>>,
+#[inline]
+/// Create a job, able to be executed in parallel, from a provided closure. The closure must
+/// implement `FnMut`
+pub fn job<F>(f: F) -> job::InlineJob<F>
+where
+    F: FnMut() + Send,
+{
+    job::InlineJob::new(f)
 }
 
-impl Finite {
-    pub fn new() -> Self {
-        Self {
-            arena: Bump::new(),
-            jobs: Vec::with_capacity(MAX_THREADS),
-            threads: Vec::with_capacity(MAX_THREADS),
-        }
-    }
-    pub fn execute(mut self) {
-        for job_ref in self.jobs {
-            // Implementation note:
-            //  This is unsafe because we are eliding the lifetime requirements of the job, which rather
-            //  than being static is located on a temporarily allocated arena. Additionally, any
-            //  captured context in the closures to execute is no longer borrow checked.
-            //
-            //  However, the sequence of code below, where all threads are immediately joined, followed
-            //  by the deallocation of the arena and all data as it is dropped, is guaranteed to
-            //  complete before this function returns and is safe for external users
-            self.threads
-                .push(thread::spawn(move || unsafe { job_ref.execute() }));
-        }
+/// Create a scope for jobs to run in parallel. All jobs are guaranteed to complete when the
+/// provided closure returns.
+///
+/// NOTE: this is intended for jobs with a finite run time. If a job entires an infinite loop
+/// the scope will never return
+#[inline]
+pub fn scope<'scope, F, const NUM_THREADS: usize>(f: F)
+where
+    F: FnOnce(Scope<'scope, NUM_THREADS>) -> Scope<'scope, NUM_THREADS>,
+{
+    let scope = Scope {
+        threads: StaticVec::new(),
+        marker: PhantomData::default(),
+    };
 
-        // FIXME: this currently wastes a thread spin-locking on the other thread joins. Probably
-        // should handle this via signals
-        for thread in self.threads {
-            thread.join().unwrap(); // continue a delayed panic
-        }
-    }
+    let scope = (f)(scope);
 
-    /// Add a job to be executed in parallel by calling [Scope::execute]
-    pub fn with_job<F>(mut self, f: F) -> Self
+    for t in scope.threads {
+        t.join().unwrap();
+    }
+}
+
+/// Stores data needed to run parallel jobs within a scope. The generic parameter indicates the
+/// number of threads (and thus jobs) that can be created.
+///
+/// Spawn a new job to be run in parallel with [Scope::spawn]
+pub struct Scope<'scope, const NUM_THREADS: usize> {
+    threads: StaticVec<thread::JoinHandle<()>, NUM_THREADS>,
+    marker: PhantomData<::std::cell::Cell<&'scope mut ()>>,
+}
+
+impl<'scope, const N: usize> Scope<'scope, N> {
+    /// Stage a job to be executed in parallel. Guaranteed to complete before
+    /// the returned handle is dropped.
+    ///
+    /// # Panic
+    /// If the maximum number of threads defined by the scope have already been used
+    #[inline]
+    pub fn spawn<J>(&mut self, j: &'scope J)
     where
-        F: FnOnce() + Send,
+        J: job::Work + Send,
     {
-        // the job is allocated onto the scope's memory arena here. This ensures that the job will
-        // live long enough to execute the threadpool (see impl note below)
-        //
-        // FIXME: this is probably not entirely necessary, but for now this code closely follows the
-        // rayon impl of HeapJob, just allocated onto the arena instead
-        let job = bumpalo::boxed::Box::new_in(job::Inline::new(f), &self.arena);
-        // Implementation note:
-        //  This is unsafe because we are eliding the lifetime requirements of the job, which rather
-        //  than being static is located on a temporarily allocated arena. Additionally, any
-        //  captured context in the closures to execute is no longer borrow checked.
-        //
-        //  However, the sequence of code below, where all threads are immediately joined, followed
-        //  by the deallocation of the arena and all data as it is dropped, is guaranteed to
-        //  complete before this function returns and is safe for external users
         unsafe {
-            self.jobs.push(job::Ref::from_arena_job(job));
+            let job_ref = j.as_job_ref();
+            // try to push, if the vector is full, throw a compile error. This works because
+            // staticvec has const implementations for checking if the threads are full
+            self.check_thread_available();
+            self.threads.push(thread::spawn(move || job_ref.execute()));
         }
-        self
     }
-}
 
-pub struct Scope<const Q: usize> {
-    arena: *const Bump,
-    queue: *const ach_ring::Ring<job::Ref, Q>,
-    threads: *const [thread::JoinHandle<()>],
-}
-
-/// public interface to create and execute a scoped threadpool, creating a thread-per-core. Returns
-/// an error if the current processor parallelism cannot be queried. It is recommended to fall back
-/// to [scope_with_threads] to manually define a fallback thread count for such cases
-
-pub fn scope<F, R>(f: F) -> io::Result<R>
-where
-    F: FnOnce(&mut Scope<MAX_THREADS>) -> R,
-{
-    Ok(scope_with_thread_count::<F, R>(
-        thread::available_parallelism()?.get(),
-        f,
-    ))
-}
-
-/// public interface to create and execute a scoped threadpool
-pub fn scope_with_thread_count<F, R>(thread_count: usize, f: F) -> R
-where
-    F: FnOnce(&mut Scope<MAX_THREADS>) -> R,
-{
-    unsafe {
-        let arena = Bump::new();
-        // we need to tie the job queue & terminate flag to the scope lifetime, and then elide the lifetime to ensure
-        // that we can pass the receiver to our threads. This method guarantees that all threads are
-        // ended before the value is destroyed
-        let queue = Box::into_raw(Box::new_in(ach_ring::Ring::<job::Ref, MAX_THREADS>::new(), &arena));
-        let terminate = Box::into_raw(Box::new_in(AtomicBool::new(false), &arena));
-        let mut threads = Vec::with_capacity(thread_count);
-
-        // this is where the lifetime is elided, from here, this fucntion *must* guarantee that all
-        // threads have joined before returning, otherwise the arena will be deallocated
-        let q_ref = queue.as_ref().unwrap();
-        let t_ref = terminate.as_ref().unwrap();
-        for _ in 0..thread_count {
-            threads.push(thread::spawn(|| {
-                worker(
-                    &thread::current(),
-                    q_ref,
-                    t_ref,
-                );
-            }));
-        }
-
-        let mut scope = Scope {
-            arena: &arena,
-            queue: queue.clone(),
-            threads: threads.as_slice(),
-        };
-
-        let ret = f(&mut scope);
-
-        // park until queue is empty, worker threads will wake owner thread up
-        while !(*queue).is_empty() {
-            thread::park()
-        }
-        // now that the queue is empty, terminate all threads and wait for join
-        (*terminate).store(true, Ordering::Release);
-        for thread in threads {
-            thread.thread().unpark();
-            thread.join().unwrap(); // continue a delayed panic
-        }
-        ret
-    }
-}
-
-/// spawn a new task to start executing in parallel. Call this within a scoped closure
-pub fn spawn<F>(scope: &mut Scope<MAX_THREADS>, f: F)
-where
-    F: FnOnce() + Send,
-{
-    // the job is allocated onto the scope's memory arena here. This ensures that the job will
-    // live long enough to execute the threadpool (see impl note below)
-    //
-    // FIXME: this is probably not entirely necessary, but for now this code closely follows the
-    // rayon impl of HeapJob, just allocated onto the arena instead
-    // Implementation note:
-    //  This is unsafe because we are eliding the lifetime requirements of the job, which rather
-    //  than being static is located on a temporarily allocated arena. Additionally, any
-    //  captured context in the closures to execute is no longer borrow checked.
-    //
-    //  However, the sequence of code below, where all threads are immediately joined, followed
-    //  by the deallocation of the arena and all data as it is dropped, is guaranteed to
-    //  complete before this function returns and is safe for external users
-    unsafe {
-        let job = bumpalo::boxed::Box::new_in(job::Inline::new(f), scope.arena.as_ref().unwrap());
-        let job_ref = job::Ref::from_arena_job(job);
-        while let Err(_) = (*scope.queue).push(job_ref.clone()) {};
-
-        // notify all workers that we just added a new job
-        // FIXME: inefficient to call unpark n times for some thread, probably causes contention
-        // too
-        for handle in &(*scope.threads) {
-            handle.thread().unpark()
-        }
-
-    }
-}
-
-/// helper function defining the execution loop for worker threads
-///
-/// The user must guarantee job refs passed in must stay valid until a job completes, and thus
-/// worker loops are unsafe
-unsafe fn worker<'q, const Q: usize>(
-    owner_thread: &thread::Thread,
-    incoming_jobs: &ach_ring::Ring<job::Ref, Q>,
-    terminate: &AtomicBool,
-) {
-    // TODO: abort failsafe
-
-    // loop until terminate is set true, this must happen exactly once, so relaxed ordering is fine
-    while !terminate.load(Ordering::Relaxed) {
-        match incoming_jobs.pop() {
-            Ok(job) => job.execute(),        // execute the newly available job
-            Err(_) => {
-                owner_thread.unpark(); // ring empty, signal to the owner thread that we have no work to do
-                thread::park(); // wait for owner thread to notify us by unparking
-            }
+    /// const helper to compile time panic if the scope's threads are all in use
+    const fn check_thread_available(&self) {
+        if self.threads.is_full() {
+            panic!("Scope attempted to spawn more jobs than threads are available. 
+                   Recommended to define the scope with more threads");
         }
     }
 }
 
 /// This submodule implements the data structures required to run parallel jobs in scoped
 /// threadpools, with the general goals of providing the closure and job data to a worker thread,
-/// and allowing the threadpool scope to manually manage memory
+/// and allowing the threadpool scope to manually manage memory and not force everything to be
+/// 'static
 ///
-/// This implementation is mostly derived from [rayon]'s HeapJob, with the main difference being
-/// [Pool] scopes use [bumpalo] for temporary memory arenas
+/// Everything in this module is highly unsafe, it's outer users must guarantee safety
+///
+/// This implementation is mostly derived from rayon's `HeapJob`
 mod job {
     use std::{cell::UnsafeCell, mem};
-    /// Trait defining jobs to run in parallel
-    pub trait Job {
-        /// Unsafe: this may be called from a different thread than the one
-        /// which scheduled the job, so the implementer must ensure the
-        /// appropriate traits are met, whether `Send`, `Sync`, or both.
+    /// Trait defining work to be run in parallel
+    pub trait Work {
         unsafe fn execute(this: *const Self);
+        unsafe fn as_job_ref(&self) -> Ref;
     }
 
     /// An unsafe job reference for which the caller guarantees the availability of a
@@ -235,11 +105,11 @@ mod job {
 
     impl Ref {
         /// Caller must assert that the job's data will remain valid until the job is executed
-        unsafe fn new<JOB>(data: *const JOB) -> Ref
+        pub unsafe fn new<J>(data: *const J) -> Ref
         where
-            JOB: Job,
+            J: Work,
         {
-            let fn_ptr: unsafe fn(*const JOB) = <JOB as Job>::execute;
+            let fn_ptr: unsafe fn(*const J) = <J as Work>::execute;
             Self {
                 // this type erasure lets us define our own lifetime requirements for the underlying job`
                 pointer: data as *const (),
@@ -250,49 +120,126 @@ mod job {
         pub unsafe fn execute(&self) {
             (self.execute_fn)(self.pointer)
         }
-
-        /// Create a job reference from a job allocated on a memory arena (implemented with [bumpalo]).
-        /// Note that this method is highly unsafe, it is up to the user to ensure the memory arena
-        /// lives until the job is completed
-        pub unsafe fn from_arena_job<J>(job: bumpalo::boxed::Box<J>) -> Ref
-        where
-            J: Job,
-        {
-            let this: *const J = mem::transmute(job);
-            Ref::new(this)
-        }
     }
 
-    /// A job where the job data and closure is stored inline. This type of job generally needs to be allocated
-    /// somewhere in order to work with threadpools.
-    pub struct Inline<F>
-    where
-        F: FnOnce() + Send,
-    {
-        /// Pointer to the storage on the arena with interior Mutability. The Option will allow us to ensure that the job runs
-        /// once-and-only-once
-        job: UnsafeCell<Option<F>>,
+    pub struct InlineJob<F> {
+        job: UnsafeCell<F>,
     }
 
-    impl<F> Inline<F>
+    impl<'scope, F> InlineJob<F>
     where
-        F: FnOnce() + Send,
+        F: FnMut() + Send + 'scope,
     {
         pub fn new(func: F) -> Self {
             Self {
-                job: UnsafeCell::new(Some(func)),
+                job: UnsafeCell::new(func),
             }
         }
     }
 
-    impl<F> Job for Inline<F>
+    impl<'scope, F> Work for InlineJob<F>
     where
-        F: FnOnce() + Send,
+        F: FnMut() + Send + 'scope,
     {
         unsafe fn execute(this: *const Self) {
-            // Here, we 'take' the pointer out of the Option, leaving None
-            let job = (*(*this).job.get()).take().unwrap();
-            (job)()
+            let job = (*this).job.get();
+            (*job)()
         }
+
+        unsafe fn as_job_ref(&self) -> Ref {
+            Ref::new(self)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::pool;
+    fn printer(var: &mut usize, name: &'static str) {
+        for i in 0..10 {
+            *var += i;
+            println!("thread {} iteration {}", name, var);
+        }
+    }
+    #[test]
+    /// Test a scoped threadpool with three printing threads, each modifying different mutable
+    /// variables
+    fn scope_print() {
+        let mut var0 = 0;
+        let mut var1 = 1;
+        let mut var2 = 2;
+
+        let job0 = pool::job(|| printer(&mut var0, "A"));
+        let job1 = pool::job(|| printer(&mut var1, "A"));
+        let job2 = pool::job(|| printer(&mut var2, "A"));
+
+        pool::scope::<_, 3>(|mut scope| {
+            scope.spawn(&job0);
+            scope.spawn(&job1);
+            scope.spawn(&job2);
+            scope
+        });
+    }
+
+    fn fibonacci(n: u64) -> u64 {
+        match n {
+            0 => 1,
+            1 => 1,
+            n => fibonacci(n - 1) + fibonacci(n - 2),
+        }
+    }
+
+    #[test]
+    fn scope_stress() {
+        let mut var0 = 0;
+        let mut var1 = 0;
+        let mut var2 = 0;
+        let mut var3 = 0;
+        let mut var4 = 0;
+        let mut var5 = 0;
+        let mut var6 = 0;
+        let mut var7 = 0;
+
+        let mut job0 = pool::job(|| {
+            var0 = fibonacci(20);
+        });
+        let mut job1 = pool::job(|| {
+            var1 = fibonacci(20);
+        });
+        let mut job2 = pool::job(|| {
+            var2 = fibonacci(20);
+        });
+
+        let mut job3 = pool::job(|| {
+            var3 = fibonacci(20);
+        });
+
+        let mut job4 = pool::job(|| {
+            var4 = fibonacci(20);
+        });
+
+        let mut job5 = pool::job(|| {
+            var5 = fibonacci(20);
+        });
+
+        let mut job6 = pool::job(|| {
+            var6 = fibonacci(20);
+        });
+
+        let mut job7 = pool::job(|| {
+            var7 = fibonacci(20);
+        });
+
+        pool::scope(|mut scope: pool::Scope<8>| {
+            scope.spawn(&mut job0);
+            scope.spawn(&mut job1);
+            scope.spawn(&mut job2);
+            scope.spawn(&mut job3);
+            scope.spawn(&mut job4);
+            scope.spawn(&mut job5);
+            scope.spawn(&mut job6);
+            scope.spawn(&mut job7);
+            scope
+        });
     }
 }
