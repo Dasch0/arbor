@@ -24,7 +24,7 @@ position: 40,-545
 title: Yarn
 position: 44,-653
 ---
-Narrator: So first observation, it seems that titles can't have spaces
+Narrator: So first observation:, it seems that titles can't have spaces
 World: Huh...that seems a little weird, but not a big deal
 Narrator: The other interesting thing is that we can nest options
 -> World: Wait what do you mean?
